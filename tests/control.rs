@@ -228,3 +228,76 @@ async fn rust_api_surface() {
     assert_eq!(s.requests(&fakellm::RequestFilter::default()).1, 0);
     assert!(s.base_url().ends_with("/v1"));
 }
+
+#[tokio::test]
+async fn responses_routes_and_status() {
+    let s = start().await;
+    assert_eq!(get(&s, "/_fakellm").await.json()["responses"]["count"], 0);
+    let r = get(&s, "/_fakellm/responses").await.json();
+    assert_eq!((r["responses"].clone(), r["count"].clone()), (json!([]), json!(0)));
+    assert_eq!(send(&s, "DELETE", "/_fakellm/responses", &[], "").await.json()["deleted"], 0);
+    assert_eq!(send(&s, "POST", "/_fakellm/responses", &[], "").await.status, 405);
+    assert!(s.response_ids().is_empty());
+    assert_eq!(post_json(&s, "/_fakellm/reset?responses=false", &json!({})).await.status, 200);
+}
+
+#[tokio::test]
+async fn put_keep_hits_and_protocol_filter() {
+    let s = start().await;
+    put_rules(&s, json!([{"name": "a", "reply": {"text": "x"}}])).await;
+    chat(&s, &chat_body("gpt-4o", "hi")).await;
+    assert_eq!(s.scripts().list()[0].hits, 1);
+    let body = r#"[{"name": "a", "reply": {"text": "y"}}]"#;
+    assert_eq!(send(&s, "PUT", "/_fakellm/scripts?keep_hits=true", &[], body).await.status, 200);
+    assert_eq!(s.scripts().list()[0].hits, 1);
+    send(&s, "PUT", "/_fakellm/scripts", &[], body).await;
+    assert_eq!(s.scripts().list()[0].hits, 0);
+
+    let total = |q: &str| {
+        let s = &s;
+        let q = q.to_owned();
+        async move { get(s, &format!("/_fakellm/requests?{q}")).await.json()["total"].clone() }
+    };
+    assert_eq!(total("protocol=openai.chat").await, 1);
+    assert_eq!(total("protocol=anthropic.messages").await, 0);
+    assert_eq!(get(&s, "/_fakellm/requests?protocol=grpc").await.status, 400);
+}
+
+#[tokio::test]
+async fn redact_auth_hides_credentials_in_the_log() {
+    let s = start_with(fakellm::Config {
+        redact_auth: true,
+        ..Default::default()
+    })
+    .await;
+    send(
+        &s,
+        "POST",
+        "/v1/chat/completions",
+        &[
+            ("authorization", "Bearer sk-secret"),
+            ("x-api-key", "sk-other"),
+            ("content-type", "application/json"),
+        ],
+        &chat_body("gpt-4o", "hi").to_string(),
+    )
+    .await;
+    let log = get(&s, "/_fakellm/requests?full=true").await;
+    assert!(!log.body.contains("sk-secret") && !log.body.contains("sk-other"), "{}", log.body);
+    assert!(log.body.contains("<redacted>"));
+}
+
+#[tokio::test]
+async fn error_replies_expose_headers_and_in_stream() {
+    let s = start().await;
+    put_rules(
+        &s,
+        json!([{"reply": {"error": {"status": 529, "headers": {"x-should-retry": "true"}}}}]),
+    )
+    .await;
+    chat(&s, &chat_body("gpt-4o", "hi")).await;
+    let r = &get(&s, "/_fakellm/requests").await.json()["requests"][0]["reply"];
+    assert_eq!(r["status"], 529);
+    assert_eq!(r["in_stream"], false);
+    assert_eq!(r["headers"], json!([["x-should-retry", "true"]]));
+}

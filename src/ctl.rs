@@ -1,9 +1,10 @@
 //! `fakellm ctl`: a command-line client for the control-plane HTTP API (docs/design.md).
 //!
-//! Commands: `status`, `reset [--keep-clock] [--keep-requests] [--keep-scripts]`,
-//! `scripts {list, put FILE, add FILE, clear}` (FILE is JSON or YAML by extension),
+//! Commands: `status`, `reset [--keep-clock] [--keep-requests] [--keep-scripts] [--keep-responses]`,
+//! `responses {list, clear}`,
+//! `scripts {list, put FILE [--keep-hits], add FILE, clear}` (FILE is JSON or YAML by extension),
 //! `clock {get, freeze [AT], unfreeze, set AT, advance BY, reset}`,
-//! `requests {list [--model] [--has-tool] [--stream] [--status] [--source] [--rule] [--path]
+//! `requests {list [--model] [--has-tool] [--stream] [--protocol] [--status] [--source] [--rule] [--path]
 //! [--since] [--after] [--limit] [--full] [--count], clear, config [--enable|--disable] [--capacity N]}`.
 //! `--endpoint` (env `FAKELLM_ENDPOINT`, default `http://127.0.0.1:4010`) and `--json` are global.
 //! Human output is a compact text rendering; `--json` prints the server's JSON.
@@ -47,6 +48,9 @@ enum Command {
         /// Leave the scripts as they are.
         #[arg(long)]
         keep_scripts: bool,
+        /// Leave the stored Responses API objects as they are.
+        #[arg(long)]
+        keep_responses: bool,
     },
     /// Manage scripted replies.
     #[command(subcommand)]
@@ -57,6 +61,17 @@ enum Command {
     /// Inspect the request log.
     #[command(subcommand)]
     Requests(Requests),
+    /// Inspect or clear the stored Responses API objects.
+    #[command(subcommand)]
+    Responses(Responses),
+}
+
+#[derive(Subcommand)]
+enum Responses {
+    /// List stored response ids.
+    List,
+    /// Forget all stored responses.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -64,7 +79,12 @@ enum Scripts {
     /// List rules in match order.
     List,
     /// Replace all rules with those in a JSON or YAML file.
-    Put { file: PathBuf },
+    Put {
+        file: PathBuf,
+        /// Keep the hit counts of rules that stay at the same position.
+        #[arg(long)]
+        keep_hits: bool,
+    },
     /// Append the rules in a JSON or YAML file.
     Add { file: PathBuf },
     /// Delete all rules.
@@ -90,6 +110,7 @@ enum Clock {
     Reset,
 }
 
+#[allow(clippy::large_enum_variant)] // parsed once per process
 #[derive(Subcommand)]
 enum Requests {
     /// List logged requests, oldest first.
@@ -102,6 +123,9 @@ enum Requests {
         /// Only streaming (true) or non-streaming (false) requests.
         #[arg(long)]
         stream: Option<bool>,
+        /// openai.chat, openai.responses or anthropic.messages.
+        #[arg(long)]
+        protocol: Option<String>,
         /// 200, 4xx, 5xx or error (400 and above).
         #[arg(long)]
         status: Option<String>,
@@ -191,6 +215,7 @@ fn requests_query(r: &Requests) -> String {
         model,
         has_tool,
         stream,
+        protocol,
         status,
         source,
         rule,
@@ -208,6 +233,7 @@ fn requests_query(r: &Requests) -> String {
     let strs = [
         ("model", model),
         ("has_tool", has_tool),
+        ("protocol", protocol),
         ("status", status),
         ("source", source),
         ("rule", rule),
@@ -241,17 +267,22 @@ fn plan(command: &Command) -> Result<Call> {
             keep_clock,
             keep_requests,
             keep_scripts,
+            keep_responses,
         } => (
             "POST",
             format!(
-                "/_fakellm/reset?clock={}&requests={}&scripts={}",
-                !keep_clock, !keep_requests, !keep_scripts
+                "/_fakellm/reset?clock={}&requests={}&scripts={}&responses={}",
+                !keep_clock, !keep_requests, !keep_scripts, !keep_responses
             ),
             None,
         ),
         Command::Scripts(s) => match s {
             Scripts::List => ("GET", "/_fakellm/scripts".into(), None),
-            Scripts::Put { file } => ("PUT", "/_fakellm/scripts".into(), Some(script_body(file)?)),
+            Scripts::Put { file, keep_hits } => (
+                "PUT",
+                format!("/_fakellm/scripts{}", if *keep_hits { "?keep_hits=true" } else { "" }),
+                Some(script_body(file)?),
+            ),
             Scripts::Add { file } => ("POST", "/_fakellm/scripts".into(), Some(script_body(file)?)),
             Scripts::Clear => ("DELETE", "/_fakellm/scripts".into(), None),
         },
@@ -262,6 +293,10 @@ fn plan(command: &Command) -> Result<Call> {
             Clock::Set { at } => ("POST", "/_fakellm/clock/set".into(), Some(json!({ "at": at }).into())),
             Clock::Advance { by } => ("POST", "/_fakellm/clock/advance".into(), Some(json!({ "by": by }).into())),
             Clock::Reset => ("POST", "/_fakellm/clock/reset".into(), None),
+        },
+        Command::Responses(r) => match r {
+            Responses::List => ("GET", "/_fakellm/responses".into(), None),
+            Responses::Clear => ("DELETE", "/_fakellm/responses".into(), None),
         },
         Command::Requests(r) => match r {
             Requests::List { .. } => ("GET", format!("/_fakellm/requests?{}", requests_query(r)), None),
@@ -307,6 +342,9 @@ fn print_human(command: &Command, v: &Value) {
             print_clock(&v["clock"]);
             let n = v["scripts"]["count"].as_u64().map_or_else(|| "-".to_owned(), |n| n.to_string());
             println!("scripts        {n} rules");
+            if let Some(n) = v["responses"]["count"].as_u64() {
+                println!("responses      {n} stored");
+            }
             if !v["strict"].is_null() {
                 println!("strict         {}", v["strict"]);
             }
@@ -315,8 +353,8 @@ fn print_human(command: &Command, v: &Value) {
         Command::Reset { .. } => println!("reset"),
         Command::Scripts(Scripts::List) => {
             let rules = v["rules"].as_array().map(Vec::as_slice).unwrap_or_default();
-            for (i, r) in rules.iter().enumerate() {
-                println!("{:>3}  {r}", i + 1);
+            for r in rules {
+                println!("{}", rule_line(r));
             }
             if rules.is_empty() {
                 println!("no rules");
@@ -339,9 +377,75 @@ fn print_human(command: &Command, v: &Value) {
                 eprintln!("showing {shown} of {total} matching requests");
             }
         }
+        Command::Responses(Responses::List) => {
+            for r in v["responses"].as_array().into_iter().flatten() {
+                println!("{}  {}", text(r, "id"), text(r, "created_at"));
+            }
+            println!("{} stored", v["count"]);
+        }
+        Command::Responses(Responses::Clear) => println!("deleted {}", v["deleted"]),
         Command::Requests(Requests::Clear) => println!("cleared"),
         Command::Requests(Requests::Config { .. }) => print_log_config(v),
     }
+}
+
+const MATCH_FIELDS: &[&str] = &[
+    "model",
+    "last_user",
+    "system",
+    "any_message",
+    "has_tool",
+    "no_tools",
+    "has_tool_result",
+    "last_tool_result",
+    "tool_result_contains",
+    "stream",
+    "turn",
+    "any",
+    "protocol",
+    "probability",
+    "every_nth",
+];
+
+/// `#<index> <name or -> hits/<times or inf> [exhausted] <matcher> -> <reply>`, from one
+/// `RuleInfo` JSON object.
+fn rule_line(r: &Value) -> String {
+    let times = r["times"].as_u64().map_or_else(|| "inf".to_owned(), |t| t.to_string());
+    let exhausted = if r["exhausted"] == true { " exhausted" } else { "" };
+    let mut conds = Vec::new();
+    for k in MATCH_FIELDS {
+        if let Some(v) = r["match"].get(*k) {
+            let shown = match v {
+                Value::String(s) if matches!(*k, "last_user" | "system" | "any_message" | "tool_result_contains") => {
+                    format!("/{}/", s.trim_matches('/'))
+                }
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            conds.push(format!("{k}={shown}"));
+        }
+    }
+    let matcher = if conds.is_empty() { "any".to_owned() } else { conds.join(" ") };
+    format!(
+        "#{} {} {}/{times}{exhausted} {matcher} -> {}",
+        r["index"],
+        r["name"].as_str().unwrap_or("-"),
+        r["hits"],
+        reply_kind(&r["reply"]),
+    )
+}
+
+fn reply_kind(reply: &Value) -> String {
+    if reply["hang"] == true || !reply["hang_ms"].is_null() {
+        return "hang".into();
+    }
+    if let Some(status) = reply["error"]["status"].as_u64() {
+        return format!("error {status}");
+    }
+    if reply["tool_calls"].as_array().is_some_and(|t| !t.is_empty()) {
+        return "tool_calls".into();
+    }
+    "text".into()
 }
 
 fn request_line(r: &Value) -> String {
@@ -489,7 +593,47 @@ mod tests {
     fn reset_flags() {
         assert_eq!(
             plan_of(&["reset", "--keep-clock"]).1,
-            "/_fakellm/reset?clock=false&requests=true&scripts=true"
+            "/_fakellm/reset?clock=false&requests=true&scripts=true&responses=true"
+        );
+        assert_eq!(
+            plan_of(&["reset", "--keep-responses"]).1,
+            "/_fakellm/reset?clock=true&requests=true&scripts=true&responses=false"
+        );
+    }
+
+    #[test]
+    fn rule_lines() {
+        let r = json!({"index": 0, "name": "greet", "hits": 2, "exhausted": false,
+            "match": {"model": "gpt-*", "last_user": "^hi", "stream": true}, "reply": {"text": "yo"}});
+        assert_eq!(rule_line(&r), "#0 greet 2/inf model=gpt-* last_user=/^hi/ stream=true -> text");
+        let r = json!({"index": 3, "hits": 1, "exhausted": true, "times": 1, "match": {},
+            "reply": {"error": {"status": 429}}});
+        assert_eq!(rule_line(&r), "#3 - 1/1 exhausted any -> error 429");
+        let r = json!({"index": 4, "hits": 0, "times": 5, "match": {"protocol": "anthropic.messages", "every_nth": 3},
+            "reply": {"hang": true}});
+        assert_eq!(rule_line(&r), "#4 - 0/5 protocol=anthropic.messages every_nth=3 -> hang");
+        let r = json!({"index": 5, "hits": 0, "match": {}, "reply": {"tool_calls": [{"name": "a"}]}});
+        assert_eq!(rule_line(&r), "#5 - 0/inf any -> tool_calls");
+    }
+
+    #[test]
+    fn responses_and_keep_hits() {
+        let (m, p, _) = plan_of(&["responses", "list"]);
+        assert_eq!((m, p.as_str()), ("GET", "/_fakellm/responses"));
+        assert_eq!(plan_of(&["responses", "clear"]).0, "DELETE");
+        let dir = std::env::temp_dir().join(format!("fakellm-ctl-kh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let j = dir.join("a.json");
+        std::fs::write(&j, "[]").unwrap();
+        assert_eq!(
+            plan_of(&["scripts", "put", j.to_str().unwrap(), "--keep-hits"]).1,
+            "/_fakellm/scripts?keep_hits=true"
+        );
+        std::fs::remove_dir_all(dir).ok();
+        assert!(
+            plan_of(&["requests", "list", "--protocol", "openai.responses"])
+                .1
+                .contains("protocol=openai.responses")
         );
     }
 

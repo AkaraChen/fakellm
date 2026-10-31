@@ -3,7 +3,7 @@
 //! the same reply and different requests get different ones. Also home to the other derived
 //! identifiers (completion ids, system fingerprints) so they are stable across runs too.
 
-use crate::ir::{FinishReason, Reply, Request, ResponseFormat, ToolCall, ToolChoice};
+use crate::ir::{FinishReason, Protocol, Reply, Request, ResponseFormat, ToolCall, ToolChoice};
 use crate::tokenizer;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,7 +105,7 @@ pub fn reply(req: &Request, cfg: &FallbackConfig) -> Reply {
         return Reply {
             text: None,
             tool_calls: vec![ToolCall {
-                id: call_id(seed),
+                id: tool_call_id(req.protocol, seed),
                 name,
                 arguments: "{}".into(),
             }],
@@ -254,6 +254,37 @@ pub fn completion_id(seed: u64) -> String {
 /// `call_` followed by 24 base62 characters derived from `seed`.
 pub fn call_id(seed: u64) -> String {
     format!("call_{}", base62(seed, 0x6361_6c6c, 24))
+}
+
+/// `toolu_` followed by 24 base62 characters, the shape of Anthropic tool use ids.
+pub fn toolu_id(seed: u64) -> String {
+    format!("toolu_{}", base62(seed, 0x746f_6f6c, 24))
+}
+
+/// A tool call id in the style of `protocol`: `toolu_...` for Anthropic, `call_...` otherwise.
+pub fn tool_call_id(protocol: Protocol, seed: u64) -> String {
+    match protocol {
+        Protocol::AnthropicMessages => toolu_id(seed),
+        Protocol::OpenaiChat | Protocol::OpenaiResponses => call_id(seed),
+    }
+}
+
+/// Anthropic message id: `msg_` followed by 24 base62 characters.
+pub fn message_id(seed: u64) -> String {
+    format!("msg_{}", base62(seed, 0x6d73_6773, 24))
+}
+
+/// Responses API ids: `<prefix>_` followed by 48 hex-ish base62 characters. Prefixes used:
+/// `resp` (response), `rs` (reasoning item), `msg` (message item), `fc` (function call item).
+/// `salt` tells ids apart within one response (use the output index).
+pub fn responses_id(prefix: &str, seed: u64, salt: u64) -> String {
+    format!("{prefix}_{}", base62(seed, 0x7265_7370 ^ salt.wrapping_mul(0x9e37_79b9), 48))
+}
+
+/// An opaque reasoning blob (Anthropic `signature`, Responses `encrypted_content`) derived from
+/// the request seed: 96 base62 characters, stable for a given request.
+pub fn reasoning_opaque(seed: u64) -> String {
+    base62(seed, 0x7369_676e, 96)
 }
 
 /// `fp_` followed by 10 hex characters derived from the model name.

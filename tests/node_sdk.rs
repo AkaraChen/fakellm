@@ -1,4 +1,4 @@
-//! Runs the official-SDK suite in `sdk/node` (openai, Vercel AI SDK) against the freshly built binary.
+//! Runs the official-SDK suite in `sdk/node` (openai, Anthropic and Vercel AI SDK suites: chat, Responses, Messages) against the freshly built binary.
 //! Skipped when `node_modules` is missing or `node` is not installed.
 
 use std::path::Path;

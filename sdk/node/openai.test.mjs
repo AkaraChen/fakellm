@@ -134,3 +134,37 @@ test('models.list', async () => {
   assert.ok(ids.length > 0);
   assert.ok(ids.every((id) => typeof id === 'string'));
 });
+
+test('cut_after_chunks: stream ends early without a finish chunk', async () => {
+  await srv.ctl.put('/scripts', [
+    { reply: { text: 'one two three four five six', stream: { chunk_tokens: 1, cut_after_chunks: 2 } } },
+  ]);
+  const stream = await client.chat.completions.create({ model: 'gpt-4o', messages: user('go'), stream: true });
+  const chunks = [];
+  let failure;
+  try {
+    for await (const c of stream) chunks.push(c);
+  } catch (e) {
+    failure = e;
+  }
+  // Observed: the openai SDK ends iteration cleanly when the body ends without [DONE]; the only signal
+  // is that no chunk carries a finish_reason.
+  assert.ok(chunks.every((c) => !c.choices[0]?.finish_reason), JSON.stringify(chunks));
+  assert.equal(chunks.filter((c) => c.choices[0]?.delta?.content).length, 2);
+  assert.equal(failure, undefined);
+});
+
+test('streaming n=2 keeps choices separate', async () => {
+  await srv.ctl.put('/scripts', [{ reply: { text: 'alpha beta gamma' } }]);
+  const stream = await client.chat.completions.create({ model: 'gpt-4o', messages: user('go'), stream: true, n: 2 });
+  const text = ['', ''];
+  const finishes = [0, 0];
+  for await (const c of stream) {
+    for (const ch of c.choices) {
+      text[ch.index] += ch.delta.content ?? '';
+      if (ch.finish_reason) finishes[ch.index] += 1;
+    }
+  }
+  assert.deepEqual(text, ['alpha beta gamma', 'alpha beta gamma']);
+  assert.deepEqual(finishes, [1, 1]);
+});

@@ -1,7 +1,7 @@
 //! fakellm: an in-memory, OpenAI-compatible LLM API server for tests.
 //!
-//! It speaks the wire protocols (Chat Completions today; Responses and Anthropic Messages are
-//! planned) without running a model: replies come from scripts, or from a deterministic default.
+//! It speaks the wire protocols (OpenAI Chat Completions and Responses, Anthropic Messages)
+//! without running a model: replies come from scripts, or from a deterministic default.
 //! A control plane under `/_fakellm/` resets state, registers scripts, moves the server clock and
 //! reads a log of parsed requests. The binary is a thin CLI over this library.
 //!
@@ -18,6 +18,10 @@
 //! Synchronous code can use [`Server::start_blocking`], which runs the server on a background
 //! runtime and stops it when the returned handle is dropped.
 
+// `ApiError` carries headers now and is returned by every parser; errors are the cold path.
+#![allow(clippy::result_large_err)]
+
+mod anthropic;
 mod blocking;
 mod clock;
 mod control;
@@ -26,7 +30,9 @@ pub mod ir;
 mod openai;
 mod reqlog;
 mod script;
+mod sse;
 mod tokenizer;
+pub mod wire;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -66,8 +72,10 @@ pub const DEFAULT_MODELS: &[&str] = &[
     "gpt-5-nano",
     "o3",
     "o4-mini",
-    "text-embedding-3-small",
-    "text-embedding-3-large",
+    "gpt-5.5",
+    "claude-sonnet-4-5",
+    "claude-opus-4-1",
+    "claude-haiku-4-5",
 ];
 
 /// Server settings. `Default` listens on a random localhost port, accepts any API key, answers
@@ -96,6 +104,9 @@ pub struct Config {
     pub request_log: bool,
     /// Requests kept by the log; the oldest are dropped first.
     pub request_log_capacity: usize,
+    /// Store `"<redacted>"` instead of the values of `authorization`, `proxy-authorization` and
+    /// `x-api-key` in the request log, so the log can be shared.
+    pub redact_auth: bool,
 }
 
 impl Default for Config {
@@ -111,6 +122,7 @@ impl Default for Config {
             scripts: Vec::new(),
             request_log: true,
             request_log_capacity: DEFAULT_REQUEST_LOG_CAPACITY,
+            redact_auth: false,
         }
     }
 }
@@ -204,7 +216,7 @@ impl Server {
         &self.control.engine.scripts
     }
 
-    /// Clears scripts, the request log and the clock.
+    /// Clears scripts, the request log, the clock and stored responses.
     pub fn reset(&self) {
         self.control.reset();
     }
@@ -212,6 +224,16 @@ impl Server {
     /// Logged requests matching `filter`, oldest first, and the match count before `limit`.
     pub fn requests(&self, filter: &RequestFilter) -> (Vec<RequestRecord>, usize) {
         self.control.log.list(filter)
+    }
+
+    /// Ids and creation times (unix seconds) of the stored Responses API objects.
+    pub fn response_ids(&self) -> Vec<(String, i64)> {
+        self.control.response_ids()
+    }
+
+    /// Forgets all stored Responses API objects.
+    pub fn clear_responses(&self) -> usize {
+        self.control.clear_responses()
     }
 
     /// Stops accepting connections. Requests already in flight finish on their own.
@@ -258,6 +280,33 @@ pub(crate) fn json_response(status: u16, body: &serde_json::Value) -> Response {
 pub(crate) fn full_body(bytes: Bytes) -> Body {
     use http_body_util::BodyExt;
     http_body_util::Full::new(bytes).boxed()
+}
+
+/// Status, headers and `body` for `err`; shared by every protocol, which only differ in `body`.
+/// `retry-after` comes first, then `err.headers`; names and values that are not valid HTTP are
+/// skipped.
+pub(crate) fn error_response(err: &ir::ApiError, body: &serde_json::Value) -> Response {
+    let bytes = Bytes::from(serde_json::to_vec(body).expect("error body serializes"));
+    let mut b = http::Response::builder()
+        .status(http::StatusCode::from_u16(err.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_LENGTH, bytes.len());
+    for (name, value) in error_headers(err) {
+        if let (Ok(n), Ok(v)) = (http::HeaderName::from_bytes(name.as_bytes()), http::HeaderValue::from_str(&value)) {
+            b = b.header(n, v);
+        }
+    }
+    b.body(full_body(bytes)).expect("valid response")
+}
+
+/// The extra headers an error carries: `retry-after` (whole seconds) when set, then `err.headers`.
+pub(crate) fn error_headers(err: &ir::ApiError) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(d) = err.retry_after {
+        out.push(("retry-after".to_owned(), retry_after_secs(d).to_string()));
+    }
+    out.extend(err.headers.iter().cloned());
+    out
 }
 
 /// Whole seconds, rounded up, for `retry-after`.

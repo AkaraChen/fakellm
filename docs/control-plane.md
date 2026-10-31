@@ -1,7 +1,7 @@
 # 测试控制面
 
 fakellm 在 API 所在的同一个端口上提供一组 HTTP API，前缀是 `/_fakellm/`，用来在测试之间重置状态、注册剧本、控制服务器时间、检查收到过哪些请求。
-真实的 OpenAI 路径都不以 `/_fakellm` 开头，所以不会冲突。
+真实的 OpenAI 和 Anthropic 路径（`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 等）都不以 `/_fakellm` 开头，所以不会冲突。三种协议的请求共用同一份剧本、同一个请求日志、同一个时钟。
 
 不需要写客户端库：用命令行 `fakellm ctl`，或者任何能发 HTTP 请求的工具（`curl`）。
 Rust 进程内使用时，同样的操作是 `fakellm::Server` 上的方法（见[最后一节](#rust-api)）。
@@ -49,9 +49,9 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | 命令 | 对应的请求 |
 |---|---|
 | `status` | `GET /_fakellm` |
-| `reset [--keep-clock] [--keep-requests] [--keep-scripts]` | `POST /_fakellm/reset?clock=&requests=&scripts=` |
-| `scripts list` | `GET /_fakellm/scripts` |
-| `scripts put FILE` | `PUT /_fakellm/scripts`，`.yaml` / `.yml` 按 YAML 发，其他按 JSON |
+| `reset [--keep-clock] [--keep-requests] [--keep-scripts] [--keep-responses]` | `POST /_fakellm/reset?clock=&requests=&scripts=&responses=` |
+| `scripts list` | `GET /_fakellm/scripts`，文本输出每条规则一行：`#序号 名字 hits/times [exhausted] 匹配条件 -> text\|tool_calls\|error 429\|hang`，`times` 不限时写 `inf`，没有名字写 `-`；`protocol`、`probability`、`every_nth` 也在匹配条件里 |
+| `scripts put FILE [--keep-hits]` | `PUT /_fakellm/scripts[?keep_hits=true]`，`.yaml` / `.yml` 按 YAML 发，其他按 JSON；文本输出 `N rules loaded (M total)` |
 | `scripts add FILE` | `POST /_fakellm/scripts` |
 | `scripts clear` | `DELETE /_fakellm/scripts` |
 | `clock get` | `GET /_fakellm/clock` |
@@ -60,11 +60,13 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `clock set AT` | `POST /_fakellm/clock/set` |
 | `clock advance BY` | `POST /_fakellm/clock/advance`，`BY` 可以是负数，如 `-2w` |
 | `clock reset` | `POST /_fakellm/clock/reset` |
-| `requests list [--model G] [--has-tool N] [--stream B] [--status S] [--source K] [--rule R] [--path P] [--since T] [--after SEQ] [--limit N] [--full] [--count]` | `GET /_fakellm/requests?...` |
+| `responses list` | `GET /_fakellm/responses`，每行 id 和创建时间 |
+| `responses clear` | `DELETE /_fakellm/responses` |
+| `requests list [--model G] [--has-tool N] [--stream B] [--protocol P] [--status S] [--source K] [--rule R] [--path P] [--since T] [--after SEQ] [--limit N] [--full] [--count]` | `GET /_fakellm/requests?...` |
 | `requests clear` | `DELETE /_fakellm/requests` |
 | `requests config [--enable \| --disable] [--capacity N]` | 不带参数是 `GET`，否则 `PUT /_fakellm/requests/config` |
 
-`--stream` 需要一个值：`--stream true`。`--count` 只打印匹配数。
+`--stream` 需要一个值：`--stream true`。`--count` 只打印匹配数。`--status` 接受 `200`、`4xx`、`error`，也接受 `0`（挂起后客户端放弃的请求，见[请求日志](#请求日志)）。`ctl status` 打印版本、时钟、剧本数、保存的 Responses 数、strict 和请求日志状态。
 
 ## 路由
 
@@ -75,9 +77,12 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `GET /_fakellm` | 状态 |
 | `POST /_fakellm/reset` | 重置 |
 | `GET /_fakellm/scripts` | 列出规则 |
-| `PUT /_fakellm/scripts` | 替换全部规则 |
+| `PUT /_fakellm/scripts` | 替换全部规则；`?keep_hits=true` 保留同一位置规则的命中计数 |
 | `POST /_fakellm/scripts` | 追加规则 |
 | `DELETE /_fakellm/scripts` | 清空规则 |
+| `GET /_fakellm/responses` | 列出保存的 Responses API 对象（只有 id 和创建时间） |
+| `DELETE /_fakellm/responses` | 清空这些对象 |
+| `GET` / `DELETE /v1/responses/{id}` | 这不是控制面路由，是 API：读取、删除一个保存的对象，见[下面](#responses-对象) |
 | `GET /_fakellm/clock` | 读时钟 |
 | `POST /_fakellm/clock/{freeze,unfreeze,set,advance,reset}` | 改时钟 |
 | `GET /_fakellm/requests` | 查询请求日志 |
@@ -90,7 +95,7 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 
 ```
 $ curl $E/_fakellm
-{"version":"0.1.0","clock":{"now":"2026-10-31T15:29:38.658Z","frozen":false,"shifted":false},"scripts":{"count":0},"strict":false,"request_log":{"enabled":true,"capacity":10000,"stored":0,"dropped":0}}
+{"version":"0.1.0","clock":{"now":"2026-10-31T15:29:38.658Z","frozen":false,"shifted":false},"scripts":{"count":0},"responses":{"count":0},"strict":false,"request_log":{"enabled":true,"capacity":10000,"stored":0,"dropped":0}}
 ```
 
 ### 重置
@@ -102,15 +107,44 @@ $ curl -X POST "$E/_fakellm/reset?clock=false&requests=false"
 {"reset":true}
 ```
 
-默认清空三样东西：剧本（包括命中计数）、请求日志、时钟（回到宿主机时间）。查询参数 `clock` / `requests` / `scripts` 设为 `false` 可以保留对应的那一项。
+默认清空四样东西：剧本（包括命中计数）、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项。
 
+- 挂起（`hang`）、错误延迟或同步回复延迟期间客户端断开的请求，会以 `status: 0` 记入日志；如果期间发生过清空请求日志的 `reset`，这条记录会被丢弃，不会污染新的日志。`reset` 不会唤醒已挂起的请求（它们按旧时钟算的截止时间继续等待）。
+- 只有 `requests` 和 `responses` 同时清空时，响应 id 的计数才归零；否则重放同一个请求会得到相同的 `resp_` id，覆盖旧对象。
 - 请求日志的序号 `seq` 不会因为清空而归零，`dropped` 计数也不清。
 - 不会清空的东西：启动时的配置（`--strict`、`--models`、`--fallback-tokens`、`--ttft` 等），以及日志的 `enabled` / `capacity` 设置。
 - **已经在飞的流不受影响**：reset 之后，还没发完的流继续按各自已经确定的截止时间发送。重置时钟会唤醒等待中的流，让它们重新计算剩余等待（见下）。
 
+### Responses 对象
+
+`POST /v1/responses` 默认保存每个响应（请求里 `store: false` 除外），供三件事使用：`previous_response_id` 续写对话、`GET /v1/responses/{id}` 读取、`DELETE /v1/responses/{id}` 删除。控制面的两个路由只负责查看和清空：
+
+```
+$ curl $E/_fakellm/responses
+{"responses":[{"id":"resp_...","created_at":"2026-10-31T15:29:38.000Z"}],"count":1}
+$ curl -X DELETE $E/_fakellm/responses
+{"deleted":1}
+```
+
+列表按创建时间从旧到新，`created_at` 是 RFC 3339（秒精度）。`GET /_fakellm` 的 `responses.count` 是保存的个数。
+
+- **容量**：最多保留 1000 个，满了丢最旧的。
+- **断流的响应也会保存**：`cut_after_chunks` 把流截断的请求，对象仍然按完整的回复保存。
+- **`previous_response_id`**：新请求的 `messages` 是 `[instructions] + 被引用响应的完整对话 + 新 input`；请求日志里记录的是这个展开后的结果，所以 `has_tool_result`、`turn` 等条件看到的是整个对话。存下来的是快照：删除被引用的响应，不影响已经从它派生出的响应。
+- **找不到**：`previous_response_id` 指向不存在（或 `store: false` 的、或已被 `DELETE`、已被清空的）响应时，返回 404 `invalid_request_error`，`param: previous_response_id`，`code: previous_response_not_found`，文案 “Previous response with id 'x' not found.”。这个请求以 `source: rejected` 记入日志。
+- `GET` / `DELETE /v1/responses/{id}` 对未知 id 返回 404 “Response with id 'x' not found.”；`DELETE` 成功返回 `{"id","object":"response","deleted":true}`。
+- 不支持：`/v1/responses/{id}/input_items`、`/cancel`、`background`（404 `Invalid URL`）。
+
+```
+$ curl $E/v1/responses -d '{"model":"m","input":"hi"}'                       # 得到 resp_A
+$ curl $E/v1/responses -d '{"model":"m","input":"again","previous_response_id":"resp_A"}'
+$ curl $E/v1/responses -d '{"model":"m","input":"x","previous_response_id":"resp_nope"}'
+{"error":{"message":"Previous response with id 'resp_nope' not found.","type":"invalid_request_error","param":"previous_response_id","code":"previous_response_not_found"}}
+```
+
 ### 剧本
 
-`PUT` 替换全部规则，`POST` 追加到末尾，请求体是规则数组或 `{"rules": [...]}`。`Content-Type` 是 `application/yaml`、`text/yaml` 或 `application/x-yaml` 时按 YAML 解析，否则看内容：以 `[` 或 `{` 开头按 JSON，其他按 YAML。规则格式见 [scripts.md](scripts.md)。
+`PUT` 替换全部规则（默认命中计数清零，加 `?keep_hits=true` 则按位置保留已有规则的计数），`POST` 追加到末尾，请求体是规则数组或 `{"rules": [...]}`。`Content-Type` 是 `application/yaml`、`text/yaml` 或 `application/x-yaml` 时按 YAML 解析，否则看内容：以 `[` 或 `{` 开头按 JSON，其他按 YAML。规则格式见 [scripts.md](scripts.md)。
 
 ```
 $ curl -X PUT $E/_fakellm/scripts -d '[{"name":"x","match":{"last_user":"ping"},"reply":{"text":"pong"}}]'
@@ -118,20 +152,21 @@ $ curl -X PUT $E/_fakellm/scripts -d '[{"name":"x","match":{"last_user":"ping"},
 $ curl -X POST $E/_fakellm/scripts -H 'content-type: application/yaml' --data-binary '- reply: {text: "catch-all"}'
 {"added":1,"count":2}
 $ curl $E/_fakellm/scripts
-{"rules":[{"index":0,"name":"x","match":{"last_user":"ping"},"reply":{"text":"pong"},"hits":0,"exhausted":false},{"index":1,"match":{},"reply":{"text":"catch-all"},"hits":0,"exhausted":false}]}
+{"rules":[{"index":0,"name":"x","match":{"last_user":"ping"},"reply":{"text":"pong"},"hits":0,"reached":0,"exhausted":false},{"index":1,"match":{},"reply":{"text":"catch-all"},"hits":0,"reached":0,"exhausted":false}]}
 $ curl -X DELETE $E/_fakellm/scripts
 {"cleared":true}
 ```
 
-- `index` 是匹配顺序里的位置（从 0 开始）；`hits` 是注册以来回答了几个请求；`exhausted` 表示 `times` 用完了。
-- `PUT` 会重置命中计数（因为所有规则都是新的），`POST` 不影响已有规则的计数。
+- `index` 是匹配顺序里的位置（从 0 开始）；`hits` 是注册以来回答了几个请求；`reached` 是其他条件都满足、到达过这条规则的请求数（`probability` 和 `every_nth` 就是按它计数，没被它们放行的请求也算）；`exhausted` 表示 `times` 用完了。
+- `PUT ?keep_hits=true` 按**位置**把旧规则的 `hits` 和 `reached` 带到同一位置的新规则上（新规则比旧的多就从 0 开始），适合在测试中途改某条规则的回复又不想丢计数；布尔值的写法同其他查询参数。
+- `PUT` 默认会重置命中计数（因为所有规则都是新的），`POST` 不影响已有规则的计数。
 - 整个文档先全部解析和编译，任何一条规则有问题就整体拒绝，已有规则不变：
 
 ```
 $ curl -X PUT $E/_fakellm/scripts -d '[{"reply":{}}]'
 {"error":{"code":"BadRequest","message":"rule 0: reply needs `text`, `tool_calls` or `error`"}}
 $ curl -X PUT $E/_fakellm/scripts -d '[{"match":{"bogus":1},"reply":{"text":"x"}}]'
-{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `stream`, `turn`, `any`"}}
+{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`"}}
 ```
 
 ### 时钟
@@ -159,7 +194,7 @@ $ curl -X POST $E/_fakellm/clock/reset
 | `advance` | `{"by": "<duration>"}`，必填 | 向前（或用负数向后）移动 |
 | `reset` | 无 | 回到宿主机时钟 |
 
-duration 的单位：`ns` `us` `ms` `s` `m` `h` `d`（24 小时）`w`，可以组合（`1h30m`），裸数字按秒，可以带 `-`。不支持小数（`1.5s` 是 400，写 `1500ms`）。
+duration 的单位：`ns` `us` `ms` `s` `m` `h` `d`（24 小时）`w`，可以组合（`1h30m`），裸数字按秒，可以带 `-`。数字可以带小数（`1.5s` 等于 `1500ms`，`.5h` 等于 30 分钟），小于 1 纳秒的零头被截掉。
 响应字段：`now` 是服务器时间，`frozen` 是否冻结，`shifted` 是否与宿主机时钟不同（冻结，或带偏移地运行）。
 时钟范围大约是 1824 到 2116 年，超出返回 400。
 
@@ -178,7 +213,7 @@ duration 的单位：`ns` `us` `ms` `s` `m` `h` `d`（24 小时）`w`，可以�
 
 ### 请求日志
 
-每个 API 请求（`/v1/*` 和不带前缀的 `/chat/completions`、`/models`，包括 404 和认证失败的）都会被记录，除非日志被关掉。
+每个 API 请求（`/v1/*` 和不带前缀的 `/chat/completions`、`/messages`、`/responses`、`/models`，包括 404 和认证失败的）都会被记录，除非日志被关掉。三种协议在同一个日志里，用 `protocol` 区分。
 
 ```
 $ curl "$E/_fakellm/requests?full=true&limit=1"
@@ -194,19 +229,26 @@ $ curl "$E/_fakellm/requests?full=true&limit=1"
 | `seq` | 到达顺序，从 1 开始，`reset` / 清空后继续增长 |
 | `time` | 请求到达时的服务器时间 |
 | `method`、`path` | 方法，和带查询串的路径（原样） |
-| `status` | 响应状态码 |
+| `status` | 响应状态码；`0` 表示没有发出任何响应：请求被 `hang` / `hang_ms` 挂住，客户端先放弃了。这样的记录在客户端断开时才写入，`reply` 里有 `hang` 字段 |
 | `latency_us` | 从到达到响应头就绪，微秒（真实时间；流的 body 不计，被时钟挂住的同步响应要等放行后才记录，包含等待） |
-| `protocol` | `openai.chat`；body 解析失败时为 `null` |
+| `protocol` | `openai.chat`、`openai.responses` 或 `anthropic.messages`；body 解析失败时为 `null` |
 | `model`、`stream` | 请求的模型名和是否流式；没有解析出请求时为 `null` / `false` |
 | `source` | 谁回答的：`{"kind": "script", "index", "name"}`、`{"kind": "fallback"}`、`{"kind": "strict"}`、`{"kind": "rejected"}`（在匹配之前就被拒绝：认证失败、JSON 不合法、校验失败、404） |
 | `rule` | 命中规则的 `name`；没有名字或不是规则回答时为 `null` |
 | `request` | 解析后的结构化请求（IR）：完整的 messages、tools、`tool_choice`、参数、`extra`（不认识的字段）。不截断文本；解析失败时 `null` |
-| `reply` | `{"finish", "text", "tool_calls": [{id, name, arguments}], "reasoning", "usage": {prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cached_tokens}}`，或 `{"error": {...}}`；没有决定时 `null` |
-| `headers` | 仅 `full=true`：请求头 `[[名字(小写), 值], ...]`，`authorization` 不脱敏 |
+| `reply` | `{"finish", "text", "tool_calls": [{id, name, arguments}], "reasoning", "usage": {prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cached_tokens}}`，或 `{"status", "error", "retry_after", "in_stream", "headers"}`（`error` 是该协议的线上格式，Anthropic 请求用 Anthropic 的错误体）；被 `hang` 挂住的请求还有 `hang: {"until_ms": n \| null}`；没有决定时 `null` |
+| `headers` | 仅 `full=true`：请求头 `[[名字(小写), 值], ...]`。`anthropic-version`、`anthropic-beta`、`openai-beta` 之类的头都在这里，可以断言客户端发了什么。`authorization` 默认原样保存；见下面的[脱敏](#脱敏) |
 | `raw` | 仅 `full=true`：请求 body 的原始 JSON |
 | `raw_text` | 仅 `full=true`：body 不是 JSON 时的文本，最多 64 KiB |
 
 流式请求的 `reply` 是完整的回复（不管流是否被 `cut_after_chunks` 截断），日志不记录每个 chunk 的实际发送情况。
+错误回复的 `reply.error` 是该协议的线上格式：Anthropic 请求记 `{"type":"error","error":{...}}`，其他记 OpenAI 的四键格式；`in_stream` 是错误是否作为流内事件发出，`headers` 是规则里设的额外响应头。
+
+Anthropic 请求和 Responses 请求的 `request`（解析后的结构）与 Chat 同形：`messages` 里 Anthropic 的 `tool_result` 块是 `tool` 角色的消息，`thinking` 块是 `Thinking` part，Responses 的 `instructions` 是开头的 system 消息，`previous_response_id` 引用的历史已经展开在里面；协议自己的字段（`thinking` 配置、`previous_response_id`）有专门的键，不认识的字段在 `extra` 里原样保留。完整的原始 body 在 `raw`（`full=true`）。
+
+#### 脱敏
+
+请求头默认原样保存（方便断言客户端发的 key）。`--redact-auth`（环境变量 `FAKELLM_REDACT_AUTH`，Rust 里是 `Config::redact_auth`）打开后，`authorization`、`proxy-authorization`、`x-api-key` 三个头的值记成 `<redacted>`（头名保留），在写入日志时就替换，之后取不回原值。要导出日志给别人之前打开它。`raw` 里的请求体不会被脱敏。
 
 过滤条件（查询参数，可以组合，都是“与”）：
 
@@ -215,7 +257,8 @@ $ curl "$E/_fakellm/requests?full=true&limit=1"
 | `model` | 模型名 glob（`*` 和 `?`，区分大小写） |
 | `has_tool` | 请求里提供了这个名字的工具 |
 | `stream` | `true` / `false` |
-| `status` | 精确（`404`）、类别（`4xx`）、或 `error`（>= 400） |
+| `protocol` | `openai.chat` / `openai.responses` / `anthropic.messages`（body 解析失败的请求没有协议，匹配不到任何一个） |
+| `status` | 精确（`404`，挂起后放弃的是 `0`）、类别（`4xx`）、或 `error`（>= 400） |
 | `source` | `script` / `fallback` / `strict` / `rejected` |
 | `rule` | 规则名（精确） |
 | `path` | 路径前缀，如 `/v1/chat/completions` |
@@ -248,11 +291,13 @@ $ curl -X PUT $E/_fakellm/requests/config -d '{"capacity":50,"enabled":true}'
 
 | HTTP | Rust |
 |---|---|
-| `POST /reset` | `server.reset()`；`server.control().reset_with(ResetOptions { clock, requests, scripts })` |
+| `POST /reset` | `server.reset()`；`server.control().reset_with(ResetOptions { clock, requests, scripts, responses })` |
 | `/scripts` | `server.scripts()`：`replace(Vec<Rule>)`、`append`、`clear`、`list() -> Vec<RuleInfo>`、`len`；`Rule::parse_many(text, ScriptFormat::{Json,Yaml,Auto})` |
 | `/clock` | `server.clock()`：`now`、`freeze(Option<SystemTime>)`、`unfreeze`、`set`、`advance(i64 纳秒)`、`reset`、`is_frozen`；`fakellm::parse_duration("30d")` 返回纳秒 |
 | `GET /requests` | `server.requests(&RequestFilter) -> (Vec<RequestRecord>, usize)` |
 | `DELETE /requests` | `server.control().clear_requests()` |
+| `GET /responses` | `server.response_ids() -> Vec<(String, i64)>`（id 和 unix 秒） |
+| `DELETE /responses` | `server.clear_responses()`，返回删除的个数 |
 
 `RequestFilter` 的字段与查询参数同名（`path` 对应 `path_prefix`，`status` 是 `StatusFilter`，可以用 `"4xx".parse()` 构造）。`RequestRecord` 的字段是 `seq`、`time`、`method`、`path`、`status`、`latency`、`headers`、`raw`、`raw_text`、`request`、`outcome`，另有方法 `model()`、`stream()`、`protocol()`。
 

@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use http_body_util::{BodyExt, Limited};
@@ -11,7 +12,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::clock::{self, Clock};
-use crate::ir::{Outcome, Source};
+use crate::ir::{Outcome, Protocol, Source};
+use crate::openai::responses_store::ResponseStore;
 use crate::reqlog::{RequestFilter, RequestLog, RequestRecord, StatusFilter};
 use crate::script::{Engine, Rule, ScriptFormat};
 use crate::{Config, Response, json_response};
@@ -26,6 +28,13 @@ pub struct Control {
     pub(crate) clock: Arc<Clock>,
     pub(crate) log: RequestLog,
     pub(crate) engine: Engine,
+    /// Stored Responses API objects, see `openai::responses_store`.
+    pub(crate) responses: ResponseStore,
+    /// Mixed into response ids and `x-request-id` so that identical requests (retries, parallel
+    /// agents) get distinct ids, while a fresh or reset server repeats the same sequence.
+    counter: AtomicU64,
+    /// Bumped by every reset; requests parked across one must not write into the cleared log.
+    generation: AtomicU64,
 }
 
 /// What [`Control::reset_with`] clears. Everything is cleared by default.
@@ -37,6 +46,8 @@ pub struct ResetOptions {
     pub requests: bool,
     /// Remove all script rules.
     pub scripts: bool,
+    /// Forget stored Responses API objects.
+    pub responses: bool,
 }
 
 impl Default for ResetOptions {
@@ -45,6 +56,7 @@ impl Default for ResetOptions {
             clock: true,
             requests: true,
             scripts: true,
+            responses: true,
         }
     }
 }
@@ -82,10 +94,15 @@ impl Control {
     pub(crate) fn new(config: &Config) -> Result<Self, ControlError> {
         let engine = Engine::new(config.fallback.clone(), config.strict, config.delivery.clone());
         engine.scripts.replace(config.scripts.clone())?;
+        let log = RequestLog::new(config.request_log, config.request_log_capacity);
+        log.set_redact_auth(config.redact_auth);
         Ok(Self {
             clock: Arc::default(),
-            log: RequestLog::new(config.request_log, config.request_log_capacity),
+            log,
             engine,
+            responses: ResponseStore::default(),
+            counter: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -102,8 +119,26 @@ impl Control {
             self.clock.reset();
         }
         if opts.requests {
+            self.generation.fetch_add(1, Ordering::Relaxed);
             self.log.clear();
         }
+        if opts.responses {
+            self.responses.clear();
+        }
+        // Response ids derive from the counter; restarting it while stored responses survive
+        // would let a replayed request overwrite an old entry with the same id.
+        if opts.requests && opts.responses {
+            self.counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// The next value of the per-server id counter, starting at 0.
+    pub(crate) fn next_salt(&self) -> u64 {
+        self.counter.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn clock(&self) -> &Clock {
@@ -123,18 +158,31 @@ impl Control {
         self.log.clear();
     }
 
+    /// Ids and creation times (unix seconds) of the stored Responses API objects.
+    pub fn response_ids(&self) -> Vec<(String, i64)> {
+        self.responses.list()
+    }
+
+    /// Forgets all stored Responses API objects and returns how many there were.
+    pub fn clear_responses(&self) -> usize {
+        let n = self.responses.len();
+        self.responses.clear();
+        n
+    }
+
     /// Answers a request under [`PREFIX`]. Routes (see docs/design.md):
     ///
     /// - `GET  /_fakellm`                      status: version, clock, scripts count, log config
     /// - `POST /_fakellm/reset?clock=&requests=&scripts=`   booleans, all default true
     /// - `GET  /_fakellm/scripts`              `{"rules": [RuleInfo...]}`
-    /// - `PUT  /_fakellm/scripts`              replace; body is a JSON array / `{"rules":[...]}`,
+    /// - `PUT  /_fakellm/scripts[?keep_hits=true]`  replace; body is a JSON array / `{"rules":[...]}`,
     ///   or YAML when `Content-Type` is `application/yaml` or `text/yaml`
     /// - `POST /_fakellm/scripts`              append, same body
     /// - `DELETE /_fakellm/scripts`            clear
     /// - `GET  /_fakellm/clock`, `POST /_fakellm/clock/{freeze,unfreeze,set,advance,reset}`
     ///   bodies `{"at": "<RFC 3339>"}` / `{"by": "<duration>"}`, same as fakes3
-    /// - `GET  /_fakellm/requests?model=&has_tool=&stream=&status=&source=&rule=&path=&since=&after=&limit=&full=`
+    /// - `GET  /_fakellm/responses`, `DELETE /_fakellm/responses`  stored Responses API objects
+    /// - `GET  /_fakellm/requests?protocol=&model=&has_tool=&stream=&status=&source=&rule=&path=&since=&after=&limit=&full=`
     ///   `{"requests": [...], "total": n, "dropped": n}`; each record has `seq, time, method,
     ///   path, status, latency_us, protocol, model, stream, source, rule, request (IR), reply`
     ///   (`{finish, text, tool_calls:[{id,name,arguments}], usage}` or `error`); `full=true`
@@ -175,6 +223,7 @@ impl Control {
                         "version": env!("CARGO_PKG_VERSION"),
                         "clock": clock_json(&self.clock),
                         "scripts": { "count": self.engine.scripts.len() },
+                        "responses": { "count": self.responses.len() },
                         "strict": self.engine.strict,
                         "request_log": log_config_json(&self.log),
                     }),
@@ -188,6 +237,7 @@ impl Control {
                         clock: query_flag(q, "clock", defaults.clock)?,
                         requests: query_flag(q, "requests", defaults.requests)?,
                         scripts: query_flag(q, "scripts", defaults.scripts)?,
+                        responses: query_flag(q, "responses", defaults.responses)?,
                     });
                     Ok(reply(200, json!({ "reset": true })))
                 }
@@ -200,7 +250,11 @@ impl Control {
                     let rules = Rule::parse_many(text, format)?;
                     let count = rules.len();
                     if *method == M::PUT {
-                        self.engine.scripts.replace(rules)?;
+                        if query_flag(q, "keep_hits", false)? {
+                            self.engine.scripts.replace_keep_hits(rules)?;
+                        } else {
+                            self.engine.scripts.replace(rules)?;
+                        }
                     } else {
                         self.engine.scripts.append(rules)?;
                     }
@@ -210,6 +264,20 @@ impl Control {
                     self.engine.scripts.clear();
                     Ok(reply(200, json!({ "cleared": true })))
                 }
+                _ => not_allowed(),
+            },
+            ["responses"] => match *method {
+                M::GET => {
+                    let items = self.response_ids();
+                    Ok(reply(
+                        200,
+                        json!({
+                            "responses": items.iter().map(|(id, at)| json!({ "id": id, "created_at": fmt_unix(*at) })).collect::<Vec<_>>(),
+                            "count": items.len(),
+                        }),
+                    ))
+                }
+                M::DELETE => Ok(reply(200, json!({ "deleted": self.clear_responses() }))),
                 _ => not_allowed(),
             },
             ["clock"] => match *method {
@@ -370,6 +438,14 @@ fn request_filter(q: &Query) -> Result<RequestFilter, ControlError> {
                 f.source = Some(v.clone());
             }
             "rule" => f.rule = Some(v.clone()),
+            "protocol" => {
+                f.protocol = Some(match v.as_str() {
+                    "openai.chat" => Protocol::OpenaiChat,
+                    "openai.responses" => Protocol::OpenaiResponses,
+                    "anthropic.messages" => Protocol::AnthropicMessages,
+                    _ => return Err(bad("expected openai.chat, openai.responses or anthropic.messages")),
+                })
+            }
             "path" => f.path_prefix = Some(v.clone()),
             "since" => f.since = Some(parse_time(v)?),
             "after" => f.after = Some(v.parse().map_err(|_| bad("expected a sequence number"))?),
@@ -390,6 +466,10 @@ pub(crate) fn fmt_time(t: SystemTime) -> String {
     time::OffsetDateTime::from(t)
         .format(TIME_FORMAT)
         .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".into())
+}
+
+fn fmt_unix(secs: i64) -> String {
+    fmt_time(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs.max(0) as u64))
 }
 
 /// Parses an RFC 3339 time.
@@ -414,7 +494,7 @@ pub(crate) fn record_json(r: &RequestRecord, full: bool) -> Value {
         Some(Source::Script { name, .. }) => name.clone(),
         _ => None,
     };
-    let reply = match r.outcome.as_deref() {
+    let reply = match r.outcome.as_deref().map(Outcome::inner) {
         Some(Outcome::Reply { reply, .. }) => json!({
             "finish": reply.finish.as_str(),
             "text": reply.text,
@@ -429,13 +509,28 @@ pub(crate) fn record_json(r: &RequestRecord, full: bool) -> Value {
             },
         }),
         // The wire shape, so a test can assert the same thing the client saw.
-        Some(Outcome::Error { error, .. }) => json!({
-            "status": error.status,
-            "error": crate::openai::error::body(error)["error"],
-            "retry_after": error.retry_after.map(|d| d.as_secs_f64()),
-        }),
+        Some(Outcome::Error { error, .. }) => {
+            let body = match r.protocol() {
+                Some(Protocol::AnthropicMessages) => crate::anthropic::error::body(error),
+                _ => crate::openai::error::body(error),
+            };
+            json!({
+                "status": error.status,
+                "error": body["error"],
+                "retry_after": error.retry_after.map(|d| d.as_secs_f64()),
+                "in_stream": error.in_stream,
+                "headers": error.headers.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(),
+            })
+        }
+        Some(Outcome::Hang { .. }) => unreachable!("inner() never returns a Hang"),
         None => Value::Null,
     };
+    let mut reply = reply;
+    if let Some(Outcome::Hang { until, .. }) = r.outcome.as_deref()
+        && let Some(obj) = reply.as_object_mut()
+    {
+        obj.insert("hang".into(), json!({ "until_ms": until.map(|d| d.as_millis() as u64) }));
+    }
     let mut out = json!({
         "seq": r.seq,
         "time": fmt_time(r.time),

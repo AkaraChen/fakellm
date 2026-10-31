@@ -164,10 +164,11 @@ fn from_nanos(n: i64) -> SystemTime {
     }
 }
 
-/// Parses a duration such as `30d`, `1h30m`, `500ms` or `-2w`. Units: `ns`, `us`, `ms`, `s`, `m`,
-/// `h`, `d` (24 hours), `w`. A bare number is seconds. Returns signed nanoseconds.
+/// Parses a duration such as `30d`, `1h30m`, `500ms`, `1.5s` or `-2w`. Units: `ns`, `us`, `ms`,
+/// `s`, `m`, `h`, `d` (24 hours), `w`. A bare number is seconds. A number may have a decimal
+/// fraction; sub-nanosecond remainders are truncated. Returns signed nanoseconds.
 pub fn parse_duration(s: &str) -> Result<i64, String> {
-    let bad = || format!("invalid duration {s:?} (examples: 30d, 1h30m, 500ms, -2w)");
+    let bad = || format!("invalid duration {s:?} (examples: 30d, 1h30m, 500ms, 1.5s, -2w)");
     let (neg, mut rest) = match s.trim().strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s.trim().trim_start_matches('+')),
@@ -177,10 +178,25 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
     }
     let mut total: i128 = 0;
     while !rest.is_empty() {
-        let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-        let n: i128 = rest[..digits].parse().map_err(|_| bad())?;
-        rest = &rest[digits..];
-        let unit_len = rest.find(|c: char| c.is_ascii_digit()).unwrap_or(rest.len());
+        let int_len = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        let (int_part, after) = rest.split_at(int_len);
+        let (frac_part, after) = match after.strip_prefix('.') {
+            Some(f) => match f.split_at(f.find(|c: char| !c.is_ascii_digit()).unwrap_or(f.len())) {
+                ("", _) => return Err(bad()),
+                split => split,
+            },
+            None => ("", after),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(bad());
+        }
+        let n: i128 = if int_part.is_empty() {
+            0
+        } else {
+            int_part.parse().map_err(|_| bad())?
+        };
+        rest = after;
+        let unit_len = rest.find(|c: char| c.is_ascii_digit() || c == '.').unwrap_or(rest.len());
         let per: i128 = match &rest[..unit_len] {
             "ns" => 1,
             "us" | "µs" => 1_000,
@@ -194,6 +210,13 @@ pub fn parse_duration(s: &str) -> Result<i64, String> {
         };
         rest = &rest[unit_len..];
         total = total.saturating_add(n.saturating_mul(per));
+        // Fraction: digits / 10^len * per, with integer math. Digits beyond 18 cannot matter for
+        // a unit of at most a week in nanoseconds.
+        let digits = &frac_part[..frac_part.len().min(18)];
+        if !digits.is_empty() {
+            let f: i128 = digits.parse().map_err(|_| bad())?;
+            total = total.saturating_add(f * per / 10_i128.pow(digits.len() as u32));
+        }
     }
     let total = if neg { -total } else { total };
     i64::try_from(total).map_err(|_| bad())
@@ -296,6 +319,18 @@ mod tests {
         assert_eq!(parse_duration("-500ms"), Ok(-500_000_000));
         assert_eq!(parse_duration("2w"), Ok(14 * 86_400 * 1_000_000_000));
         assert_eq!(parse_duration("90"), Ok(90 * 1_000_000_000));
+        assert_eq!(parse_duration("1.5s"), Ok(1_500_000_000));
+        assert_eq!(parse_duration("0.25m"), Ok(15_000_000_000));
+        assert_eq!(parse_duration(".5h"), Ok(1_800_000_000_000));
+        assert_eq!(parse_duration("1.5ms"), Ok(1_500_000));
+        assert_eq!(parse_duration("-1.5s"), Ok(-1_500_000_000));
+        assert_eq!(parse_duration("1.5"), Ok(1_500_000_000));
+        assert_eq!(parse_duration("1h0.5s"), Ok(3_600_500_000_000));
+        assert_eq!(parse_duration("0.0000000019s"), Ok(1));
+        assert!(parse_duration("1.s5").is_err());
+        assert!(parse_duration(".").is_err());
+        assert!(parse_duration("1..5s").is_err());
+        assert!(parse_duration(".s").is_err());
         assert!(parse_duration("").is_err());
         assert!(parse_duration("d").is_err());
         assert!(parse_duration("5x").is_err());

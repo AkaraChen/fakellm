@@ -63,3 +63,21 @@ test('openai-compatible provider', async () => {
   for await (const t of result.textStream) out += t;
   assert.equal(out, 'compat ok');
 });
+
+test('cut_after_chunks: streamText sees no finish', async () => {
+  await srv.ctl.put('/scripts', [
+    { reply: { text: 'one two three four five six', stream: { chunk_tokens: 1, cut_after_chunks: 2 } } },
+  ]);
+  const parts = [];
+  const r = streamText({
+    model: provider.chat('gpt-4o'),
+    prompt: 'go',
+    onError: () => {},
+  });
+  try {
+    for await (const p of r.fullStream) parts.push(p);
+  } catch {}
+  const deltas = parts.filter((p) => p.type === 'text-delta').map((p) => p.text ?? p.delta ?? '');
+  assert.equal(deltas.join(''), 'one two');
+  assert.ok(!parts.some((p) => p.type === 'finish' && p.finishReason === 'stop'), JSON.stringify(parts.map((p) => p.type)));
+});

@@ -64,6 +64,8 @@ pub struct RequestFilter {
     pub status: Option<StatusFilter>,
     /// `script`, `fallback`, `strict` or `rejected`.
     pub source: Option<String>,
+    /// Only requests that came in on this API.
+    pub protocol: Option<Protocol>,
     /// Name of the rule that answered.
     pub rule: Option<String>,
     /// Path prefix, e.g. `/v1/chat/completions`.
@@ -140,6 +142,9 @@ impl RequestFilter {
                 return false;
             }
         }
+        if self.protocol.is_some_and(|p| r.protocol() != Some(p)) {
+            return false;
+        }
         if let Some(want) = &self.rule {
             match r.outcome.as_deref().map(Outcome::source) {
                 Some(Source::Script { name: Some(n), .. }) if n == want => {}
@@ -162,6 +167,7 @@ pub const DEFAULT_CAPACITY: usize = 10_000;
 
 pub struct RequestLog {
     enabled: AtomicBool,
+    redact_auth: AtomicBool,
     next_seq: AtomicU64,
     inner: Mutex<Inner>,
 }
@@ -177,6 +183,7 @@ impl RequestLog {
     pub fn new(enabled: bool, capacity: usize) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
+            redact_auth: AtomicBool::new(false),
             next_seq: AtomicU64::new(1),
             inner: Mutex::new(Inner {
                 capacity: capacity.max(1),
@@ -192,6 +199,11 @@ impl RequestLog {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Replace the values of credential headers by `<redacted>` in records stored from now on.
+    pub fn set_redact_auth(&self, on: bool) {
+        self.redact_auth.store(on, Ordering::Relaxed);
     }
 
     pub fn capacity(&self) -> usize {
@@ -210,9 +222,19 @@ impl RequestLog {
 
     /// Stores `record` (its `seq` is assigned here) and returns the seq. No-op returning 0 when
     /// logging is off.
-    pub fn record(&self, record: RequestRecord) -> u64 {
+    pub fn record(&self, mut record: RequestRecord) -> u64 {
         if !self.is_enabled() {
             return 0;
+        }
+        if self.redact_auth.load(Ordering::Relaxed) {
+            for (name, value) in &mut record.headers {
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "authorization" | "proxy-authorization" | "x-api-key"
+                ) {
+                    *value = "<redacted>".into();
+                }
+            }
         }
         // Assigned under the lock so that buffer order and seq order agree (`list` relies on it).
         let mut inner = self.inner.lock();
@@ -287,6 +309,32 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ir::{ApiError, Delivery, Message, Reply, Role, ToolDef};
+
+    #[test]
+    fn redacts_credential_headers() {
+        let mut r = rec(Some("m"), "/v1/x", 200, Source::Fallback);
+        r.headers = vec![
+            ("Authorization".into(), "Bearer sk-1".into()),
+            ("x-api-key".into(), "k".into()),
+            ("proxy-authorization".into(), "p".into()),
+            ("user-agent".into(), "ua".into()),
+        ];
+        let log = RequestLog::new(true, 10);
+        log.record(r.clone());
+        log.set_redact_auth(true);
+        log.record(r);
+        let (rows, _) = log.list(&RequestFilter::default());
+        assert_eq!(rows[0].headers[0].1, "Bearer sk-1");
+        assert_eq!(
+            rows[1].headers,
+            vec![
+                ("Authorization".to_owned(), "<redacted>".to_owned()),
+                ("x-api-key".into(), "<redacted>".into()),
+                ("proxy-authorization".into(), "<redacted>".into()),
+                ("user-agent".into(), "ua".into()),
+            ]
+        );
+    }
 
     #[test]
     fn glob() {

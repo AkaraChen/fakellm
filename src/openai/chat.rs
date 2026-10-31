@@ -20,6 +20,8 @@
 
 use serde_json::{Map, Value, json};
 
+use crate::sse::{Frame, FrameKind};
+
 use crate::ir::{
     ApiError, FinishReason, Message, Part, Protocol, Reply, Request, ResponseFormat, Role, ToolCall, ToolChoice, ToolDef, Usage,
 };
@@ -360,6 +362,8 @@ fn parse_message(i: usize, m: &Value) -> Result<Message, ApiError> {
         tool_calls,
         tool_call_id: field(obj, "tool_call_id").and_then(Value::as_str).map(str::to_owned),
         reasoning,
+        reasoning_opaque: None,
+        is_error: false,
     })
 }
 
@@ -460,19 +464,21 @@ pub fn render_sync(req: &Request, reply: &Reply, meta: &ResponseMeta) -> Value {
     })
 }
 
-/// What a chunk carries, so the streamer knows which ones take a token interval.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChunkKind {
-    /// The role chunk; sent at `ttft` together with the first content chunk.
-    Role,
-    /// Text or tool-call fragment; one `token_interval` apart.
-    Content,
-    /// Finish and usage chunks; sent right after the previous chunk.
-    Trailer,
+/// The whole chunk sequence for a streamed reply, in order, without the `[DONE]` sentinel.
+pub fn chunks(req: &Request, reply: &Reply, meta: &ResponseMeta, chunk_tokens: usize, args_chunk_bytes: usize) -> Vec<Frame> {
+    chunk_values(req, reply, meta, chunk_tokens, args_chunk_bytes)
+        .into_iter()
+        .map(|(kind, v)| Frame::json(kind, None, &v))
+        .collect()
 }
 
-/// The whole chunk sequence for a streamed reply, in order, without the `[DONE]` sentinel.
-pub fn chunks(req: &Request, reply: &Reply, meta: &ResponseMeta, chunk_tokens: usize, args_chunk_bytes: usize) -> Vec<(ChunkKind, Value)> {
+fn chunk_values(
+    req: &Request,
+    reply: &Reply,
+    meta: &ResponseMeta,
+    chunk_tokens: usize,
+    args_chunk_bytes: usize,
+) -> Vec<(FrameKind, Value)> {
     let chunk_tokens = chunk_tokens.max(1);
     let args_chunk_bytes = args_chunk_bytes.max(1);
     let wrap = |choices: Vec<Value>| -> Map<String, Value> {
@@ -501,24 +507,24 @@ pub fn chunks(req: &Request, reply: &Reply, meta: &ResponseMeta, chunk_tokens: u
     let mut out = Vec::new();
     for index in 0..req.n.max(1) {
         out.push((
-            ChunkKind::Role,
+            FrameKind::Head,
             delta_chunk(index, json!({"role": "assistant", "content": "", "refusal": null}), None),
         ));
         if let Some(r) = reply.reasoning.as_deref().filter(|r| !r.is_empty()) {
             for group in crate::tokenizer::tokenize(r).chunks(chunk_tokens) {
                 out.push((
-                    ChunkKind::Content,
+                    FrameKind::Content,
                     delta_chunk(index, json!({"reasoning_content": group.concat()}), None),
                 ));
             }
         }
         if let Some(text) = reply.text.as_deref() {
             for group in crate::tokenizer::tokenize(text).chunks(chunk_tokens) {
-                out.push((ChunkKind::Content, delta_chunk(index, json!({"content": group.concat()}), None)));
+                out.push((FrameKind::Content, delta_chunk(index, json!({"content": group.concat()}), None)));
             }
         }
         if let Some(refusal) = reply.refusal.as_deref().filter(|r| !r.is_empty()) {
-            out.push((ChunkKind::Content, delta_chunk(index, json!({"refusal": refusal}), None)));
+            out.push((FrameKind::Content, delta_chunk(index, json!({"refusal": refusal}), None)));
         }
         for (k, call) in reply.tool_calls.iter().enumerate() {
             let head = json!({"tool_calls": [{
@@ -527,20 +533,27 @@ pub fn chunks(req: &Request, reply: &Reply, meta: &ResponseMeta, chunk_tokens: u
                 "type": "function",
                 "function": {"name": call.name, "arguments": ""},
             }]});
-            out.push((ChunkKind::Content, delta_chunk(index, head, None)));
+            out.push((FrameKind::Content, delta_chunk(index, head, None)));
             for frag in split_bytes(&call.arguments, args_chunk_bytes) {
                 let d = json!({"tool_calls": [{"index": k, "function": {"arguments": frag}}]});
-                out.push((ChunkKind::Content, delta_chunk(index, d, None)));
+                out.push((FrameKind::Content, delta_chunk(index, d, None)));
             }
         }
-        out.push((ChunkKind::Trailer, delta_chunk(index, json!({}), Some(reply.finish))));
+        out.push((FrameKind::Trailer, delta_chunk(index, json!({}), Some(reply.finish))));
     }
     if req.include_usage {
         let mut o = wrap(Vec::new());
         o.insert("usage".into(), usage_json(&reply.usage, req.n));
-        out.push((ChunkKind::Trailer, Value::Object(o)));
+        out.push((FrameKind::Trailer, Value::Object(o)));
     }
     out
+}
+
+/// The frames of an in-stream error: one `data: {"error": {"message", "type", "param", "code"}}`
+/// frame, all four keys present (the same object as `error::body`), kind `Head`. The caller adds
+/// the `[DONE]` sentinel through `sse::respond`.
+pub fn error_frames(err: &ApiError) -> Vec<Frame> {
+    vec![Frame::json(FrameKind::Head, None, &super::error::body(err))]
 }
 
 /// Pieces of at most `max` bytes, split on char boundaries (a char wider than `max` gets its own piece).
@@ -578,6 +591,7 @@ mod tests {
             text: text.map(str::to_owned),
             tool_calls: calls,
             reasoning: None,
+            reasoning_opaque: None,
             refusal: None,
             finish,
             usage: Usage {
@@ -585,6 +599,7 @@ mod tests {
                 completion_tokens: 5,
                 reasoning_tokens: 2,
                 cached_tokens: 1,
+                cache_creation_tokens: 0,
             },
         }
     }
@@ -710,8 +725,8 @@ mod tests {
         req.stream = true;
         req.include_usage = true;
         let text = "Hello there, world! How are you?";
-        let cs = chunks(&req, &reply(Some(text), vec![], FinishReason::Stop), &meta(), 1, 16);
-        assert_eq!(cs[0].0, ChunkKind::Role);
+        let cs = chunk_values(&req, &reply(Some(text), vec![], FinishReason::Stop), &meta(), 1, 16);
+        assert_eq!(cs[0].0, FrameKind::Head);
         assert_eq!(
             cs[0].1["choices"][0]["delta"],
             json!({"role": "assistant", "content": "", "refusal": null})
@@ -727,7 +742,7 @@ mod tests {
             assert_eq!(v["service_tier"], "default");
         }
         let n = cs.len();
-        assert_eq!(cs[n - 2].0, ChunkKind::Trailer);
+        assert_eq!(cs[n - 2].0, FrameKind::Trailer);
         assert_eq!(cs[n - 2].1["choices"][0]["finish_reason"], "stop");
         assert_eq!(cs[n - 2].1["choices"][0]["delta"], json!({}));
         assert_eq!(cs[n - 1].1["choices"], json!([]));
@@ -735,15 +750,15 @@ mod tests {
         assert_eq!(cs.iter().filter(|(_, v)| v["choices"][0]["finish_reason"].is_string()).count(), 1);
 
         req.include_usage = false;
-        let cs = chunks(&req, &reply(Some("a"), vec![], FinishReason::Stop), &meta(), 3, 16);
+        let cs = chunk_values(&req, &reply(Some("a"), vec![], FinishReason::Stop), &meta(), 3, 16);
         assert!(cs.iter().all(|(_, v)| v.get("usage").is_none()));
-        assert_eq!(cs.last().unwrap().0, ChunkKind::Trailer);
+        assert_eq!(cs.last().unwrap().0, FrameKind::Trailer);
     }
 
     #[test]
     fn stream_empty_and_tool_calls() {
         let mut req = Request::new("gpt-4o", vec![Message::text(Role::User, "hi")]);
-        let cs = chunks(&req, &reply(Some(""), vec![], FinishReason::Stop), &meta(), 1, 16);
+        let cs = chunk_values(&req, &reply(Some(""), vec![], FinishReason::Stop), &meta(), 1, 16);
         assert_eq!(cs.len(), 2);
         let args = "{\"city\":\"Zürich\",\"unit\":\"celsius\"}";
         let calls = vec![
@@ -759,7 +774,7 @@ mod tests {
             },
         ];
         req.n = 2;
-        let cs = chunks(&req, &reply(None, calls, FinishReason::ToolCalls), &meta(), 1, 5);
+        let cs = chunk_values(&req, &reply(None, calls, FinishReason::ToolCalls), &meta(), 1, 5);
         let mut rebuilt = [String::new(), String::new()];
         let mut heads = 0;
         for (_, v) in cs.iter().filter(|(_, v)| v["choices"][0]["index"] == 0) {
@@ -792,7 +807,7 @@ mod tests {
         let req = Request::new("m", vec![Message::text(Role::User, "hi")]);
         let mut r = reply(Some("answer"), vec![], FinishReason::Stop);
         r.reasoning = Some("think hard".into());
-        let cs = chunks(&req, &r, &meta(), 1, 16);
+        let cs = chunk_values(&req, &r, &meta(), 1, 16);
         let first_reasoning = cs
             .iter()
             .position(|(_, v)| v["choices"][0]["delta"].get("reasoning_content").is_some())

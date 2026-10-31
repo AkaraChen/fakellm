@@ -100,20 +100,41 @@ pub struct Sse {
 }
 
 pub async fn open_stream(s: &Server, body: &Value) -> Sse {
-    let resp = request(
-        s,
-        "POST",
-        "/v1/chat/completions",
-        &[("content-type", "application/json")],
-        &body.to_string(),
-    )
-    .await;
+    open_sse(s, "/v1/chat/completions", &[], body).await
+}
+
+/// Opens a streaming POST on any generation endpoint (`/v1/messages`, `/v1/responses`, ...).
+/// `headers` are added to `content-type: application/json`.
+pub async fn open_sse(s: &Server, path: &str, headers: &[(&str, &str)], body: &Value) -> Sse {
+    let mut all = vec![("content-type", "application/json")];
+    all.extend_from_slice(headers);
+    let resp = request(s, "POST", path, &all, &body.to_string()).await;
     let (parts, body) = resp.into_parts();
     Sse {
         status: parts.status.as_u16(),
         headers: parts.headers,
         body,
         buf: String::new(),
+    }
+}
+
+/// `post_json` with extra request headers (`anthropic-version`, `x-api-key`, ...).
+pub async fn post_json_with(s: &Server, path: &str, headers: &[(&str, &str)], body: &Value) -> Reply {
+    let mut all = vec![("content-type", "application/json")];
+    all.extend_from_slice(headers);
+    send(s, "POST", path, &all, &body.to_string()).await
+}
+
+/// One SSE event: the `event:` name (if any) and the joined `data:` lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+impl SseEvent {
+    pub fn json(&self) -> Value {
+        serde_json::from_str(&self.data).unwrap_or_else(|e| panic!("not JSON ({e}): {}", self.data))
     }
 }
 
@@ -135,6 +156,46 @@ impl Sse {
                 None => return None,
             }
         }
+    }
+
+    /// Next event with its `event:` name, or None at end of body.
+    pub async fn next_event(&mut self) -> Option<SseEvent> {
+        loop {
+            if let Some(i) = self.buf.find("\n\n") {
+                let block: String = self.buf.drain(..i + 2).collect();
+                let mut event = None;
+                let mut data = Vec::new();
+                for line in block.lines() {
+                    if let Some(e) = line.strip_prefix("event: ") {
+                        event = Some(e.to_owned());
+                    } else if let Some(d) = line.strip_prefix("data: ") {
+                        data.push(d);
+                    }
+                }
+                return Some(SseEvent {
+                    event,
+                    data: data.join("\n"),
+                });
+            }
+            match self.body.frame().await {
+                Some(Ok(f)) => {
+                    if let Ok(d) = f.into_data() {
+                        self.buf.push_str(std::str::from_utf8(&d).unwrap());
+                    }
+                }
+                Some(Err(e)) => panic!("body error: {e}"),
+                None => return None,
+            }
+        }
+    }
+
+    /// Reads to the end; returns all events.
+    pub async fn events(&mut self) -> Vec<SseEvent> {
+        let mut out = Vec::new();
+        while let Some(e) = self.next_event().await {
+            out.push(e);
+        }
+        out
     }
 
     pub async fn next_within(&mut self, d: Duration) -> Option<Option<String>> {

@@ -2,7 +2,7 @@
 
 一个专门给测试用的 LLM API 服务：全内存、不跑模型，启动只要几毫秒。
 只复刻协议（请求和响应的格式、SSE 分帧、错误体、状态码），回复来自你写的剧本，或者一个确定性的默认回复。
-和 fakes3 之于 S3 是同一个思路。目前实现的是 OpenAI Chat Completions 和 `/v1/models`，用 Rust 编写。
+和 fakes3 之于 S3 是同一个思路。目前实现了三种协议：OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages（加模型列表和 `count_tokens`），三者共用同一套剧本、请求日志和虚拟时钟，用 Rust 编写。
 
 ## 为什么
 
@@ -13,6 +13,21 @@ paseo 手写了约 5 个 `http.createServer` 假模型，raft 十几个测试文
 - **时间不好控**：延迟用墙钟，abort / steer 的窗口就 flaky；retry 测试要真等 12 秒。fakellm 有服务端虚拟时钟，流式节奏、`created`、请求日志时间戳都跟着它走，冻结后一个 chunk 都不会发出，`advance` 一下立刻放行。
 - **调用过程不好断言**：日志丢字段（想断言 `reasoning_effort` 却发现 mock 没记）。fakellm 记录每个请求的原始 JSON、解析后的结构、请求头和服务端的回复，通过控制面查询。
 - **剧本无限重复匹配、旁路请求抢剧本**：agent 循环里同一条规则会一直命中（有人在 30 秒里被调用了 1143 次 tool），生成标题的旁路请求会吃掉本该给主流程的回复。剧本支持 `times`、`has_tool_result`、`last_tool_result`、`system`、`no_tools` 这类有状态条件。
+
+## 协议与端点
+
+| 协议 | 端点 | 说明 |
+|---|---|---|
+| OpenAI Chat Completions（`openai.chat`） | `POST /v1/chat/completions` | 同步和 SSE，工具调用，`n > 1`，`stream_options.include_usage` |
+| OpenAI Responses（`openai.responses`） | `POST /v1/responses` | 同步和 SSE，工具调用，推理项，`previous_response_id`；codex 和 ai-sdk 的 `openai('...')` 默认走这个 |
+| | `GET /v1/responses/{id}`、`DELETE /v1/responses/{id}` | 读取、删除保存的响应对象，见 [Responses 的状态](#responses-的状态与-previous_response_id) |
+| Anthropic Messages（`anthropic.messages`） | `POST /v1/messages` | 同步和 SSE，`tool_use`、`thinking`（含 `signature`），`anthropic-beta` 头只记录不校验 |
+| | `POST /v1/messages/count_tokens` | 返回 `{"input_tokens": n}`，不消耗剧本 |
+| 模型列表 | `GET /v1/models`、`GET /v1/models/{id}` | 请求带 `anthropic-version` 头时返回 Anthropic 的格式（`display_name`、`created_at`、`has_more`），否则是 OpenAI 的 |
+
+所有路径也可以不带 `/v1` 前缀。其他路径是 404 `Invalid URL (METHOD path)`，带 `anthropic-version` 头的请求得到 Anthropic 格式的 404。
+认证：配了 `--api-key` 后，`Authorization: Bearer` 和 `x-api-key` 任一个对即可，所有路由通用；失败时 Chat / Responses 返回 OpenAI 的 `invalid_api_key`，Anthropic 路由返回 `authentication_error`（“invalid x-api-key”）。
+三种协议的请求先被解析成同一个内部结构，所以[剧本](#剧本)里同一条规则可以回答它们，想区分时用 `protocol` 条件。
 
 ## 快速开始
 
@@ -37,7 +52,7 @@ const r = await client.chat.completions.create({
 console.log(r.choices[0].message.content);
 ```
 
-Vercel AI SDK。必须用 `.chat(...)`：`openai('gpt-4o')` 默认走 Responses API，现在还没有实现（见[路线图](#路线图)）：
+Vercel AI SDK。`openai('gpt-4o')` 默认走 Responses API，`openai.chat(...)` 走 Chat Completions，两者都支持：
 
 ```js
 import { generateText } from 'ai';
@@ -48,6 +63,35 @@ const { text } = await generateText({ model: openai.chat('gpt-4o'), prompt: 'pin
 console.log(text);
 ```
 
+Responses API 和 Anthropic SDK。注意 Anthropic SDK 的 `baseURL` **不带** `/v1`（它自己会加），ai-sdk 的 `createAnthropic` 则要带 `/v1`：
+
+```js
+import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
+
+const openai = new OpenAI({ baseURL: 'http://127.0.0.1:41873/v1', apiKey: 'test' });
+const r = await openai.responses.create({ model: 'gpt-5.5', input: 'ping' });
+console.log(r.output_text);
+
+const anthropic = new Anthropic({ baseURL: 'http://127.0.0.1:41873', apiKey: 'test' });
+const m = await anthropic.messages.create({
+  model: 'claude-opus-5-5',
+  max_tokens: 64,
+  messages: [{ role: 'user', content: 'ping' }],
+});
+console.log(m.content[0].text);
+```
+
+```js
+import { generateText } from 'ai';
+import { createAnthropic } from '@ai-sdk/anthropic';
+
+const anthropic = createAnthropic({ baseURL: 'http://127.0.0.1:41873/v1', apiKey: 'test' });
+const { text } = await generateText({ model: anthropic('claude-opus-5-5'), prompt: 'ping' });
+```
+
+Anthropic 的请求必须带 `max_tokens`（和真实 API 一样，缺了是 400 “max_tokens: Field required”）。
+
 没有剧本时，每个请求得到一段确定性的 lorem 文本（同一个请求永远得到同一个回复）。注册一条规则：
 
 ```bash
@@ -56,7 +100,28 @@ curl -X PUT http://127.0.0.1:41873/_fakellm/scripts \
 # {"added":1,"count":1}
 ```
 
-上面两个例子这时都会打印 `pong`。`sdk/node/` 里有用官方 SDK 跑的完整测试（`cargo test` 会在装了 node 时自动运行它们，先在该目录 `npm ci`）。
+上面的例子这时都会打印 `pong`。`sdk/node/` 里有用官方 SDK 跑的完整测试：`openai`、`@anthropic-ai/sdk`、Vercel AI SDK 的 `@ai-sdk/openai`（Chat 和 Responses）和 `@ai-sdk/anthropic`，共六个套件（`cargo test` 会在装了 node 时自动运行它们，先在该目录 `npm ci`；没装 `node_modules` 会打印 skip 并跳过）。
+
+### 接线真实的 agent：`fakellm wire`
+
+`fakellm wire <目标>` 打印让真实客户端连上 fakellm 的配置（环境变量、配置文件、代码片段），目标有 `claude`、`codex`、`opencode`、`pi`、`openai-sdk`、`ai-sdk`、`anthropic-sdk`：
+
+```bash
+eval "$(fakellm wire claude --endpoint http://127.0.0.1:41873)"    # 导出 ANTHROPIC_BASE_URL 和 ANTHROPIC_API_KEY
+fakellm wire codex --endpoint http://127.0.0.1:41873 --format toml > "$CODEX_HOME/config.toml"
+fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json     # files["opencode.json"] 是配置文件
+```
+
+`--format` 取 `shell`（默认，有环境变量时）、`env`、`json`、`toml`，`--endpoint` 缺省读 `FAKELLM_ENDPOINT`。用真实二进制验证的结果（`e2e/*.sh`，手工运行，不在 `cargo test` 里；配方和注意事项见 [docs/wire.md](docs/wire.md)）：
+
+| 客户端 | 结果 | 要点 |
+|---|---|---|
+| codex（0.162.1） | 通过：纯文本，和一轮 `exec_command` 工具调用 | 不读 `OPENAI_BASE_URL`，必须写自定义 provider（`wire codex` 生成）；`env_key` 对应的环境变量必须非空；故障只能用流内 `response.failed` |
+| Claude Code（2.1.314） | 通过：`claude -p` 得到 `FAKELLM_OK` | 需要 `ANTHROPIC_API_KEY`；它在 `messages` 里放 `role: system` 的条目，fakellm 为此放宽了校验 |
+| opencode（1.18.29） | 通过：标题旁路请求加主请求 | 要写一条 `no_tools` + `system` 的规则接住标题生成；隔离测试设 `OPENCODE_DISABLE_MODELS_FETCH=1`；第一次运行曾卡死一次，没能复现 |
+| pi | **没有用真实的 pi 验证** | 只生成配置，格式按约定写，没有 e2e 脚本 |
+
+这些 e2e 只验证“能完成一轮对话”，没有用真实 harness 测过 429 重试、断流、挂起这些故障。
 
 ## 剧本
 
@@ -67,7 +132,7 @@ curl -X PUT http://127.0.0.1:41873/_fakellm/scripts \
 |---|---|
 | `name` | 可选。规则名，出现在请求日志里，可以用 `rule=` 过滤 |
 | `match` | 条件，缺省或 `{}` 匹配所有请求。所有写出的字段都要满足 |
-| `reply` | 回复：`text` / `tool_calls` / `error` 三选一（`text` 和 `tool_calls` 可以同时有） |
+| `reply` | 回复：`text` / `tool_calls` / `error` / `hang` 四选一（`text` 和 `tool_calls` 可以同时有） |
 | `times` | 这条规则最多回答几次，用完后跳过，缺省不限 |
 
 `match` 常用字段（完整列表和语义见 [docs/scripts.md](docs/scripts.md)）：
@@ -81,8 +146,23 @@ curl -X PUT http://127.0.0.1:41873/_fakellm/scripts \
 | `has_tool_result` | 对话以 tool 结果结尾（`true`）或不是（`false`） |
 | `last_tool_result` | 结尾的 tool 结果里有某个函数的结果 |
 | `stream` / `turn` | 只匹配流式 / 非流式；已经有几条 assistant 消息 |
+| `protocol` | 只匹配某个协议：`openai.chat`、`openai.responses`、`anthropic.messages` |
+| `probability` | 0 到 1，其他条件都满足后按这个概率命中（确定性的，同样的请求序列每次得到同样的结果） |
+| `every_nth` | 其他条件都满足的请求里，每第 N 个命中（`3` 命中第 3、6、9 个） |
 
 正则可以写成 `"pattern"`、`"/pattern/"` 或 `"/pattern/i"`（忽略大小写）。
+
+`reply` 常用字段（完整说明见 [docs/scripts.md](docs/scripts.md#reply)）：
+
+| 字段 | 含义 |
+|---|---|
+| `text` / `tool_calls` | 回复文本 / 工具调用（`arguments` 可以故意写成不完整的 JSON） |
+| `reasoning` / `reasoning_opaque` | 推理文本，和随它发的 `signature`（Anthropic）/ `encrypted_content`（Responses） |
+| `error` | 错误：`status` 必填，`type` / `code` / `message` / `param` / `retry_after` 可覆盖；`in_stream: true` 把错误放进事件流；`headers` 加额外响应头（`retry-after-ms`、`x-should-retry`） |
+| `hang` / `hang_ms` | 收到请求后不回答（连响应头都不发）/ 挂这么久（服务端时钟）再回答 |
+| `stream` | 节奏：`ttft_ms`、`tokens_per_sec`、`chunk_tokens`、`cut_after_chunks`（流中途断开） |
+| `delay_ms` | 同步响应或错误发出前的等待 |
+| `finish_reason` | 覆盖结束原因（`stop`、`length`、`tool_calls`、`content_filter`） |
 
 YAML：
 
@@ -120,7 +200,8 @@ JSON：
 
 - **`times`**：`times: 1` 的规则回答一次后就被跳过，之后的请求落到后面的规则。`GET /_fakellm/scripts` 里每条规则有 `hits` 和 `exhausted`。
 - **旁路请求**：agent 常在主流程之外发请求（生成会话标题、做摘要）。用 `system` 匹配它们的 system prompt、`no_tools: true` 区分它们没有带工具，写在主规则**前面**，主流程的规则就不会被它们消耗。完整例子在 [docs/scripts.md](docs/scripts.md)。
-- 注册规则时整体校验：正则不合法、`reply` 为空、`text` 和 `error` 同时出现、出现未知字段都是 400，不会改动已有的规则。
+- **`tool_result` 的判定**对三种协议一致：看最后一条 assistant 消息之后有没有工具结果，所以 Claude Code 那种“`tool_result` 块后面还跟一段文本”的用户消息，`has_tool_result` 仍然命中。
+- 注册规则时整体校验：正则不合法、`reply` 为空、`text` 和 `error` 同时出现、`probability` 不在 0 到 1、`every_nth` 为 0、`protocol` 写错、出现未知字段都是 400，不会改动已有的规则。
 - 所有 `*_ms`、`tokens_per_sec` 等延迟字段读的是服务端时钟，见下一节。
 
 ## 默认兜底与 `--strict`
@@ -128,17 +209,17 @@ JSON：
 没有规则命中时，默认回一段 lorem 文本，长度由 `--fallback-tokens` 决定（默认 32 token），内容是请求的哈希播种的，所以相同请求得到相同回复、不同请求不同。
 兜底规则：
 
-- 遵守 `max_tokens` / `max_completion_tokens`（截断，`finish_reason` 为 `length`）。
-- `response_format` 是 `json_object` 或 `json_schema` 时返回 `{"message": "<lorem>"}`。
-- `tool_choice` 强制调用工具（`required` 或指定名字）时返回一个参数为 `{}` 的工具调用；其他情况**永远不会**主动调用工具，所以 agent 循环到兜底就会结束，而不是空转。
+- 遵守 `max_tokens` / `max_completion_tokens`（截断，`finish_reason` 为 `length`；Anthropic 是 `stop_reason: max_tokens`，Responses 是 `max_output_tokens`，状态 `incomplete`，真实 API 要求它至少为 16，更小是 400）。
+- `response_format`（Responses 里是 `text.format`）是 `json_object` 或 `json_schema` 时返回 `{"message": "<lorem>"}`。
+- `tool_choice` 强制调用工具（`required` 或指定名字，Anthropic 的 `any` 和 `tool`）时返回一个参数为 `{}` 的工具调用；其他情况**永远不会**主动调用工具，所以 agent 循环到兜底就会结束，而不是空转。
 
-`--strict`（或 `FAKELLM_STRICT=true`，这个环境变量只认 `true` / `false`）把兜底换成错误：没有规则命中的请求得到 400：
+`--strict`（或 `FAKELLM_STRICT=true`，环境变量也认 `1/0`、`yes/no`、`on/off`）把兜底换成错误：没有规则命中的请求得到 400：
 
 ```json
 {"error": {"message": "fakellm: no script rule matched this request (model \"gpt-4o\") and --strict is on", "type": "fakellm_error", "param": null, "code": "fakellm_no_matching_rule"}}
 ```
 
-用 400 而不是 5xx，是为了让 SDK 不重试、测试立刻失败。
+用 400 而不是 5xx，是为了让 SDK 不重试、测试立刻失败。Anthropic 路由的 strict 错误是同样的状态码，错误体是 Anthropic 的格式（`type: fakellm_error`，没有 `code`）。
 
 ## 虚拟时钟与流式节奏
 
@@ -172,7 +253,7 @@ await ctl.post('/clock/advance', { by: '500ms' });     // 现在 first 完成
 
 ## 请求日志
 
-每个 API 请求（包括被拒绝的：认证失败、JSON 不合法）都会记入一个有上限的内存环形缓冲（`--request-log-capacity`，默认 10000，满了丢最旧的；`--no-request-log` 关闭）。控制面请求本身不记录。每条记录有原始 JSON body（`full=true` 时）、解析后的结构化请求、回复、状态码、来源（哪条规则、兜底、strict 还是被拒绝）：
+每个 API 请求（包括被拒绝的：认证失败、JSON 不合法）都会记入一个有上限的内存环形缓冲（`--request-log-capacity`，默认 10000，满了丢最旧的；`--no-request-log` 关闭）。控制面请求本身不记录。三种协议的请求记在同一个日志里，用 `protocol` 区分（`ctl requests list --protocol anthropic.messages`）。每条记录有原始 JSON body（`full=true` 时）、解析后的结构化请求、回复、状态码、来源（哪条规则、兜底、strict 还是被拒绝）：
 
 ```bash
 fakellm ctl requests list --has-tool read_file --source script
@@ -180,21 +261,24 @@ fakellm ctl requests list --count --status 4xx
 fakellm ctl --json requests list --limit 1 --full
 ```
 
-字段和过滤条件见 [docs/control-plane.md](docs/control-plane.md#请求日志)。日志里保存完整文本，不截断 system prompt。`authorization` 头的值也原样保存，方便断言客户端发的 key。
+字段和过滤条件见 [docs/control-plane.md](docs/control-plane.md#请求日志)。日志里保存完整文本，不截断 system prompt。`authorization` 头的值默认也原样保存，方便断言客户端发的 key；要导出日志给别人时用 `--redact-auth`。被 `hang` 挂住、客户端放弃的请求以 `status: 0` 记入。
 
 ## 错误与状态码
 
-错误体与 OpenAI 一致：`{"error": {"message", "type", "param", "code"}}`，四个键总是都在（没有值时为 `null`）。规则里只写 `status` 就得到下表的默认值，`type` / `code` / `message` / `param` 都可以覆盖，`retry_after`（秒）写入 `retry-after` 头：
+错误体跟着请求的协议走。Chat 和 Responses 与 OpenAI 一致：`{"error": {"message", "type", "param", "code"}}`，四个键总是都在（没有值时为 `null`）；Anthropic Messages 是 `{"type": "error", "error": {"type", "message"}}`，只有这两个键，规则里写的 `code` 和 `param` 在这里被丢掉。
+规则里只写 `status` 就得到下表的默认值，`type` / `code` / `message` / `param` 都可以覆盖，`retry_after`（秒）写入 `retry-after` 头，`headers` 可以加任意响应头。
+
+OpenAI 系（Chat、Responses）的默认值：
 
 | status | `type` | `code` | message |
 |---|---|---|---|
 | 400 | `invalid_request_error` | null | Invalid request. |
 | 401 | `invalid_request_error` | `invalid_api_key` | Incorrect API key provided. ... |
 | 403 | `invalid_request_error` | null | You do not have access to this resource. |
-| 404 | `invalid_request_error` | `model_not_found` | The model `unknown` does not exist ... |
+| 404 | `invalid_request_error` | `model_not_found` | The model `unknown` does not exist ...（写死的是 `unknown`，不是请求里的模型名） |
 | 408 | `timeout` | null | Request timed out. |
 | 409 | `server_error` | null | Conflict. |
-| 413 | `invalid_request_error` | `request_too_large` | Request too large.（目前响应状态码是 400，见 [TODO](TODO.md)） |
+| 413 | `invalid_request_error` | `request_too_large` | Request too large. |
 | 429 | `requests` | `rate_limit_exceeded` | Rate limit reached for requests. Please try again later. |
 | 500 | `server_error` | null | The server had an error while processing your request. Sorry about that! |
 | 502 | `server_error` | null | Bad gateway. |
@@ -202,6 +286,22 @@ fakellm ctl --json requests list --limit 1 --full
 | 529 | `overloaded_error` | null | Overloaded（没有标准状态短语） |
 | 其他 >= 500 | `server_error` | null | The server had an error while processing your request. |
 | 其他 | `invalid_request_error` | null | Request failed with status N. |
+
+Anthropic Messages 的默认值（只有 `type` 和 `message`）：
+
+| status | `type` | message |
+|---|---|---|
+| 400 | `invalid_request_error` | Invalid request. |
+| 401 | `authentication_error` | invalid x-api-key |
+| 403 | `permission_error` | Your API key does not have permission to use the specified resource. |
+| 404 | `not_found_error` | Not found. |
+| 408 / 504 | `timeout_error` | Request timed out. |
+| 409 | `api_error` | Conflict. |
+| 413 | `request_too_large` | Request exceeds the maximum allowed number of bytes. |
+| 429 | `rate_limit_error` | This request would exceed your organization's rate limit. |
+| 529 | `overloaded_error` | Overloaded |
+| 其他 >= 500 | `api_error` | Internal server error |
+| 其他 | `invalid_request_error` | Request failed. |
 
 配额耗尽、上下文溢出这类客户端会按 `code` 或文案分类的错误，在规则里自己写：
 
@@ -223,7 +323,7 @@ fakellm ctl --json requests list --limit 1 --full
 | 情况 | 状态码 | `code` |
 |---|---|---|
 | 配了 `--api-key` 但 key 不对（`Authorization: Bearer` 或 `x-api-key`） | 401 | `invalid_api_key` |
-| body 不是合法 JSON | 400 | null（文案与 OpenAI 相同） |
+| body 不是合法 JSON | 400 | null（文案与 OpenAI 相同；Anthropic 路由是 “The request body is not valid JSON.”） |
 | 缺 `messages` | 400 | `missing_required_parameter` |
 | 缺 `model` | 400 | null，`you must provide a model parameter` |
 | 字段类型不对 | 400 | `invalid_type` |
@@ -232,8 +332,68 @@ fakellm ctl --json requests list --limit 1 --full
 | 不支持的路径 | 404 | null，`Invalid URL (POST /v1/embeddings)` |
 | `GET /v1/models/{id}` 不在 `--models` 里 | 404 | `model_not_found` |
 | strict 模式没有规则命中 | 400 | `fakellm_no_matching_rule` |
+| Responses 缺 `input`（又没有 `previous_response_id`） | 400 | `missing_required_parameter` |
+| Responses 的 `max_output_tokens` 小于 16 | 400 | `integer_below_min_value` |
+| `previous_response_id` 找不到 | 404 | `previous_response_not_found` |
+| Anthropic 缺 `max_tokens` / `model` / `messages`、角色不对 | 400 | `invalid_request_error`，文案是 Anthropic 的 `field: problem` 风格，如 “max_tokens: Field required” |
+| Anthropic `thinking.budget_tokens` 小于 1024 或不小于 `max_tokens` | 400 | 同上，与真实 API 一样 |
 
-每个响应都带 `x-request-id`（由请求内容派生，相同请求相同）和 `openai-processing-ms`。
+Anthropic 路由上，上面的错误都用 Anthropic 的错误体，`code` 和 `param` 不出现。
+
+每个响应都带 `x-request-id` 和 `openai-processing-ms`；Anthropic 路由还带值相同的 `request-id`。`x-request-id` 由请求内容和服务端的一个计数器派生：内容相同的两次请求（比如重试）得到不同的值，`reset` 会把计数器清零。
+
+## 故障注入
+
+客户端要处理的各类失败，都用剧本里的 `error`、`stream` 和 `hang` 写出来，三种协议各有自己的错误体（见上一节）。`match` 里加 `protocol` 可以给不同协议写不同的错误，`times` / `every_nth` / `probability` 决定失败几次、多久一次。完整的类别表、所有例子和每个字段的语义见 [docs/scripts.md](docs/scripts.md#故障注入每一类怎么写)。
+
+| 类别 | Chat / Responses | Anthropic |
+|---|---|---|
+| `auth` | `error: { status: 401 }` | `error: { status: 401 }` |
+| `quota` | `status: 429, type: insufficient_quota, code: insufficient_quota` | `status: 400, type: invalid_request_error`，文案 “...reached your specified workspace API usage limits.” |
+| `rate_limited` | `status: 429, retry_after: 2` | 同左 |
+| `billing` | `status: 400, code: billing_hard_limit_reached` | `status: 402, type: billing_error` |
+| `model_unavailable` | `status: 404`（默认 `model_not_found`） | `status: 404`（默认 `not_found_error`） |
+| `input_too_large` | `status: 400, code: context_length_exceeded, param: messages` | `status: 400`，文案 “prompt is too long: N tokens > M maximum”；请求体太大用 `status: 413` |
+| `overloaded` | `status: 503`（或 529） | `status: 529` |
+| `provider` | `status: 500`（或 502、504） | `status: 500` |
+| 流中途断开 | `stream: { cut_after_chunks: N }` | 同左 |
+| 挂起 | `hang: true`，或 `hang_ms: N` | 同左 |
+| 流内错误 | `error: { ..., in_stream: true }` | 同左 |
+
+这些类别的名字来自 oar 这类 agent 运行时的错误分类；oar 的分类代码不在本仓库里，上表是按各家真实 API 的状态码、`type`、`code` 和文案写的，没有对照 oar 验证过。如果你的分类器看别的字段，改 `type` / `code` / `message` 即可。
+
+```yaml
+- match: { last_user: "quota" }
+  reply: { error: { status: 429, type: insufficient_quota, code: insufficient_quota, message: "You exceeded your current quota." } }
+- match: { last_user: "flaky" }                   # 每第 3 个请求返回 500，要求 SDK 不要重试
+  reply: { error: { status: 500, headers: { x-should-retry: "false" } } }
+  # 在 match 里再加 every_nth: 3 即可
+- match: { last_user: "cut" }                     # 发出两个 content chunk 后流消失
+  reply: { text: "one two three four", stream: { cut_after_chunks: 2 } }
+- match: { last_user: "hang" }                    # 连响应头都不发，直到客户端超时
+  reply: { hang: true }
+```
+
+- **重试头**：`error.headers` 可以加 `retry-after-ms`、`x-should-retry`（官方 SDK 用它覆盖自己的重试判断），`retry_after` 只写 `retry-after`。
+- **流中途断开有两种**：`cut_after_chunks` 是干净地结束 chunked body（没有 finish 事件，没有 `[DONE]`；客户端看到流提前结束）；`in_stream: true` 的错误是 200 的流里出现一个错误事件（Chat 是 `data: {"error": ...}` 加 `[DONE]`，Anthropic 是 `event: error`，Responses 是 `response.failed`）。**流中途的 TCP 重置还没做**，见 [TODO](TODO.md)。
+- **挂起**：`hang` 的请求在客户端放弃后以 `status: 0` 记入请求日志；`hang_ms` 读服务端时钟，冻结时钟时一直挂着，`advance` 后放行。
+- **codex 的限制**：codex 对 HTTP 400 的 body 不分类（一律是不重试的 `InvalidRequest`），要让它认出 `context_length_exceeded`、`insufficient_quota`、`rate_limit_exceeded`、`server_is_overloaded`，错误必须是流内的 `response.failed`，也就是规则里写 `in_stream: true`。写法见 [docs/scripts.md](docs/scripts.md#示例五codex-的上下文溢出)。codex 的 `wire` 配置同时把它的重试关掉了，并把空闲超时降到 5 秒，所以挂起超过 5 秒的流会被它当作超时。
+
+## Responses 的状态与 `previous_response_id`
+
+`POST /v1/responses` 默认把每个响应保存在内存里（请求带 `store: false` 则不存），供三件事用：
+
+- `previous_response_id`：新请求的对话是“被引用响应的完整对话 + 新 `input`”（`instructions` 不继承，和真实 API 一样要重发）。请求日志和剧本条件（`turn`、`has_tool_result`）看到的是展开后的整个对话。找不到时返回 404，`code: previous_response_not_found`。
+- `GET /v1/responses/{id}` 读回响应对象，`DELETE /v1/responses/{id}` 删除，未知 id 是 404。
+- 保存的是快照：删除一个响应，不影响已经从它派生出的响应。
+
+规则：最多保存 1000 个，满了丢最旧的；被 `cut_after_chunks` 截断的流也照常保存；`ctl reset` 默认连同它们一起清（`--keep-responses` 保留），控制面 `GET` / `DELETE /_fakellm/responses` 查看和清空（见 [docs/control-plane.md](docs/control-plane.md#responses-对象)）。
+codex 走 HTTP，不发 `previous_response_id`（`store` 恒为 `false`，每次重发完整历史），所以对 codex 这条路径用不上；`openai` SDK 和 ai-sdk 的 Responses 会用。
+
+```js
+const a = await openai.responses.create({ model: 'gpt-5.5', input: 'ping' });
+const b = await openai.responses.create({ model: 'gpt-5.5', input: 'and again', previous_response_id: a.id });
+```
 
 ## Rust 库模式
 
@@ -277,10 +437,11 @@ server.reset();
 | `requests(&RequestFilter)` | 日志记录（旧到新）和过滤后（`limit` 之前）的总数 |
 | `clock()` | `freeze` / `unfreeze` / `set` / `advance` / `reset` / `now` |
 | `control()` | 控制面的全部操作，包括 `reset_with(ResetOptions)` |
-| `reset()` | 清空剧本、日志、时钟 |
+| `response_ids()` / `clear_responses()` | 保存的 Responses 对象的 id 列表 / 清空它们 |
+| `reset()` | 清空剧本、日志、时钟、已存的 response |
 | `shutdown()` | 停止接受连接（async），`BlockingServer::shutdown` 是同步版本 |
 
-`Config` 的字段和下面的命令行参数一一对应；`Config::default()` 监听随机端口、接受任何 key、非 strict、无延迟。多个 `Server` 之间状态完全独立。`Server::wait()` 会一直等到进程退出（二进制就是这么用的）。
+`Config` 的字段和下面的命令行参数一一对应（包括 `redact_auth` 和 `delivery` 里的 `chunk_tokens`、`args_chunk_bytes`）；`Config::default()` 监听随机端口、接受任何 key、非 strict、无延迟。多个 `Server` 之间状态完全独立。`Server::wait()` 会一直等到进程退出（二进制就是这么用的）。
 
 ## 配置
 
@@ -290,21 +451,24 @@ server.reset();
 |---|---|---|---|
 | `--host` | `FAKELLM_HOST` | `127.0.0.1` | 监听地址 |
 | `--port` | `FAKELLM_PORT` | `4010` | 监听端口，`0` 为随机；实际地址打印到 stdout |
-| `--api-key` | `FAKELLM_API_KEY` | 无 | 设置后必须匹配（`Authorization: Bearer` 或 `x-api-key`），否则 401；不设则任意 key 都行。只管 API，不管控制面 |
-| `--models` | `FAKELLM_MODELS` | 12 个常见名字 | `GET /v1/models` 返回的列表，逗号分隔。不影响 chat 接口，那里任何模型名都接受 |
-| `--strict` | `FAKELLM_STRICT` | 关 | 没有规则命中时返回 400 而不是默认回复 |
+| `--api-key` | `FAKELLM_API_KEY` | 无 | 设置后必须匹配（`Authorization: Bearer` 或 `x-api-key`），否则 401（Anthropic 路由用 Anthropic 的错误体）；不设则任意 key 都行。只管 API，不管控制面 |
+| `--models` | `FAKELLM_MODELS` | 14 个常见名字（gpt-4o、gpt-5、o3、gpt-5.5、claude-sonnet-4-5、claude-opus-4-1、claude-haiku-4-5 等） | `GET /v1/models` 返回的列表，逗号分隔。不影响生成接口，那里任何模型名都接受 |
+| `--strict` | `FAKELLM_STRICT` | 关 | 没有规则命中时返回 400 而不是默认回复。环境变量认 `true/false`、`1/0`、`yes/no`、`on/off` |
 | `--scripts` | `FAKELLM_SCRIPTS` | 无 | 启动时加载的规则文件；`.json` / `.yaml` / `.yml` 按扩展名，其他按内容判断。规则不合法则启动失败 |
-| `--fallback-tokens` | 无 | `32` | 默认回复的长度（token） |
-| `--ttft` | 无 | `0` | 默认首 token 延迟，如 `300ms`、`2s`（单位 ns us ms s m h d w，不支持小数）。规则可覆盖 |
-| `--tokens-per-sec` | 无 | `0` | 默认流式速度，`0` 表示 chunk 之间不等待。规则可覆盖 |
-| `--no-request-log` | 无 | 关 | 不记录请求 |
-| `--request-log-capacity` | 无 | `10000` | 日志保留的请求数，满了丢最旧的 |
+| `--fallback-tokens` | `FAKELLM_FALLBACK_TOKENS` | `32` | 默认回复的长度（token） |
+| `--ttft` | `FAKELLM_TTFT` | `0` | 默认首 token 延迟，如 `300ms`、`1.5s`（单位 ns us ms s m h d w，可以带小数）。规则可覆盖 |
+| `--tokens-per-sec` | `FAKELLM_TOKENS_PER_SEC` | `0` | 默认流式速度，`0` 表示 chunk 之间不等待。规则可覆盖 |
+| `--chunk-tokens` | `FAKELLM_CHUNK_TOKENS` | `1` | 每个流式文本 chunk 含几个 token（至少 1），三种协议通用。规则的 `stream.chunk_tokens` 可覆盖 |
+| `--args-chunk-bytes` | `FAKELLM_ARGS_CHUNK_BYTES` | `16` | 流式工具调用参数每个分片的字节数（至少 1），三种协议通用 |
+| `--no-request-log` | `FAKELLM_NO_REQUEST_LOG` | 关 | 不记录请求 |
+| `--request-log-capacity` | `FAKELLM_REQUEST_LOG_CAPACITY` | `10000` | 日志保留的请求数，满了丢最旧的 |
+| `--redact-auth` | `FAKELLM_REDACT_AUTH` | 关 | 请求日志里把 `authorization`、`proxy-authorization`、`x-api-key` 的值记成 `<redacted>`；不设则原样保存 |
 
-日志级别用 `RUST_LOG`（默认 `warn`）。`fakellm ctl` 的 `--endpoint` 读 `FAKELLM_ENDPOINT`（默认 `http://127.0.0.1:4010`）。
+布尔参数可以只写 `--strict` 不带值。日志级别用 `RUST_LOG`（默认 `warn`）。`fakellm ctl` 和 `fakellm wire` 的 `--endpoint` 读 `FAKELLM_ENDPOINT`（默认 `http://127.0.0.1:4010`）。`--scripts` 文件读不出来时报错信息里有文件名。
 
 ## 控制面
 
-API 端口上 `/_fakellm/*` 是测试控制面：重置状态、注册剧本、移动时钟、查询请求日志。命令行 `fakellm ctl` 和 Rust 的 `Server` 方法做同样的事。
+API 端口上 `/_fakellm/*` 是测试控制面：重置状态、注册剧本、移动时钟、查询请求日志、查看和清空保存的 Responses 对象。命令行 `fakellm ctl` 和 Rust 的 `Server` 方法做同样的事。
 **控制面没有认证**，只监听 `127.0.0.1` 是唯一的防护。路由、请求和响应示例见 [docs/control-plane.md](docs/control-plane.md)，规则格式见 [docs/scripts.md](docs/scripts.md)。
 
 ```bash
@@ -321,7 +485,7 @@ fakellm ctl reset                  # 每个测试开始前
 - 不发 `obfuscation` 字段（真实 API 用来填充的随机串，没有语义）。`system_fingerprint` 和 `service_tier: "default"` 会发。
 - `model` 原样回显请求里的值，不解析别名（`gpt-4o` 不会变成 `gpt-4o-2024-08-06`）。任何模型名都接受，不校验；只有 `GET /v1/models/{id}` 会因为不在列表里返回 404。
 - `n > 1` 时各 choice 的 chunk 是依次发的（choice 0 发完再发 choice 1），不像真实 API 那样交错。每个 choice 有自己的 role 和 finish chunk，格式是对的；多数客户端只读 `choices[0]`。
-- `created` 来自服务端时钟，冻结时间时是固定值；completion id 由请求内容和一个计数器派生，所以相同请求的 id 也不同。`x-request-id` 则只由请求内容派生。
+- `created` 来自服务端时钟，冻结时间时是固定值；completion id 和 `x-request-id` 都由请求内容和一个服务端计数器派生，所以相同请求（比如重试）的 id 也不同。
 - `GET /v1/models` 的 `created` 是按名字派生的固定值，`owned_by` 总是 `openai`。
 - 剧本里的 `max_tokens` 只截断 `text`；`reasoning` 和工具调用参数按原样发出。`reasoning` 作为 `reasoning_content` 发送。
 - 工具调用的 `id` 不写就由请求派生；`arguments` 可以是对象（紧凑序列化）或字符串（原样发送，可以故意写成不完整的 JSON）。
@@ -329,18 +493,41 @@ fakellm ctl reset                  # 每个测试开始前
 - `cut_after_chunks` 的断流是**干净地结束 chunked body**（没有 finish chunk，没有 `[DONE]`），不是 TCP 重置；客户端看到的是流提前结束。
 - 不支持：`logprobs`（请求里带了会被接受并记入日志，但响应里永远是 `null`）、`prediction`、音频输入输出、图片输入只会被解析并记录。
 - `/v1/chat/completions` 也可以不带 `/v1` 前缀访问（`/chat/completions`）。
+- 其他入口见[协议与端点](#协议与端点)，同样可以不带 `/v1`。
+
+### Anthropic Messages 与真实 API 的差异
+
+- `anthropic-version` 不校验，`anthropic-beta` 只记录进请求日志（`full=true` 的 `headers`），不影响行为。
+- `model` 原样回显，不解析别名；任何模型名都接受。`GET /v1/models` 的 `created_at` 是按名字派生的固定值。
+- 响应体里没有顶层的 `request_id`，请求 id 只在 `request-id` 响应头里（与 `x-request-id` 同值）。
+- `stop_sequence` 总是 `null`，不会因为 `stop_sequences` 命中而停；`usage` 由内置的近似 tokenizer 算出（`input_tokens` 是扣掉缓存读写之后的值，缓存字段取自规则，默认 0）。
+- `thinking`：规则里写 `reasoning`（和可选的 `reasoning_opaque` 作为 `signature`）才会有 `thinking` 块，请求里开了 `thinking` 但规则没写 `reasoning` 时不会凭空生成。请求侧按真实 API 校验：`budget_tokens` 至少 1024 且小于 `max_tokens`。
+- `tool_use.input`：同步响应里参数不是合法 JSON 时是 `{}`，流式响应则原样发出 `partial_json` 片段（用来测截断的 JSON）。
+- 流里的 `ping` 事件会发；`message_start` 里的 `usage.output_tokens` 是 1，和真实 API 一样。流内错误是 `message_start`、`ping`、`event: error`，没有 `message_stop`。
+- 请求里的 `role: system` 消息被接受并当作 system（真实 API 会拒绝），因为 Claude Code 会这么发。
+- 不支持：服务端工具（`web_search` 等）的执行，`/v1/messages/batches`，Files API，`cache_control` 只解析不生效；`count_tokens` 用的是近似 tokenizer。
+
+### Responses 与真实 API 的差异
+
+- 只实现 HTTP（同步和 SSE），没有 WebSocket。不支持 `background`、`/cancel`、`/input_items`。
+- `reasoning` 项的 `encrypted_content` 只在请求的 `include` 里有 `reasoning.encrypted_content` 时才发；值取自规则的 `reasoning_opaque`，没写则是请求派生的确定值，不是真的加密内容。
+- 未知的 input 项类型（`web_search_call`、`local_shell_call`、`compaction` 等）不会让请求失败，会被接受并记入日志；`tools` 里除 `function` / `custom` 之外的类型（`namespace`、`web_search` 等）不当作可调用的工具。
+- 请求声明为 `custom`（自由格式，如 codex 的 `apply_patch`）的工具，剧本里的调用会以 `custom_tool_call` 返回，`input` 取参数字符串，或参数对象里的 `input` 字段；其余工具是 `function_call`。
+- `finish_reason: length` 得到 `status: incomplete`（`incomplete_details.reason: max_output_tokens`），`content_filter` 得到 `incomplete` + `content_filter`；`failed` 只出现在 `in_stream` 错误里。
+- 响应对象的 `usage`、`output` 项 id（`msg_`、`fc_`、`rs_`）由请求派生，`created_at` 来自服务端时钟。
+- 保存的对象最多 1000 个，见 [Responses 的状态](#responses-的状态与-previous_response_id)。
 
 ## 路线图
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| M0 | Chat Completions（同步 + SSE，含工具调用）、`/v1/models`、剧本、默认兜底、虚拟时钟、请求日志、控制面和 `ctl`、Rust 库 | 本版本 |
-| M1 | Anthropic Messages 和 Responses API（复用同一套剧本） | 未做 |
-| M1 | 故障注入（按概率、延迟、流中途 reset 等，现在只有 `cut_after_chunks` 和剧本里的错误） | 未做 |
-| M1 | `fakellm wire` helper | 未做 |
-| M2 | napi / Bun 绑定 | 未做 |
-| M2 | GHCR 镜像（Docker） | 未做 |
-| M2 | Go helper、真实 harness 的 e2e | 未做 |
+| M0 | Chat Completions（同步 + SSE，含工具调用）、`/v1/models`、剧本、默认兜底、虚拟时钟、请求日志、控制面和 `ctl`、Rust 库 | 已完成 |
+| M1 | Anthropic Messages 和 Responses API（复用同一套剧本） | 已完成 |
+| M1 | 故障注入（`probability`、`every_nth`、`hang`、`error.headers`、`error.in_stream`、`cut_after_chunks`、按协议的错误体） | 已完成（流中途 TCP 重置未做，进了 [TODO](TODO.md)） |
+| M1 | `fakellm wire` helper 和 codex / claude / opencode 的冒烟 e2e（`e2e/*.sh`，手工运行） | 已完成 |
+| M2 | napi / Bun 绑定 | 下一步 |
+| M2 | GHCR 镜像（Docker） | 下一步 |
+| M2 | Go helper；e2e 进 CI、补 pi 和故障场景的 e2e | 下一步 |
 | M3 | fake agent：轨迹回放、工具映射、txiki.js 策略脚本 | 未做 |
 | M4 | cassette 录制回放、Hugging Face 数据集导入 | 未做 |
 | M4 | Embeddings、按 `json_schema` 生成结构化输出 | 未做 |

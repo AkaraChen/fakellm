@@ -1,38 +1,42 @@
 # TODO
 
-## 已知问题（读代码和测试时发现的）
+## 已知问题（读代码、测试和真实 harness 冒烟时发现的）
 
-- [ ] `FAKELLM_STRICT` 只认 `true` / `false`（clap 的 bool 环境变量），`FAKELLM_STRICT=1` 会启动失败；`--ttft`、`--tokens-per-sec`、`--fallback-tokens`、`--no-request-log`、`--request-log-capacity` 没有环境变量，Docker 里只能用命令行
-- [ ] `--scripts` 文件读不出来时报 `Error: Os { code: 2 ... }`，没有文件名；解析失败的错误有文件名。`--ttft` 不支持小数（`1.5s`），错误信息里的例子也没提
-- [ ] 默认 `--models` 里有 `text-embedding-3-*`，但 `POST /v1/embeddings` 是 404 `Invalid URL`；`GET /v1/models/{id}` 对不在列表里的模型 404，而 chat 接口接受任何模型名，两边行为不一致
-- [ ] `fakellm ctl scripts list` 的文本输出是每条规则一行紧凑 JSON，不如 `requests list` 的一行摘要好读（序号、名字、hits/times、匹配条件摘要）
-- [ ] 同步响应的 `x-request-id` 和流式响应一致地由请求内容派生，相同请求（比如重试）拿到相同的 `x-request-id`；真实 API 每次都不同。重试断言“两次请求是不同的请求”时会误导。可以混入 `ID_COUNTER`
-- [ ] `PUT /_fakellm/scripts` 总是把命中计数清零；想在不丢计数的情况下改规则只能 `POST`。需要的话加 `PATCH` 或 `?keep_hits`
-- [ ] `RequestRecord.headers` 里 `authorization` 原样保存。测试服务无所谓，但把日志导出给别人之前要脱敏，加一个 `redact` 开关
-- [ ] `Config` 没有 `Delivery` 的 `chunk_tokens` / `args_chunk_bytes` 的命令行参数（只有规则里能改 `chunk_tokens`；`args_chunk_bytes` 固定 16，规则里也改不了）
 - [ ] `--scripts` 没有热加载；`ctl scripts put` 是唯一的运行时入口
+- [ ] 错误规则只写 `status: 404` 时，Chat / Responses 的默认文案里写死了模型名 `unknown`（“The model `unknown` does not exist ...”），不是请求里的模型名；Anthropic 的默认文案是 “Not found.”，只有 `GET /v1/models/{id}` 才是 “model: {id}”。生成接口上的 404 应该回显请求的模型名
+- [ ] `error.in_stream: true` 时 `error.headers` 只在 Responses 的 `response.failed` 里（`response.error.headers`）出现；Chat 和 Anthropic 的流内错误是 200 的响应，规则里设的头（`x-should-retry`、`retry-after-ms`）没有地方放，被丢掉了
+- [ ] `fakellm wire opencode` 的 `shell` 输出把 `opencode.json` 打印了两遍（文件内容一遍，说明片段里一遍）
+- [ ] `fakellm wire pi` 没有环境变量也没有 `.toml`，默认格式是 `json`（带 `env`/`files`/`snippet` 的包装对象），想直接得到 `models.json` 要自己用 `jq` 取；可以给 `wire` 加 `--file NAME` 之类的选项
+- [ ] 挂起（`hang`）的请求要等客户端放弃才会出现在请求日志里（`status: 0`），测试里没有办法在请求还挂着的时候看到它；`reset` 也不会唤醒已挂起的请求
+- [ ] `hang_ms` 与 `delay_ms` / `stream.ttft_ms` 的语义容易混淆（前者不发响应头，后者流式时先发响应头）；考虑在注册时对同时写 `hang_ms` 和 `delay_ms` 的规则给出提示
+- [ ] 流中途 TCP 重置：现在 `cut_after_chunks` 是干净地结束 chunked body，客户端看到的是“流提前结束”，不是 `ECONNRESET`；两种在 SDK 里的表现不同，需要补一个能直接 RST 的选项（比如 `stream.reset_after_chunks`）
+- [ ] `docs/m1-spec.md` 第 6.1 节还写着 Anthropic 的消息角色只接受 `user` 和 `assistant`，实际代码为了兼容 Claude Code 也接受 `system`（见 `src/anthropic/messages.rs`）；这份内部文档需要同步
+
+## 真实 harness 的 e2e（`e2e/*.sh`，手工运行）
+
+- [ ] 三个脚本都不在 `cargo test` 和 CI 里（需要机器上有 codex / claude / opencode）；想办法在 CI 里按需运行，或者至少在发版前跑一遍
+- [ ] `e2e/claude.sh` 总是用 `target/debug/fakellm`，不读 `FAKELLM_BIN`，另外两个读
+- [ ] Claude Code 只测了一轮纯文本；没有用 `tool_calls` 规则测它的工具循环（它发 Bash、Read、Edit 等十几个工具），也没测 `claude` 在 4xx / 5xx / 529 / 流内错误下的重试行为
+- [ ] codex 只测了纯文本和 `exec_command` 工具调用；没有用真实 codex 测 `response.failed`（`context_length_exceeded`、`insufficient_quota`、`rate_limit_exceeded` + `error.headers`）、`response.incomplete`、`apply_patch`（`custom_tool_call`）、挂起超过 `stream_idle_timeout_ms`
+- [ ] opencode 的 e2e 第一次运行曾卡死 120 秒（请求日志为空），之后都在约 3 秒完成，没能复现，原因未查明；`OPENCODE_CONFIG_CONTENT`（`wire opencode` 的环境变量形式）没有被 e2e 覆盖，脚本用的是 `OPENCODE_CONFIG` 指向的文件
+- [ ] pi 没有 e2e：`wire pi` 的 `models.json` 格式是按约定写的，没有对照真实的 pi 验证过
+- [ ] Claude Code 启动时会 `HEAD /api/hello`（连通性检查，只在对着桩服务时观察到过）；对 fakellm 是 404 `Invalid URL`，当前不影响运行，但没有专门验证
 
 ## 测试覆盖缺口
 
-- [ ] `tests/` 和 `sdk/node` 里没有 HTTP 层的测试覆盖 `tool_result_contains`、`any_message`、`turn`、`system` + `no_tools` 的组合（文档里的“标题旁路”例子是手工验证的），应该把 `docs/scripts.md` 的三个例子做成集成测试
-- [ ] `cut_after_chunks` 没有用官方 SDK 验证客户端看到的是 `interrupted` / 流提前结束（pi、opencode 要测的故障）
-- [ ] `n > 1` 的流式输出没有用官方客户端验证
-- [ ] 虚拟时钟下的 `retry-after` 与 SDK 重试的交互没有测试（SDK 退避是真实定时器，见 README 的边界一节）；至少补一个 `maxRetries: 0` 的断言
-- [ ] `tests/node_sdk.rs` 在没有 `node_modules` 时静默跳过，CI 之外很容易忘了跑；Python `openai` 客户端还没有覆盖
-- [ ] 请求日志容量缩小、`enabled: false` 之后再打开、`since` / `after` 组合过滤没有 HTTP 层测试
+- [ ] `tests/node_sdk.rs` 在没有 `node_modules` 时会打印 skip 并跳过（`sdk/node` 有 openai、openai-responses、anthropic、ai-sdk、ai-sdk-responses、ai-sdk-anthropic 六个套件），CI 之外很容易忘了跑；Python 的 `openai` 和 `anthropic` 客户端还没有覆盖（`wire` 打印的 Python 片段只是照 SDK 文档写的）
+- [ ] 故障注入没有用官方 SDK 逐类验证：`x-should-retry`、`retry-after-ms` 对 SDK 重试行为的影响，Anthropic 的流内 `error` 事件在 `@anthropic-ai/sdk` 里的表现
 
 ## 路线图（设计见 docs/design.md）
 
-- [ ] M1：Anthropic Messages 和 Responses API，复用同一套剧本和 IR（`ir::Protocol` 目前只有 `OpenaiChat` 一个变体）。ai-sdk 的 `openai('gpt-4o')` 默认走 Responses，现在会得到 404，README 里要求用 `.chat()`
-- [ ] M1：故障注入：按概率、固定或随机延迟、流中途 TCP 重置（现在 `cut_after_chunks` 是干净结束）、`x-should-retry` 头、`retry-after-ms`
-- [ ] M1：`fakellm wire` helper
 - [ ] M2：napi-rs 绑定（Node 和 Bun，Bun 的兼容性单独在 CI 里测）
 - [ ] M2：GHCR 镜像（linux/amd64 + arm64，静态 musl），默认监听 `0.0.0.0:4010`，文档里补 testcontainers 用法
 - [ ] M2：Go helper（下载并启动二进制、等就绪信号、控制面客户端）
-- [ ] M2：真实 harness 的 e2e（paseo、pi、opencode 等指向 fakellm 跑一遍）
-- [ ] M3：fake agent：轨迹回放、工具映射、txiki.js 策略脚本
+- [ ] M2：e2e 进 CI，补 paseo、pi 和故障场景
+- [ ] M3：fake agent：轨迹回放、工具映射、txiki.js 策略脚本（codex 的测试里有 `validate_request_body_invariants`：每个 `function_call` 都有同 `call_id` 的 `function_call_output`，轨迹模式可以做同样的校验）
 - [ ] M4：cassette 录制回放（`--upstream`）、Hugging Face 数据集导入
 - [ ] M4：Embeddings、按 `json_schema` 生成结构化输出
+- [ ] Responses 的 WebSocket 传输、`background`、`/cancel`、`/input_items`（codex 默认走 HTTP SSE，暂时不需要）
 - [ ] 发布到 crates.io，README 里的 git 依赖改成版本号
 - [ ] 控制面支持快照（fakes3 有 `POST /_fakes3/snapshots`），在 `reset` 之外提供“回到某个剧本 + 日志状态”的能力
 

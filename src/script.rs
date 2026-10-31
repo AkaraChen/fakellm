@@ -10,6 +10,7 @@
 //! The [`Engine`] is the whole decision: scripts first, then the fallback, or an error in strict
 //! mode. It also fills in `usage` and applies `max_tokens`, so frontends only render.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -19,7 +20,7 @@ use serde_json::Value;
 use regex::Regex;
 
 use crate::fallback::{self, FallbackConfig};
-use crate::ir::{ApiError, Delivery, FinishReason, Outcome, Reply, Request, Source, ToolCall, Usage};
+use crate::ir::{ApiError, Delivery, FinishReason, Outcome, Protocol, Reply, Request, Source, ToolCall, Usage};
 use crate::reqlog::glob_match;
 use crate::tokenizer;
 
@@ -68,6 +69,18 @@ pub struct Match {
     /// Explicit catch-all, for readability; `{}` matches everything too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub any: Option<bool>,
+    /// Only requests that came in on this API (`openai.chat`, `openai.responses`, `anthropic.messages`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<Protocol>,
+    /// Match a request with this probability (0..=1) once every other condition holds. Decided
+    /// by a deterministic xorshift seeded from `fallback::request_seed` and the rule's number
+    /// of earlier matches, so a run is reproducible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probability: Option<f64>,
+    /// Match the nth, 2nth, 3nth ... request that reached this rule (every other condition
+    /// held), counting from 1; `every_nth: 3` matches the 3rd, 6th, 9th.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_nth: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -82,7 +95,7 @@ pub struct ToolCallSpec {
     pub id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorSpec {
     pub status: u16,
@@ -98,6 +111,12 @@ pub struct ErrorSpec {
     /// Seconds, sent as `retry-after`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after: Option<f64>,
+    /// Deliver the error inside the event stream of a streaming request, see [`ApiError::in_stream`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_stream: Option<bool>,
+    /// Extra response headers, e.g. `retry-after-ms`, `x-should-retry`, `x-codex-active-limit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -137,6 +156,16 @@ pub struct ReplySpec {
     /// the same as `stream.ttft_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay_ms: Option<u64>,
+    /// Never answer: hold the request until the client gives up (`Outcome::Hang`). With
+    /// `hang_ms`, answer with the rest of this spec after that long on the server clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hang: Option<bool>,
+    /// Hold the request this many server-clock milliseconds, then answer. Implies `hang`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hang_ms: Option<u64>,
+    /// The thinking `signature` / reasoning `encrypted_content` to send with `reasoning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_opaque: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -160,6 +189,10 @@ pub struct RuleInfo {
     pub rule: Rule,
     /// Requests answered since the rule was registered.
     pub hits: u64,
+    /// Requests that got past every other condition of the rule, whether or not `probability`
+    /// or `every_nth` then let them through.
+    #[serde(default)]
+    pub reached: u64,
     /// `times` is spent.
     pub exhausted: bool,
 }
@@ -255,8 +288,17 @@ impl Matchers {
 fn validate(rule: &Rule) -> Result<(), String> {
     let r = &rule.reply;
     let has_content = r.text.is_some() || r.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    let hangs = r.hang == Some(true) || r.hang_ms.is_some();
+    if let Some(p) = rule.matcher.probability
+        && !(0.0..=1.0).contains(&p)
+    {
+        return Err("match.probability must be between 0 and 1".into());
+    }
+    if rule.matcher.every_nth == Some(0) {
+        return Err("match.every_nth must be at least 1".into());
+    }
     match (&r.error, has_content) {
-        (None, false) => return Err("reply needs `text`, `tool_calls` or `error`".into()),
+        (None, false) if !hangs => return Err("reply needs `text`, `tool_calls` or `error`".into()),
         (Some(_), true) => return Err("reply `error` excludes `text` and `tool_calls`".into()),
         _ => {}
     }
@@ -287,6 +329,7 @@ pub struct Scripts {
 struct Compiled {
     rule: Rule,
     hits: u64,
+    reached: u64,
     re: Matchers,
 }
 
@@ -294,15 +337,45 @@ impl Compiled {
     fn new(rule: Rule, index: usize) -> Result<Self, ScriptError> {
         validate(&rule).map_err(|e| ScriptError(format!("rule {index}: {e}")))?;
         let re = Matchers::compile(&rule.matcher).map_err(|e| ScriptError(format!("rule {index}: {e}")))?;
-        Ok(Self { rule, hits: 0, re })
+        Ok(Self {
+            rule,
+            hits: 0,
+            reached: 0,
+            re,
+        })
     }
 
     fn exhausted(&self) -> bool {
         self.rule.times.is_some_and(|t| self.hits >= u64::from(t))
     }
 
-    fn matches(&self, req: &Request) -> bool {
+    /// Whether `req` matches; counts the request as reached when every plain condition holds.
+    fn matches(&mut self, req: &Request) -> bool {
+        if !self.conditions_hold(req) {
+            return false;
+        }
+        self.reached += 1;
         let m = &self.rule.matcher;
+        if let Some(n) = m.every_nth
+            && !self.reached.is_multiple_of(u64::from(n))
+        {
+            return false;
+        }
+        if let Some(p) = m.probability
+            && draw(fallback::request_seed(req), self.reached) >= p
+        {
+            return false;
+        }
+        true
+    }
+
+    fn conditions_hold(&self, req: &Request) -> bool {
+        let m = &self.rule.matcher;
+        if let Some(p) = m.protocol
+            && p != req.protocol
+        {
+            return false;
+        }
         if let Some(g) = &m.model
             && !glob_match(g, &req.model)
         {
@@ -362,6 +435,17 @@ impl Compiled {
     }
 }
 
+/// A uniform number in `[0, 1)` from the request seed and how many requests reached the rule
+/// before, so a run replays the same decisions. The counter is mixed in because an identical
+/// retry has the same seed and would otherwise draw the same number forever.
+fn draw(seed: u64, reached: u64) -> f64 {
+    let mut z = (seed ^ reached.wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
 fn compile_all(rules: Vec<Rule>, offset: usize) -> Result<Vec<Compiled>, ScriptError> {
     rules.into_iter().enumerate().map(|(i, r)| Compiled::new(r, offset + i)).collect()
 }
@@ -371,6 +455,20 @@ impl Scripts {
     pub fn replace(&self, rules: Vec<Rule>) -> Result<(), ScriptError> {
         let compiled = compile_all(rules, 0)?;
         *self.inner.lock() = compiled;
+        Ok(())
+    }
+
+    /// Like [`Scripts::replace`], but the rule at each index keeps the hit count of the rule
+    /// that was there before (`PUT /_fakellm/scripts?keep_hits=true`). Rules past the old length
+    /// start at zero.
+    pub fn replace_keep_hits(&self, rules: Vec<Rule>) -> Result<(), ScriptError> {
+        let mut compiled = compile_all(rules, 0)?;
+        let mut inner = self.inner.lock();
+        for (new, old) in compiled.iter_mut().zip(inner.iter()) {
+            new.hits = old.hits;
+            new.reached = old.reached;
+        }
+        *inner = compiled;
         Ok(())
     }
 
@@ -391,6 +489,7 @@ impl Scripts {
                 index,
                 rule: c.rule.clone(),
                 hits: c.hits,
+                reached: c.reached,
                 exhausted: c.exhausted(),
             })
             .collect()
@@ -412,7 +511,14 @@ impl Scripts {
     /// clone of its reply spec.
     pub fn resolve(&self, req: &Request) -> Option<(usize, Option<String>, ReplySpec)> {
         let mut inner = self.inner.lock();
-        let (index, c) = inner.iter_mut().enumerate().find(|(_, c)| !c.exhausted() && c.matches(req))?;
+        let mut found = None;
+        for (index, c) in inner.iter_mut().enumerate() {
+            if !c.exhausted() && c.matches(req) {
+                found = Some((index, c));
+                break;
+            }
+        }
+        let (index, c) = found?;
         c.hits += 1;
         Some((index, c.rule.name.clone(), c.rule.reply.clone()))
     }
@@ -464,8 +570,24 @@ impl Engine {
             delivery.ttft = Duration::from_millis(ms);
         }
 
+        let hang = match (spec.hang, spec.hang_ms) {
+            (_, Some(ms)) => Some(Some(Duration::from_millis(ms))),
+            (Some(true), None) => Some(None),
+            _ => None,
+        };
+        let outcome = Self::answer(req, spec, delivery, source);
+        match hang {
+            Some(until) => Outcome::Hang {
+                until,
+                then: Box::new(outcome),
+            },
+            None => outcome,
+        }
+    }
+
+    fn answer(req: &Request, spec: ReplySpec, mut delivery: Delivery, source: Source) -> Outcome {
         if let Some(e) = spec.error {
-            let mut error = ApiError::for_status(e.status);
+            let mut error = ApiError::for_status_in(req.protocol, e.status);
             if let Some(k) = e.kind {
                 error.kind = k;
             }
@@ -481,12 +603,17 @@ impl Engine {
             if let Some(s) = e.retry_after {
                 error.retry_after = Some(Duration::try_from_secs_f64(s).unwrap_or(Duration::MAX));
             }
+            error.in_stream = e.in_stream.unwrap_or(false);
+            for (name, value) in e.headers.into_iter().flatten() {
+                error.headers.push((name.to_ascii_lowercase(), value));
+            }
             if let Some(ms) = spec.delay_ms {
                 delivery.ttft = Duration::from_millis(ms);
             }
             return Outcome::Error { error, delivery, source };
         }
 
+        let text = spec.text.or_else(|| spec.tool_calls.is_none().then(String::new));
         let calls = spec.tool_calls.unwrap_or_default();
         let seed = if calls.iter().any(|c| c.id.is_none()) {
             fallback::request_seed(req)
@@ -497,7 +624,7 @@ impl Engine {
             .into_iter()
             .enumerate()
             .map(|(i, c)| ToolCall {
-                id: c.id.unwrap_or_else(|| fallback::call_id(seed ^ i as u64)),
+                id: c.id.unwrap_or_else(|| fallback::tool_call_id(req.protocol, seed ^ i as u64)),
                 name: c.name,
                 arguments: match c.arguments {
                     Value::String(s) => s,
@@ -508,7 +635,7 @@ impl Engine {
             .collect();
         // `max_tokens` bounds only the scripted text; reasoning and tool-call arguments are emitted as written.
         let mut truncated = false;
-        let text = spec.text.map(|t| match req.max_tokens {
+        let text = text.map(|t| match req.max_tokens {
             Some(max) => {
                 let (t, cut) = tokenizer::truncate(&t, max);
                 truncated = cut;
@@ -531,6 +658,7 @@ impl Engine {
             text,
             tool_calls,
             reasoning: spec.reasoning,
+            reasoning_opaque: spec.reasoning_opaque,
             refusal: None,
             finish,
             usage: Usage {
@@ -538,6 +666,7 @@ impl Engine {
                 completion_tokens,
                 reasoning_tokens,
                 cached_tokens: 0,
+                cache_creation_tokens: 0,
             },
         };
         Outcome::Reply { reply, delivery, source }
@@ -653,11 +782,7 @@ mod tests {
         let mut both = text_rule(Match::default(), "x", None);
         both.reply.error = Some(ErrorSpec {
             status: 500,
-            kind: None,
-            code: None,
-            message: None,
-            param: None,
-            retry_after: None,
+            ..Default::default()
         });
         assert!(s.replace(vec![both]).is_err());
 
@@ -880,5 +1005,160 @@ mod tests {
         assert_eq!(interval_from_tps(None), Duration::ZERO);
         assert_eq!(interval_from_tps(Some(-1.0)), Duration::ZERO);
         assert_eq!(interval_from_tps(Some(10.0)), Duration::from_millis(100));
+    }
+
+    fn yaml(text: &str) -> Engine {
+        let e = engine(true);
+        e.scripts.replace(Rule::parse_many(text, ScriptFormat::Yaml).unwrap()).unwrap();
+        e
+    }
+
+    fn is_script(o: &Outcome) -> bool {
+        matches!(o.source(), Source::Script { .. })
+    }
+
+    #[test]
+    fn protocol_matcher() {
+        let e = yaml("- match: { protocol: anthropic.messages }\n  reply: { text: a }\n");
+        let mut req = user("x");
+        assert!(!is_script(&e.resolve(&req)));
+        req.protocol = Protocol::AnthropicMessages;
+        assert!(is_script(&e.resolve(&req)));
+    }
+
+    #[test]
+    fn every_nth_counts_reached_requests() {
+        let e = yaml("- match: { last_user: /go/, every_nth: 3 }\n  reply: { text: a }\n");
+        let got: Vec<bool> = (0..6)
+            .map(|i| {
+                // Requests that fail another condition do not count as reached.
+                assert!(!is_script(&e.resolve(&user("other"))));
+                is_script(&e.resolve(&user(&format!("go {i}"))))
+            })
+            .collect();
+        assert_eq!(got, [false, false, true, false, false, true]);
+        let info = &e.scripts.list()[0];
+        assert_eq!((info.hits, info.reached), (2, 6));
+    }
+
+    #[test]
+    fn probability_is_deterministic_and_retries_vary() {
+        let run = |p: f64| {
+            let e = engine(true);
+            e.scripts
+                .replace(vec![text_rule(
+                    Match {
+                        probability: Some(p),
+                        ..Default::default()
+                    },
+                    "a",
+                    None,
+                )])
+                .unwrap();
+            // Same request every time: only the reached counter varies the draw.
+            (0..200).map(|_| is_script(&e.resolve(&user("same")))).collect::<Vec<_>>()
+        };
+        assert!(run(0.0).iter().all(|h| !h));
+        assert!(run(1.0).iter().all(|h| *h));
+        let half = run(0.5);
+        assert_eq!(half, run(0.5));
+        let hits = half.iter().filter(|h| **h).count();
+        assert!((60..=140).contains(&hits), "{hits}");
+    }
+
+    #[test]
+    fn probability_and_every_nth_validation() {
+        for bad in ["probability: 1.5", "probability: -0.1", "every_nth: 0"] {
+            let rules = Rule::parse_many(&format!("- match: {{ {bad} }}\n  reply: {{ text: a }}\n"), ScriptFormat::Yaml).unwrap();
+            let err = Scripts::default().replace(rules).unwrap_err();
+            assert!(err.0.contains("match."), "{err}");
+        }
+    }
+
+    #[test]
+    fn nan_probability_is_rejected() {
+        let m = Match {
+            probability: Some(f64::NAN),
+            ..Default::default()
+        };
+        assert!(Scripts::default().replace(vec![text_rule(m, "a", None)]).is_err());
+    }
+
+    #[test]
+    fn probability_and_every_nth_both_must_hold() {
+        let e = yaml("- match: { probability: 0.0, every_nth: 1 }\n  reply: { text: a }\n");
+        assert!(!is_script(&e.resolve(&user("x"))));
+        assert_eq!(e.scripts.list()[0].reached, 1);
+    }
+
+    #[test]
+    fn keep_hits_carries_reached() {
+        let e = yaml("- match: { every_nth: 2 }\n  reply: { text: a }\n");
+        e.resolve(&user("x"));
+        e.resolve(&user("x"));
+        let rules = e.scripts.list().into_iter().map(|r| r.rule).collect();
+        e.scripts.replace_keep_hits(rules).unwrap();
+        let info = &e.scripts.list()[0];
+        assert_eq!((info.hits, info.reached), (1, 2));
+    }
+
+    #[test]
+    fn hang_outcomes() {
+        let e = yaml(
+            "- match: { last_user: forever }\n  reply: { hang: true }\n- match: { last_user: later }\n  reply: { hang_ms: 500, text: hi }\n",
+        );
+        let Outcome::Hang { until: None, then } = e.resolve(&user("forever")) else {
+            panic!()
+        };
+        let Outcome::Reply { reply, .. } = *then else { panic!() };
+        assert_eq!(reply.text.as_deref(), Some(""));
+        let Outcome::Hang { until, then } = e.resolve(&user("later")) else {
+            panic!()
+        };
+        assert_eq!(until, Some(Duration::from_millis(500)));
+        let Outcome::Reply { reply, .. } = *then else { panic!() };
+        assert_eq!(reply.text.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn hang_then_error() {
+        let e = yaml("- reply: { hang_ms: 10, error: { status: 503 } }\n");
+        let Outcome::Hang { then, .. } = e.resolve(&user("x")) else {
+            panic!()
+        };
+        assert!(matches!(*then, Outcome::Error { .. }));
+    }
+
+    #[test]
+    fn error_in_stream_headers_and_protocol_defaults() {
+        let e = yaml(
+            "- reply: { error: { status: 429, in_stream: true, retry_after: 1, headers: { Retry-After-Ms: '1500', x-should-retry: 'true' } } }\n",
+        );
+        let Outcome::Error { error, .. } = e.resolve(&user("x")) else {
+            panic!()
+        };
+        assert!(error.in_stream);
+        assert_eq!(error.retry_after, Some(Duration::from_secs(1)));
+        assert_eq!(
+            error.headers,
+            [
+                ("retry-after-ms".to_owned(), "1500".to_owned()),
+                ("x-should-retry".to_owned(), "true".to_owned())
+            ]
+        );
+        let mut req = user("x");
+        req.protocol = Protocol::AnthropicMessages;
+        let Outcome::Error { error, .. } = e.resolve(&req) else { panic!() };
+        assert_eq!(error.kind, ApiError::for_status_in(Protocol::AnthropicMessages, 429).kind);
+    }
+
+    #[test]
+    fn reasoning_opaque_and_anthropic_tool_ids() {
+        let e = yaml("- reply: { reasoning: think, reasoning_opaque: sig, tool_calls: [{ name: f }] }\n");
+        let mut req = user("x");
+        req.protocol = Protocol::AnthropicMessages;
+        let Outcome::Reply { reply, .. } = e.resolve(&req) else { panic!() };
+        assert_eq!(reply.reasoning_opaque.as_deref(), Some("sig"));
+        assert!(reply.tool_calls[0].id.starts_with("toolu_"));
     }
 }

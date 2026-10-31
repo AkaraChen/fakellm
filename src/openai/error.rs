@@ -1,8 +1,6 @@
 //! OpenAI's error body: `{"error": {"message", "type", "param", "code"}}`, all four keys always
 //! present (`null` when unset). `retry-after` goes on 429s that ask for it.
 
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
 use serde_json::json;
 
 use crate::Response;
@@ -12,17 +10,9 @@ pub fn body(err: &ApiError) -> serde_json::Value {
     json!({"error": {"message": err.message, "type": err.kind, "param": err.param, "code": err.code}})
 }
 
-/// The full HTTP response: status, JSON body, `retry-after` when set.
+/// The full HTTP response: status, JSON body, `retry-after` when set, then `err.headers`.
 pub fn render(err: &ApiError) -> Response {
-    let bytes = Bytes::from(serde_json::to_vec(&body(err)).expect("error body serializes"));
-    let mut b = http::Response::builder()
-        .status(http::StatusCode::from_u16(err.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR))
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .header(http::header::CONTENT_LENGTH, bytes.len());
-    if let Some(d) = err.retry_after {
-        b = b.header("retry-after", crate::retry_after_secs(d));
-    }
-    b.body(Full::new(bytes).boxed()).expect("valid response")
+    crate::error_response(err, &body(err))
 }
 
 #[cfg(test)]
@@ -51,5 +41,18 @@ mod tests {
         let r = render(&ApiError::for_status(529));
         assert_eq!(r.status().as_u16(), 529);
         assert!(!r.headers().contains_key("retry-after"));
+    }
+
+    #[test]
+    fn render_adds_custom_headers() {
+        let r = render(
+            &ApiError::overloaded()
+                .header("x-should-retry", "false")
+                .header("retry-after-ms", "250"),
+        );
+        assert_eq!(r.headers()["x-should-retry"], "false");
+        assert_eq!(r.headers()["retry-after-ms"], "250");
+        let r = render(&ApiError::overloaded().header("bad name", "x"));
+        assert_eq!(r.status(), 503);
     }
 }

@@ -1,6 +1,7 @@
 # 剧本规则格式
 
 剧本是 fakellm 决定“回什么”的方式：一个有序的规则列表，每条规则是 `match`（什么样的请求）加 `reply`（怎么回答）。
+同一套规则服务三种协议（Chat Completions、Responses、Anthropic Messages），请求先被解析成同一个内部结构再匹配，所以 `last_user`、`has_tool`、`has_tool_result` 这些条件在三种协议上含义相同；想只作用于某一种用 `protocol`。
 没有规则命中的请求走[默认兜底](../README.md#默认兜底与---strict)，或者在 `--strict` 下得到 400。
 
 注册方式：
@@ -45,20 +46,26 @@
 | `any_message` | 正则 | 任何一条消息（任何角色）的文本匹配即可 |
 | `has_tool` | 字符串 | `tools` 里提供了这个名字的工具 |
 | `no_tools` | 布尔 | `true`：没有提供任何工具；`false`：至少提供了一个 |
-| `has_tool_result` | 布尔 | `true`：对话**以 tool 消息结尾**（客户端刚执行完工具）；`false`：不是 |
-| `last_tool_result` | 字符串 | 结尾那一串连续的 tool 消息里，有一条是这个函数的结果 |
-| `tool_result_contains` | 正则 | 结尾的 tool 消息中，有一条的文本匹配 |
+| `has_tool_result` | 布尔 | `true`：最后一条 assistant 消息之后有 tool 结果（客户端刚执行完工具）；`false`：没有 |
+| `last_tool_result` | 字符串 | 那一串 tool 结果里，有一条是这个函数的结果 |
+| `tool_result_contains` | 正则 | 那一串 tool 结果中，有一条的文本匹配 |
 | `stream` | 布尔 | `true` 只匹配流式请求，`false` 只匹配非流式 |
 | `turn` | 整数 | 请求里已有多少条 assistant 消息；第一次请求是 `0` |
 | `any` | 布尔 | 显式的“全部匹配”，只为可读，`{}` 等价 |
+| `protocol` | 字符串 | 只匹配某个协议：`openai.chat`、`openai.responses`、`anthropic.messages`。写别的值是 400 |
+| `probability` | 数字 | 0 到 1。其他条件都满足后，以这个概率命中。不在范围内（包括 NaN）是 400 |
+| `every_nth` | 整数 | 至少为 1。其他条件都满足的请求里，每第 N 个命中：`every_nth: 3` 命中第 3、6、9 个 |
 
 细节：
 
 - **文本**：消息里 `text` 类型的 part 用换行连在一起；图片、音频等 part 不参与。字符串 content 就是它自己。
 - **正则**：Rust `regex` 语法，不是 PCRE（没有环视和反向引用）。写法有三种：`"pattern"`（子串搜索，不要求整串匹配，要整串自己写 `^...$`）、`"/pattern/"`、`"/pattern/i"`（忽略大小写）。YAML 里含 `:`、`#`、`{` 的要加引号。不合法的正则在注册时报错并指出规则序号和字段。
 - **`last_tool_result` 里的函数名**：通过 tool 消息的 `tool_call_id` 找到前面 assistant 消息里同 id 的调用，取它的函数名；找不到时才退而用 tool 消息自己的 `name`。所以客户端必须把 assistant 的 `tool_calls` 带回来（所有 SDK 都会）。名字是精确匹配。
+- **tool 结果的判定**：看“最后一条 assistant 消息之后”的所有 tool 结果，不要求它们是整个对话的最后几条。Claude Code 会把 `tool_result` 块和一段附加文本放进同一个 user 消息，fakellm 把它拆成 tool 消息加 user 消息，`has_tool_result` / `last_tool_result` 仍然命中。Responses 里 `function_call_output` 和 `custom_tool_call_output` 也算，Anthropic 里 `tool_result` 块算，`is_error: true` 的也算（想区分就用 `tool_result_contains` 匹配错误文本）。
 - **`has_tool_result: false`** 不仅匹配“第一次请求”，还匹配所有不以 tool 消息结尾的请求（例如用户追问）。想只匹配第一次请求，用 `turn: 0`。
-- **`turn`** 数的是整个对话里的 assistant 消息数，不是工具调用次数。
+- **`turn`** 数的是整个对话里的 assistant 消息数，不是工具调用次数。Responses 里连续的 `reasoning`、assistant `message` 和 `function_call` 项合并算一条 assistant 消息（一次模型输出）；带 `previous_response_id` 时，前面已存的对话也算进去。
+- **`probability` 和 `every_nth` 的计数**：它们数的是“到达过这条规则的请求”，也就是其他所有条件都满足、规则也没用完 `times` 的请求（`GET /_fakellm/scripts` 里每条规则的 `reached`），**不是 `hits`**。`probability` 的随机数由请求内容和 `reached` 决定，所以同一个测试每次运行的结果都一样；`reached` 不同，同样内容的重试也会抽到不同的数（用 `hits` 做计数的话，一次没抽中，`hits` 不变，重试会永远抽到同一个数）。同时写 `probability` 和 `every_nth` 时两者都要满足，`reached` 每个请求只加一次。`times` 只数真正命中的请求。
+- **`protocol` 的用法**：同一个提示词在三种协议下需要不同的错误体或不同的行为时，写多条规则、各带一个 `protocol`。Anthropic 的 system 提示在 `system` 字段，Chat 在 `system` / `developer` 消息，Responses 在 `instructions` 或 `developer` 消息，它们都会被 `system` 条件看到。
 
 示例（每个都是独立的规则）：
 
@@ -81,13 +88,16 @@
 
 ## Reply
 
-`text`、`tool_calls`、`error` 至少要有一个；`error` 不能和 `text` / `tool_calls` 同时出现；`text` 和 `tool_calls` 可以同时出现（先发文本，再发工具调用）。空的 `tool_calls: []` 不算。违反的规则注册时 400。
+`text`、`tool_calls`、`error`、`hang` / `hang_ms` 至少要有一个；`error` 不能和 `text` / `tool_calls` 同时出现；`text` 和 `tool_calls` 可以同时出现（先发文本，再发工具调用）。空的 `tool_calls: []` 不算。违反的规则注册时 400。只写 `hang: true` 的规则是合法的。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `text` | 字符串 | 回复文本。受请求的 `max_tokens` / `max_completion_tokens` 约束：超出就按 tokenizer 的 token 边界截断，`finish_reason` 变成 `length` |
 | `tool_calls` | 数组 | 见下 |
-| `reasoning` | 字符串 | 推理文本，作为 `reasoning_content` 发送（流式在正文之前）。不受 `max_tokens` 约束，计入 `reasoning_tokens` |
+| `reasoning` | 字符串 | 推理文本（流式在正文之前）。Chat 里是 `reasoning_content`；Anthropic 里是 `thinking` 块；Responses 里是 `reasoning` 项的 `summary_text`。不受 `max_tokens` 约束，计入 `reasoning_tokens` |
+| `reasoning_opaque` | 字符串 | 跟 `reasoning` 一起发的不透明串：Anthropic `thinking` 块的 `signature`，Responses `reasoning` 项的 `encrypted_content`（请求的 `include` 里有 `reasoning.encrypted_content` 时才发）。不写则由请求派生一个确定的值。Chat 里没有对应物，被忽略 |
+| `hang` | 布尔 | `true`：收到请求后不回答，一直挂到客户端放弃。见[挂起](#挂起) |
+| `hang_ms` | 整数 | 挂这么久（服务端时钟，毫秒）再按这条规则的其余部分回答。隐含 `hang` |
 | `error` | 对象 | 见下 |
 | `finish_reason` | `stop` / `length` / `tool_calls` / `content_filter` | 覆盖自动推断的结束原因。默认：被 `max_tokens` 截断为 `length`，有工具调用为 `tool_calls`，否则 `stop` |
 | `stream` | 对象 | 流式节奏，见下 |
@@ -115,11 +125,13 @@
 | `message` | 字符串 | 覆盖 `message` |
 | `param` | 字符串 | 覆盖 `param` |
 | `retry_after` | 数字 | 秒，可以带小数；写入 `retry-after` 头，向上取整成整数秒（`0.5` 写成 `1`） |
+| `in_stream` | 布尔 | 流式请求时，不返回 HTTP 错误，而是返回 200 的事件流，错误作为流里的事件发出。非流式请求忽略它（仍是 HTTP 错误）。见[协议里的错误形态](#协议里的错误形态) |
+| `headers` | 对象 | 额外的响应头，值是字符串，如 `retry-after-ms: "250"`、`x-should-retry: "false"`。头名会转成小写，名字或值不合法的头被丢弃。流内错误（`in_stream`）下 HTTP 头里没有这些，只有 Responses 的 `response.failed` 把它们放进 `error.headers` |
 
-只写 `status` 时，`type` / `code` / `message` 取真实 API 对这个状态码的默认值（状态码表见 [README](../README.md#错误与状态码)）。错误响应是 `{"error": {"message", "type", "param", "code"}}`，四个键总在。
-错误在 `delay_ms` 之后才发出。流式请求遇到错误规则也是一个普通的 HTTP 错误响应（不是 SSE），所以客户端能像真实 API 那样在流开始前重试。
+只写 `status` 时，`type` / `code` / `message` 取真实 API 对这个状态码的默认值，**默认值随请求的协议而变**（状态码表见 [README](../README.md#错误与状态码)）：Chat 和 Responses 用 OpenAI 的格式 `{"error": {"message", "type", "param", "code"}}`（四个键总在）；Anthropic 用 `{"type": "error", "error": {"type", "message"}}`，`code` 和 `param` 在这个协议里没有位置，会被丢掉。
+错误在 `delay_ms` 之后才发出。默认情况下流式请求遇到错误规则也是一个普通的 HTTP 错误响应（不是 SSE），所以客户端能像真实 API 那样在流开始前重试；要模拟流已经开始之后才出的错，用 `in_stream: true`。
 
-目前 `status: 413` 的响应状态码实际是 400（`type` 和 `code` 是对的），见 [TODO](../TODO.md)。
+两处默认值要留意：`status: 404` 的 Chat / Responses 默认文案里写死的是模型名 `unknown`（不是请求里的模型名），Anthropic 默认是 `Not found.`；想要和请求一致的文案就自己写 `message`。
 
 ### Stream
 
@@ -130,7 +142,7 @@
 | `ttft_ms` | 整数 | 首 token 延迟：从请求开始到发出第一个 chunk（role chunk），毫秒 |
 | `tokens_per_sec` | 数字 | 流式速度，必须大于 0。chunk 之间等待 `chunk_tokens / tokens_per_sec` 秒；不写则 chunk 之间不等待 |
 | `chunk_tokens` | 整数 | 每个 content chunk 含几个 token，默认 1（真实 API 的行为）；0 按 1 处理 |
-| `cut_after_chunks` | 整数 | 发完这么多个 content chunk 后结束 body，**不发 finish chunk 和 `[DONE]`**，用来测客户端的流中断处理。结束是干净的 chunked 结尾，不是 TCP 重置 |
+| `cut_after_chunks` | 整数 | 发完这么多个 content chunk 后结束 body，**不发 finish chunk 和 `[DONE]`**（Anthropic 没有 `message_delta` / `message_stop`，Responses 没有 `response.completed`），用来测客户端的流中断处理。结束是干净的 chunked 结尾，不是 TCP 重置 |
 
 所有时间都读服务端时钟：冻结时钟时流停在对应位置，`advance` 后放行。详见[控制面的时钟一节](control-plane.md#时钟)。
 
@@ -145,6 +157,80 @@
 - match: { last_user: "slow" }
   reply: { text: "ok", delay_ms: 2000 }            # 同步响应 2 秒后才返回
 ```
+
+## 挂起
+
+`hang: true` 让 fakellm 收到请求后什么都不回：**连响应头都不发**，客户端看到的是一个一直等不到响应的连接，直到它自己的超时或取消。`hang_ms: N` 是“挂 N 毫秒再回答”，期间同样不发响应头，到时间后按规则的 `text` / `tool_calls` / `error` 正常回答。这样可以测客户端的请求超时、abort、steer 窗口，而且不用真的等：
+
+```yaml
+- name: never
+  match: { last_user: "^hang$" }
+  reply: { hang: true }
+- name: late
+  match: { last_user: "^slow$" }
+  reply: { hang_ms: 30000, text: "finally" }       # 冻结时钟时一直挂着，advance 30s 后才回答
+```
+
+- 等待读的是服务端时钟：冻结时钟时 `hang_ms` 不会结束，`ctl clock advance 30s` 立刻放行。`hang: true`（没有 `hang_ms`）永远不会自己结束，推进时钟也没用；`reset` 也不会唤醒已经挂住的请求。
+- 客户端放弃（超时、abort、断开）后，这个请求以 **`status: 0`** 记入请求日志，表示“没有发出任何响应”，`reply.hang` 是 `{"until_ms": null}` 或毫秒数；如果等待期间日志被清空，这条记录会被丢弃。
+  所以挂起的请求要等客户端放弃之后才在日志里出现，断言前先让客户端超时：`fakellm ctl requests list --status 0`。
+- 不要把 `hang` 和 `delay_ms` / `stream.ttft_ms` 搞混：后者是“等一会儿再发响应头”（流的响应头在 `ttft` 之前就发了，非流式和错误响应在等待结束后才发），`hang` 是“根本不回”。
+- 带 `hang_ms` 又带 `error` 的规则，是“挂一会儿再失败”，常用来模拟网关超时前的长时间无响应。
+
+## 协议里的错误形态
+
+同一个 `error` 规则，不同协议的客户端看到的东西不一样：
+
+| | HTTP 错误（默认） | `in_stream: true` 且请求是流式 |
+|---|---|---|
+| Chat | 状态码 + `{"error": {message, type, param, code}}` | 200 的事件流：一条 `data: {"error": {...}}`，然后 `data: [DONE]` |
+| Anthropic | 状态码 + `{"type": "error", "error": {type, message}}` | 200 的事件流：`message_start`、`ping`，然后 `event: error`，`data: {"type":"error","error":{type,message}}`；没有 `message_stop` |
+| Responses | 状态码 + OpenAI 错误体 | 200 的事件流：`response.created`，然后 `response.failed`，错误在 `response.error` 里：`{code, message}`，设了 `retry_after` 或 `headers` 时还有 `headers` 对象 |
+
+Responses 的 `response.error.code` 由规则决定：写了 `code` 就用它；没写时按状态码推：`insufficient_quota` 类型用 `insufficient_quota`，429 是 `rate_limit_exceeded`，503 和 529 是 `server_is_overloaded`，其他 5xx 是 `server_error`，都不是就用 `type`。
+`in_stream` 在三种协议里都只对流式请求生效；对非流式请求，同一条规则退回成 HTTP 错误。
+
+## 故障注入：每一类怎么写
+
+下面的“类别”是 oar 这类 agent 运行时分类错误时用的名字。**oar 自己的分类代码不在本仓库里，这里没有对照它验证**；下表按各家真实 API 的状态码、`type`、`code` 和文案约定写，所有例子都对真实二进制跑过，看到的响应和下面写的一致。分类器如果按文案或别的字段判断，请调整 `message` / `code`。
+
+| 类别 | Chat / Responses（HTTP） | Anthropic Messages（HTTP） |
+|---|---|---|
+| `auth` | `status: 401`（默认 `invalid_api_key`，“Incorrect API key provided...”） | `status: 401`（默认 `authentication_error`，“invalid x-api-key”） |
+| `quota` | `status: 429, type: insufficient_quota, code: insufficient_quota`，文案 “You exceeded your current quota...” | `status: 400, type: invalid_request_error`，文案 “You have reached your specified workspace API usage limits.” |
+| `rate_limited` | `status: 429`（默认 `type: requests`, `code: rate_limit_exceeded`），加 `retry_after` | `status: 429`（默认 `rate_limit_error`），加 `retry_after` |
+| `billing` | `status: 400, code: billing_hard_limit_reached`，文案 “Billing hard limit has been reached.” | `status: 402, type: billing_error` |
+| `model_unavailable` | `status: 404`（默认 `code: model_not_found`） | `status: 404`（默认 `not_found_error`），建议自己写 `message: "model: claude-x"` |
+| `input_too_large` | `status: 400, code: context_length_exceeded, param: messages`，文案 “This model's maximum context length is ...” | `status: 400, type: invalid_request_error`，文案 “prompt is too long: 213462 tokens > 200000 maximum”；请求体太大用 `status: 413`（默认 `request_too_large`） |
+| `overloaded` | `status: 503`（默认 `server_error`，“The engine is currently overloaded”）；也可以用 `529`（默认 `overloaded_error`） | `status: 529`（默认 `overloaded_error`） |
+| `provider` | `status: 500`（默认 `server_error`）或 502 / 504 | `status: 500`（默认 `api_error`）或 502 / 504 |
+| 流中途断开 | `stream: { cut_after_chunks: N }` | 同左 |
+| 流中途出错 | 加 `in_stream: true` | 同左 |
+| 挂起 | `hang: true` 或 `hang_ms` | 同左 |
+
+要点：
+
+- **客户端重试**：官方 SDK 会重试 408、409、429 和 5xx，不会重试 400、401、403、404。`x-should-retry: "true"` / `"false"` 可以覆盖 SDK 的判断，`retry-after-ms` 和 `retry-after` 决定等多久；这两个头用 `error.headers` 加（`retry_after` 只写 `retry-after`）。
+- **只想让它失败几次**：加 `times: N`，或者用 `every_nth` / `probability` 做间歇故障；再用 `ctl requests list --rule X --count` 断言重试次数。
+- **混合**：同一个规则列表里按 `protocol` 区分不同协议的错误体（见下面的完整例子），一份剧本可以同时给三种客户端用。
+
+### Responses（codex）的限制
+
+codex 对 HTTP 错误体不做细分类：**400 的 body 一律是不重试的 `InvalidRequest`**，所以 `context_length_exceeded`、`insufficient_quota` 这类要被 codex 认出来的错误，**必须作为流内的 `response.failed` 注入**，即错误规则写 `in_stream: true`，并且请求是流式的（codex 总是流式）。codex 对 `response.error.code` 的反应（来自对 codex 源码的调研，见 [research.md](research.md)）：
+
+| `response.error.code` | codex 的行为 |
+|---|---|
+| `context_length_exceeded` | 不重试，上下文溢出错误 |
+| `insufficient_quota` | 不重试，额度错误 |
+| `rate_limit_exceeded` / `slow_down` | 重试；等多久从 `error.headers` 或消息里的 “try again in Ns” 读 |
+| `server_is_overloaded` | 只有带 retry-after 才重试 |
+| `usage_not_included` | 套餐错误 |
+| 其他 code | 一律重试 |
+
+HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}}` 是 usage limit（codex 会读 `x-codex-active-limit` 头，用 `error.headers` 加）；`insufficient_quota` 是额度错误；其他 429 是 RetryLimit；5xx 重试；401、404 也会被当成可重试的意外状态码。
+`response.incomplete` 的 `content_filter` 原因会被 codex 重试，`max_output_tokens` 是硬错误；对应 `finish_reason: content_filter` 和 `finish_reason: length`。
+
+以上这些除了 `e2e/codex.sh` 的两个正常场景外，没有用真实 codex 逐项验证过；`response.failed` 的形状有 `tests/responses.rs` 覆盖。
 
 ## 示例一：最简单的文本
 
@@ -238,3 +324,142 @@ fakellm ctl requests list --source fallback --count    # 0，没有请求落到�
 ```
 
 用 Vercel AI SDK 跑这个两步流程的完整测试在 `sdk/node/ai-sdk.test.mjs`（“tool loop over two steps”）。
+
+## 示例四：一份剧本覆盖所有故障类别
+
+下面的文件三种协议通用，用提示词里的 `fault:<类别>` 触发。每条规则对应上面表格的一行；同一个类别在 Anthropic 和 OpenAI 系协议下的错误体不同，所以写成两条，带 `protocol` 的写在前面。
+
+```yaml
+# faults.yaml —— fakellm ctl scripts put faults.yaml
+- name: auth
+  match: { last_user: "fault:auth" }
+  reply: { error: { status: 401 } }
+
+- name: quota-anthropic
+  match: { protocol: anthropic.messages, last_user: "fault:quota" }
+  reply:
+    error: { status: 400, type: invalid_request_error, message: "You have reached your specified workspace API usage limits." }
+- name: quota
+  match: { last_user: "fault:quota" }
+  reply:
+    error: { status: 429, type: insufficient_quota, code: insufficient_quota, message: "You exceeded your current quota, please check your plan and billing details." }
+
+- name: rate-limited
+  match: { last_user: "fault:rate" }
+  reply: { error: { status: 429, retry_after: 2, headers: { retry-after-ms: "2000" } } }
+
+- name: billing-anthropic
+  match: { protocol: anthropic.messages, last_user: "fault:billing" }
+  reply: { error: { status: 402, type: billing_error, message: "There was an issue with your billing or payment information." } }
+- name: billing
+  match: { last_user: "fault:billing" }
+  reply: { error: { status: 400, type: invalid_request_error, code: billing_hard_limit_reached, message: "Billing hard limit has been reached." } }
+
+- name: model-unavailable
+  match: { last_user: "fault:model" }
+  reply: { error: { status: 404 } }
+
+- name: too-large-anthropic
+  match: { protocol: anthropic.messages, last_user: "fault:large" }
+  reply: { error: { status: 400, type: invalid_request_error, message: "prompt is too long: 213462 tokens > 200000 maximum" } }
+- name: too-large
+  match: { last_user: "fault:large" }
+  reply:
+    error:
+      status: 400
+      code: context_length_exceeded
+      param: messages
+      message: "This model's maximum context length is 128000 tokens. However, your messages resulted in 200000 tokens."
+
+- name: overloaded
+  match: { last_user: "fault:overloaded" }
+  reply: { error: { status: 529 } }
+
+- name: provider
+  match: { last_user: "fault:provider" }
+  reply: { error: { status: 500, headers: { x-should-retry: "true" } } }
+
+- name: cut
+  match: { last_user: "fault:cut" }
+  reply: { text: "one two three four five six", stream: { cut_after_chunks: 2 } }
+
+- name: hang
+  match: { last_user: "fault:hang" }
+  reply: { hang: true }
+```
+
+对 Chat 发 `fault:quota` 和对 Messages 发同样的提示词：
+
+```
+$ curl $E/v1/chat/completions -d '{"model":"m","messages":[{"role":"user","content":"fault:quota"}]}'
+429 {"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}
+$ curl $E/v1/messages -d '{"model":"m","max_tokens":9,"messages":[{"role":"user","content":"fault:quota"}]}'
+400 {"type":"error","error":{"type":"invalid_request_error","message":"You have reached your specified workspace API usage limits."}}
+```
+
+`fault:rate` 在 Anthropic 下的响应头：`retry-after: 2`、`retry-after-ms: 2000`。流中途断开（`fault:cut`）在三种协议下看到的事件是：Chat 两个 content chunk 之后结束；Anthropic 是 `message_start`、`content_block_start`、`ping`、两个 `content_block_delta` 之后结束；Responses 是 `response.created`、`response.in_progress`、`response.output_item.added`、`response.content_part.added` 和两个 `response.output_text.delta` 之后结束。
+
+间歇故障：每第 3 个请求失败，其余成功；或者随机 30% 失败：
+
+```yaml
+- name: every-third
+  match: { every_nth: 3 }
+  reply: { error: { status: 500 } }
+- name: thirty-percent
+  match: { probability: 0.3 }
+  reply: { error: { status: 529 } }
+- reply: { text: "ok" }
+```
+
+`probability` 是确定性的：同一个请求序列每次运行得到同样的成败顺序，不需要种子参数。
+
+## 示例五：codex 的上下文溢出
+
+codex 只认流内的 `response.failed`。下面的规则让第一次请求溢出，之后的请求正常回答（codex 不重试 `context_length_exceeded`，所以它会向用户报告错误并停下，这正是要测的路径）：
+
+```yaml
+- name: overflow
+  match: { protocol: openai.responses }
+  times: 1
+  reply:
+    error:
+      status: 400
+      in_stream: true
+      code: context_length_exceeded
+      message: "Your input exceeds the context window of this model. Please adjust your input and try again."
+- reply: { text: "FAKELLM_OK" }
+```
+
+流式请求得到的是（节选，`response` 对象有省略）：
+
+```
+HTTP/1.1 200 OK
+content-type: text/event-stream; charset=utf-8
+
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_...","object":"response","status":"in_progress",...,"output":[]}}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_...","object":"response","status":"failed","error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."},...,"output":[]}}
+```
+
+没有 `[DONE]`（Responses 的流不发它）。对非流式请求（`stream: false`）同一条规则退回成 HTTP 400 `{"error": {..., "code": "context_length_exceeded"}}`，这是官方 SDK 能识别的形态。
+
+另外两个常用的 codex 故障：
+
+```yaml
+# 限流，读 error.headers 里的等待时间；codex 的重试被 wire 的配置关掉了，所以请求日志里只会看到一次
+- match: { protocol: openai.responses, last_user: "limit" }
+  reply:
+    error:
+      status: 429
+      in_stream: true
+      code: rate_limit_exceeded
+      message: "Rate limit reached. Please try again in 2s."
+      retry_after: 2
+# 过载：只有带 retry-after 才会被 codex 重试
+- match: { protocol: openai.responses, last_user: "busy" }
+  reply: { error: { status: 503, in_stream: true, retry_after: 1 } }
+```
+
+`retry_after` 在 `response.failed` 里变成 `response.error.headers` 的 `retry-after`。

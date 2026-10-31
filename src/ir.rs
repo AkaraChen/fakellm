@@ -1,6 +1,6 @@
 //! The provider-neutral representation of one model round trip.
 //!
-//! Every protocol frontend (OpenAI Chat Completions today; Responses and Anthropic Messages later)
+//! Every protocol frontend (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages)
 //! parses its request into [`Request`] and renders an [`Outcome`] back into its own wire format,
 //! so scripts, the request log, cassettes and the fake agent all work on one shape. Nothing in this
 //! module knows about HTTP or JSON layouts of any particular API.
@@ -20,12 +20,20 @@ pub enum Protocol {
     /// `POST /v1/chat/completions`.
     #[serde(rename = "openai.chat")]
     OpenaiChat,
+    /// `POST /v1/responses`.
+    #[serde(rename = "openai.responses")]
+    OpenaiResponses,
+    /// `POST /v1/messages`.
+    #[serde(rename = "anthropic.messages")]
+    AnthropicMessages,
 }
 
 impl Protocol {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenaiChat => "openai.chat",
+            Self::OpenaiResponses => "openai.responses",
+            Self::AnthropicMessages => "anthropic.messages",
         }
     }
 }
@@ -66,6 +74,16 @@ pub enum Part {
     Refusal {
         text: String,
     },
+    /// Anthropic `thinking` block replayed by the client; `signature` is echoed as sent.
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Anthropic `redacted_thinking` block; `data` is opaque.
+    RedactedThinking {
+        data: String,
+    },
     /// Anything not recognized, kept verbatim so the log never loses information.
     Other {
         value: Value,
@@ -93,9 +111,17 @@ pub struct Message {
     /// Tool messages only: the call this message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// Reasoning text replayed by the client (`reasoning_content` and friends).
+    /// Reasoning text replayed by the client (`reasoning_content`, Anthropic thinking text,
+    /// Responses reasoning summary text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// The opaque blob that goes with `reasoning`: Anthropic's thinking `signature`, Responses'
+    /// reasoning `encrypted_content`. Clients replay it; the server never inspects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_opaque: Option<String>,
+    /// Tool messages only: the client flagged the result as a failure (Anthropic `is_error`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
 }
 
 impl Message {
@@ -107,6 +133,8 @@ impl Message {
             tool_calls: Vec::new(),
             tool_call_id: None,
             reasoning: None,
+            reasoning_opaque: None,
+            is_error: false,
         }
     }
 
@@ -161,6 +189,15 @@ pub enum ResponseFormat {
     },
 }
 
+/// Anthropic's `thinking` request field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    /// `enabled`, `adaptive` or `disabled`, as sent.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+}
+
 /// A parsed request. Fields the frontend understands are typed; everything else lands in
 /// `extra` so the log can still show it and scripts can still match on it later.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -196,6 +233,13 @@ pub struct Request {
     pub response_format: Option<ResponseFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Anthropic `thinking` / extended-thinking settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    /// Responses `previous_response_id`, as sent. The stored conversation has already been
+    /// prepended to `messages` by the time the request is parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,6 +275,8 @@ impl Request {
             stop: Vec::new(),
             response_format: None,
             reasoning_effort: None,
+            thinking: None,
+            previous_response_id: None,
             store: None,
             user: None,
             metadata: Map::new(),
@@ -278,34 +324,40 @@ impl Request {
         self.tool_names().any(|n| n == name)
     }
 
-    /// The tool results at the tail of the conversation (the trailing run of tool messages),
-    /// each with the name of the function it answers, resolved through the assistant message that
-    /// issued the call. Empty when the last message is not a tool result.
+    /// The tool results of the current turn: every tool message after the last assistant
+    /// message, each with the name of the function it answers, resolved through the assistant
+    /// message that issued the call. Empty when no tool message follows the last assistant message.
+    ///
+    /// Tool messages need not be the very last messages: Anthropic clients send user text
+    /// (system reminders) in the same user message as the tool results, which the Anthropic
+    /// frontend splits into tool messages followed by a user message.
     pub fn trailing_tool_results(&self) -> Vec<ToolResult<'_>> {
-        let mut out = Vec::new();
-        for m in self.messages.iter().rev() {
-            if m.role != Role::Tool {
-                break;
-            }
-            let name = m
-                .tool_call_id
-                .as_deref()
-                .and_then(|id| self.tool_call_by_id(id))
-                .map(|c| c.name.as_str())
-                .or(m.name.as_deref());
-            out.push(ToolResult {
-                tool_call_id: m.tool_call_id.as_deref(),
-                name,
-                content: m.text_content(),
-            });
-        }
-        out.reverse();
-        out
+        let start = self.messages.iter().rposition(|m| m.role == Role::Assistant).map_or(0, |i| i + 1);
+        self.messages[start..]
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| {
+                let name = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| self.tool_call_by_id(id))
+                    .map(|c| c.name.as_str())
+                    .or(m.name.as_deref());
+                ToolResult {
+                    tool_call_id: m.tool_call_id.as_deref(),
+                    name,
+                    content: m.text_content(),
+                    parts: &m.content,
+                    is_error: m.is_error,
+                }
+            })
+            .collect()
     }
 
-    /// Whether the conversation ends with one or more tool results.
+    /// Whether the current turn (see [`Request::trailing_tool_results`]) contains tool results.
     pub fn ends_with_tool_result(&self) -> bool {
-        self.last_message().is_some_and(|m| m.role == Role::Tool)
+        let start = self.messages.iter().rposition(|m| m.role == Role::Assistant).map_or(0, |i| i + 1);
+        self.messages[start..].iter().any(|m| m.role == Role::Tool)
     }
 
     /// Finds the assistant tool call with this id anywhere in the conversation.
@@ -325,7 +377,11 @@ pub struct ToolResult<'a> {
     pub tool_call_id: Option<&'a str>,
     /// Unknown when the client never sent the matching assistant tool call.
     pub name: Option<&'a str>,
+    /// Text parts joined with newlines, see [`Message::text_content`].
     pub content: String,
+    /// All parts of the result (Anthropic `tool_result` content arrays may mix text and images).
+    pub parts: &'a [Part],
+    pub is_error: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +417,10 @@ pub struct Usage {
     /// Counted inside `prompt_tokens`.
     #[serde(default)]
     pub cached_tokens: u32,
+    /// Tokens written to the prompt cache, counted inside `prompt_tokens` (Anthropic
+    /// `cache_creation_input_tokens`). Only scripts and cassettes ever make this non-zero.
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
 }
 
 impl Usage {
@@ -382,6 +442,11 @@ pub struct Reply {
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    /// What goes in Anthropic's thinking `signature` / Responses' reasoning `encrypted_content`.
+    /// `None` lets the frontend derive one from the request seed (`fallback::reasoning_opaque`)
+    /// whenever `reasoning` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_opaque: Option<String>,
     pub finish: FinishReason,
     pub usage: Usage,
 }
@@ -432,6 +497,16 @@ pub struct ApiError {
     /// Sent as a `retry-after` header (whole seconds, rounded up).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after: Option<Duration>,
+    /// Extra response headers (`retry-after-ms`, `x-should-retry`, `x-codex-active-limit`, ...).
+    /// Names are lower-cased by the frontend when rendering.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
+    /// For streaming requests: deliver the error inside the event stream (HTTP 200) instead of
+    /// as an HTTP error. Ignored for sync requests. Shapes: Chat sends one `{"error":{...}}`
+    /// frame then `[DONE]`; Anthropic sends `message_start` then an `error` event; Responses
+    /// sends `response.created` then `response.failed`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_stream: bool,
 }
 
 impl ApiError {
@@ -443,6 +518,8 @@ impl ApiError {
             message: message.into(),
             param: None,
             retry_after: None,
+            headers: Vec::new(),
+            in_stream: false,
         }
     }
 
@@ -458,6 +535,21 @@ impl ApiError {
 
     pub fn retry_after(mut self, d: Duration) -> Self {
         self.retry_after = Some(d);
+        self
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn in_stream(mut self) -> Self {
+        self.in_stream = true;
         self
     }
 
@@ -547,6 +639,32 @@ impl ApiError {
         self
     }
 
+    /// [`ApiError::for_status`] in the style of `protocol`. Anthropic has its own `type`
+    /// vocabulary; Chat and Responses share OpenAI's.
+    pub fn for_status_in(protocol: Protocol, status: u16) -> Self {
+        if protocol != Protocol::AnthropicMessages {
+            return Self::for_status(status);
+        }
+        let (kind, message) = match status {
+            400 => ("invalid_request_error", "Invalid request."),
+            401 => ("authentication_error", "invalid x-api-key"),
+            403 => (
+                "permission_error",
+                "Your API key does not have permission to use the specified resource.",
+            ),
+            404 => ("not_found_error", "Not found."),
+            408 => ("timeout_error", "Request timed out."),
+            409 => ("api_error", "Conflict."),
+            413 => ("request_too_large", "Request exceeds the maximum allowed number of bytes."),
+            429 => ("rate_limit_error", "This request would exceed your organization's rate limit."),
+            504 => ("timeout_error", "Request timed out."),
+            529 => ("overloaded_error", "Overloaded"),
+            s if s >= 500 => ("api_error", "Internal server error"),
+            _ => ("invalid_request_error", "Request failed."),
+        };
+        Self::new(status, kind, message)
+    }
+
     /// The default `type`, `code` and `message` the real API uses for a bare status code. Scripts
     /// that only give a status get these.
     pub fn for_status(status: u16) -> Self {
@@ -600,12 +718,29 @@ pub enum Outcome {
         delivery: Delivery,
         source: Source,
     },
+    /// Hold the request without answering until the server clock is `until` past the arrival
+    /// time, then deliver `then` (which is never itself a `Hang`). `until: None` holds forever
+    /// (the client's own timeout or disconnect ends it) and `then` is never delivered.
+    Hang {
+        until: Option<Duration>,
+        then: Box<Outcome>,
+    },
 }
 
 impl Outcome {
+    /// The source of the underlying reply or error; a `Hang` reports its `then`.
     pub fn source(&self) -> &Source {
         match self {
             Self::Reply { source, .. } | Self::Error { source, .. } => source,
+            Self::Hang { then, .. } => then.source(),
+        }
+    }
+
+    /// The reply or error that is (eventually) delivered, looking through `Hang`.
+    pub fn inner(&self) -> &Outcome {
+        match self {
+            Self::Hang { then, .. } => then.inner(),
+            other => other,
         }
     }
 
@@ -672,6 +807,67 @@ mod tests {
         assert_eq!(ApiError::for_status(418).status, 418);
         assert_eq!(ApiError::for_status(413).status, 413);
         assert_eq!(ApiError::invalid_api_key().status, 401);
+    }
+
+    #[test]
+    fn tool_results_survive_trailing_user_text() {
+        let mut assistant = Message::text(Role::Assistant, "");
+        assistant.content.clear();
+        assistant.tool_calls = vec![tool_call("c1", "read_file")];
+        let mut result = Message::text(Role::Tool, "contents");
+        result.tool_call_id = Some("c1".into());
+        result.is_error = true;
+        let req = Request::new(
+            "m",
+            vec![
+                Message::text(Role::User, "hi"),
+                assistant,
+                result,
+                Message::text(Role::User, "<system-reminder>"),
+            ],
+        );
+        assert!(req.ends_with_tool_result());
+        let results = req.trailing_tool_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            (results[0].name, results[0].is_error, results[0].parts.len()),
+            (Some("read_file"), true, 1)
+        );
+        let fresh = Request::new("m", vec![Message::text(Role::User, "hi")]);
+        assert!(!fresh.ends_with_tool_result());
+    }
+
+    #[test]
+    fn hang_outcome_looks_through_to_its_inner_outcome() {
+        let inner = Outcome::rejected(ApiError::server_error());
+        let hang = Outcome::Hang {
+            until: Some(Duration::from_secs(5)),
+            then: Box::new(inner.clone()),
+        };
+        assert_eq!(hang.inner(), &inner);
+        assert_eq!(hang.source(), &Source::Rejected);
+        let json = serde_json::to_value(&hang).unwrap();
+        assert_eq!(json["outcome"], "hang");
+        assert_eq!(json["then"]["outcome"], "error");
+        assert_eq!(serde_json::from_value::<Outcome>(json).unwrap(), hang);
+    }
+
+    #[test]
+    fn new_protocols_keep_their_wire_names() {
+        for (p, name) in [
+            (Protocol::OpenaiChat, "openai.chat"),
+            (Protocol::OpenaiResponses, "openai.responses"),
+            (Protocol::AnthropicMessages, "anthropic.messages"),
+        ] {
+            assert_eq!(p.as_str(), name);
+            assert_eq!(serde_json::to_value(p).unwrap(), name);
+        }
+        assert_eq!(ApiError::for_status_in(Protocol::AnthropicMessages, 529).kind, "overloaded_error");
+        assert_eq!(ApiError::for_status_in(Protocol::AnthropicMessages, 429).kind, "rate_limit_error");
+        assert_eq!(
+            ApiError::for_status_in(Protocol::OpenaiResponses, 429).code.as_deref(),
+            Some("rate_limit_exceeded")
+        );
     }
 
     #[test]
