@@ -24,9 +24,18 @@ type Match struct {
 	System     string `json:"system,omitempty"`
 	AnyMessage string `json:"any_message,omitempty"`
 	// LastUserRaw matches the latest user message exactly as sent (reminder blocks included).
-	LastUserRaw       string   `json:"last_user_raw,omitempty"`
-	Body              string   `json:"body,omitempty"`
-	Path              string   `json:"path,omitempty"`
+	LastUserRaw string `json:"last_user_raw,omitempty"`
+	Body        string `json:"body,omitempty"`
+	// Path makes the rule a custom-endpoint rule (needs Body or Raw in the reply). It also matches the
+	// standard routes (/v1/chat/completions, ...), where a matching rule takes precedence over the
+	// protocol handling.
+	Path string `json:"path,omitempty"`
+	// Method is a case-insensitive glob over the HTTP method (GET, P*).
+	Method string `json:"method,omitempty"`
+	// Header holds regexes over request headers by (case-insensitive) name; every header named must match.
+	Header map[string]string `json:"header,omitempty"`
+	// Nth matches only the nth request (1-based) that reached the rule, not every nth like EveryNth.
+	Nth               *uint32  `json:"nth,omitempty"`
 	HasTool           string   `json:"has_tool,omitempty"`
 	NoTools           *bool    `json:"no_tools,omitempty"`
 	HasToolResult     *bool    `json:"has_tool_result,omitempty"`
@@ -70,6 +79,25 @@ type ReplySpec struct {
 	Body    json.RawMessage   `json:"body,omitempty"`
 	Status  int               `json:"status,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
+	// Raw answers with a recorded response verbatim (needs Match.Path); it excludes Body, Status, Headers and
+	// every generated-reply field, Stream, DelayMs and Reset pace it.
+	Raw *RawReply `json:"raw,omitempty"`
+}
+
+// RawReply is a response replayed as it is: any status, content type and body, an SSE stream included.
+type RawReply struct {
+	// Status is the HTTP status, 200 when zero.
+	Status int `json:"status,omitempty"`
+	// ContentType defaults to application/json.
+	ContentType string `json:"content_type,omitempty"`
+	// Body is sent byte for byte.
+	Body string `json:"body"`
+	// Headers are extra response headers; they may replace content-type.
+	Headers map[string]string `json:"headers,omitempty"`
+	// Stream true writes the body chunked (an SSE body is split after each blank line, one event per
+	// frame, paced like any stream); false sends one buffered response. Unset: a stream when ContentType
+	// is text/event-stream.
+	Stream *bool `json:"stream,omitempty"`
 }
 
 // ToolCallSpec is a tool call to emit. Arguments is any JSON value; a string is sent verbatim.

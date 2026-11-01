@@ -456,3 +456,30 @@ test('custom endpoint rule: match.path/body and reply body/status/headers', () =
     assert.equal(r.headers.get('x-c'), 'y')
     assert.deepEqual(await r.json(), { mood: 'x' })
   }))
+
+test('raw rule: SSE replay on a standard route, with nth, method and header', () =>
+  withServer(undefined, async (s) => {
+    const body = 'data: {"n":1}\n\ndata: {"n":2}\n\ndata: [DONE]\n\n'
+    s.scripts.put([
+      { match: { path: '/v1/chat/completions', nth: 2 }, reply: { raw: { status: 418, body: '{"teapot":true}', headers: { 'x-fixture': 'a' } } } },
+      { match: { path: '/v1/chat/completions', header: { 'x-replay': '^yes$' }, method: 'post' }, reply: { raw: { content_type: 'text/event-stream', body } } },
+    ])
+    const post = (headers) =>
+      fetch(`${s.endpoint}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+      })
+    const first = await post({ 'x-replay': 'yes' })
+    assert.equal(first.headers.get('content-type'), 'text/event-stream')
+    assert.equal(await first.text(), body)
+    // The second request that reached the first rule is its nth: 2.
+    const second = await post({ 'x-replay': 'yes' })
+    assert.equal(second.status, 418)
+    assert.equal(second.headers.get('x-fixture'), 'a')
+    assert.deepEqual(await second.json(), { teapot: true })
+    // No header: the SSE rule does not match and the generated reply answers.
+    const plain = await post({})
+    assert.equal(plain.status, 200)
+    assert.notEqual(await plain.text(), body)
+  }))

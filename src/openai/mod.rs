@@ -23,7 +23,7 @@ use crate::anthropic;
 use crate::anthropic::messages::MessageMeta;
 use crate::control::MAX_BODY;
 use crate::fallback;
-use crate::ir::{ApiError, Outcome, Reply, Request, Source};
+use crate::ir::{ApiError, Outcome, Protocol, Reply, Request, Source};
 use crate::openai::chat::ResponseMeta;
 use crate::reqlog::RequestRecord;
 use crate::sse;
@@ -333,27 +333,17 @@ fn header_value(s: &str) -> http::HeaderValue {
 async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, body: hyper::body::Incoming, trace: &mut Trace) -> Response {
     let route = route(&parts.method, path);
     let style = style(&route, path, &parts.headers);
-    if matches!(route, Route::Unknown) {
-        if let Ok(b) = Limited::new(body, MAX_BODY).collect().await
-            && let Some(resp) = custom::respond(shared, path, &b.to_bytes(), trace)
-        {
-            return resp;
-        }
-        return reject(
-            trace,
-            style,
-            style_error(style, 404, format!("Invalid URL ({} {path})", parts.method)),
-        );
-    }
-
-    let mut body_bytes = None;
-    if matches!(
+    let reads_body = matches!(
         route,
         Route::Chat | Route::Messages | Route::CountTokens | Route::Responses | Route::Embeddings
-    ) {
+    );
+    // Custom endpoint rules (`match.path`) come before the protocol handling, on the standard routes too.
+    let custom = shared.control.engine.has_custom_rules();
+    let mut body_bytes = None;
+    if reads_body || custom {
         match Limited::new(body, MAX_BODY).collect().await {
             Ok(b) => body_bytes = Some(b.to_bytes()),
-            Err(e) => {
+            Err(e) if reads_body => {
                 let err = if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
                     style_error(style, 413, "Request body is too large.")
                 } else {
@@ -361,7 +351,28 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
                 };
                 return reject(trace, style, err);
             }
+            Err(_) => {}
         }
+    }
+    if custom && let Some(bytes) = &body_bytes {
+        let (api, protocol) = match route {
+            Route::Chat => (Some(Api::Chat), Protocol::OpenaiChat),
+            Route::Messages => (Some(Api::Messages), Protocol::AnthropicMessages),
+            Route::CountTokens => (None, Protocol::AnthropicMessages),
+            Route::Responses => (Some(Api::Responses), Protocol::OpenaiResponses),
+            Route::Embeddings => (None, Protocol::OpenaiEmbeddings),
+            _ => (None, Protocol::Custom),
+        };
+        if let Some(resp) = custom::respond(shared, parts, path, bytes, custom::Target { api, protocol }, trace).await {
+            return resp;
+        }
+    }
+    if matches!(route, Route::Unknown) {
+        return reject(
+            trace,
+            style,
+            style_error(style, 404, format!("Invalid URL ({} {path})", parts.method)),
+        );
     }
 
     if let Some(key) = &shared.api_key {
@@ -403,11 +414,11 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
                 None => reject(trace, style, ApiError::model_not_found(&id)),
             }
         }
-        Route::Chat => complete(shared, Api::Chat, &bytes, trace).await,
-        Route::Messages => complete(shared, Api::Messages, &bytes, trace).await,
-        Route::Responses => complete(shared, Api::Responses, &bytes, trace).await,
+        Route::Chat => complete(shared, parts, Api::Chat, &bytes, trace).await,
+        Route::Messages => complete(shared, parts, Api::Messages, &bytes, trace).await,
+        Route::Responses => complete(shared, parts, Api::Responses, &bytes, trace).await,
         Route::CountTokens => count_tokens(shared, &bytes, trace),
-        Route::Embeddings => embeddings::respond(shared, &bytes, trace).await,
+        Route::Embeddings => embeddings::respond(shared, parts, &bytes, trace).await,
         Route::ResponseGet(id) => match shared.control.responses.get(id) {
             Some(r) => json_response(200, &r.response),
             None => reject(trace, style, responses::not_found(id)),
@@ -421,6 +432,16 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
         }
         Route::Unknown => unreachable!("handled above"),
     }
+}
+
+/// The HTTP method and headers of the request, for `match.method` and `match.header`.
+fn note_http(req: &mut Request, parts: &http::request::Parts) {
+    req.method = Some(parts.method.as_str().to_owned());
+    req.headers = parts
+        .headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_ascii_lowercase(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+        .collect();
 }
 
 /// Fills `raw` or `raw_text` of the trace from a body; returns the parsed JSON.
@@ -479,7 +500,7 @@ const ANTHROPIC_JSON_HINT: &str = "The request body is not valid JSON.";
 ///    frames) or the protocol's HTTP error body.
 /// 5. Replies: streams through `sse::respond`; sync bodies after `sync_latency`. Responses are
 ///    stored (`Control::responses`) once delivery starts (after the latency for sync bodies) unless the request said `store: false`.
-async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) -> Response {
+async fn complete(shared: &Shared, parts: &http::request::Parts, api: Api, bytes: &[u8], trace: &mut Trace) -> Response {
     let control = &shared.control;
     let arrived = control.clock.now();
     let style = if api == Api::Messages { Style::Anthropic } else { Style::Openai };
@@ -511,6 +532,7 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
     };
     let mut req = req;
     req.raw_body = Some(String::from_utf8_lossy(bytes).into());
+    note_http(&mut req, parts);
     let seed = fallback::request_seed(&req);
     trace.seed = Some(seed);
     let mut outcome = control.engine.resolve_async(&req).await;

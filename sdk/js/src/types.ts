@@ -14,8 +14,18 @@ export interface Match {
   system?: Pattern;
   any_message?: Pattern;
   body?: Pattern;
-  /** Glob over the request path; makes the rule a custom-endpoint rule. */
+  /**
+   * Glob over the request path; makes the rule a custom-endpoint rule (needs `reply.body` or `reply.raw`).
+   * It also matches the standard routes (`/v1/chat/completions`, ...), where a matching rule takes
+   * precedence over the protocol handling.
+   */
   path?: string;
+  /** Glob over the HTTP method, case-insensitive (`GET`, `P*`). */
+  method?: string;
+  /** Regexes over request headers by (case-insensitive) name; every header named must match. */
+  header?: Record<string, Pattern>;
+  /** Match only the nth request (1-based) that reached this rule, not every nth like `every_nth`. */
+  nth?: number;
   has_tool?: string;
   no_tools?: boolean;
   has_tool_result?: boolean;
@@ -102,6 +112,30 @@ export interface Reply {
   status?: number;
   /** Custom endpoint only: extra response headers. */
   headers?: Record<string, string>;
+  /**
+   * Custom endpoint only (needs match.path): answer with this response verbatim (a recorded body, an SSE
+   * stream). Excludes `body`, `status`, `headers` and every generated-reply field; `stream`, `delay_ms`
+   * and `reset` pace it.
+   */
+  raw?: RawReply;
+}
+
+/** A response replayed as it is. */
+export interface RawReply {
+  /** HTTP status, default 200. */
+  status?: number;
+  /** `content-type`, default `application/json`. */
+  content_type?: string;
+  /** The body, byte for byte. */
+  body: string;
+  /** Extra response headers; may replace `content-type`. */
+  headers?: Record<string, string>;
+  /**
+   * `true`: chunked, an SSE body split after each blank line (one event per frame, paced like any stream),
+   * anything else as one chunk. `false`: one buffered response with `content-length`. Default: a stream
+   * when `content_type` is `text/event-stream`.
+   */
+  stream?: boolean;
 }
 
 export interface Rule {

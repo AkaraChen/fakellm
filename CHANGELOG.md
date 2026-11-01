@@ -2,6 +2,15 @@
 
 按里程碑记录，新的在前。版本号还是 `0.1.0`，还没有推过 `v*` tag，所以没有正式发布；日期是提交日期。设计思路见 [docs/design.md](docs/design.md)，待办见 [TODO.md](TODO.md)。
 
+## 未提交（原样回放：`reply.raw`）
+
+- **`reply.raw`**：自定义端点规则可以原样回放录制的响应 `{status?, content_type?, body, headers?, stream?}`；`stream` 为真（或 `content_type` 是 `text/event-stream`）时分块写出，SSE 正文每个空行后切开、一个事件一帧，按 `stream.ttft_ms` / `tokens_per_sec` / `cut_after_chunks` 等交付参数在服务端时钟上发出；否则带 `content-length` 一次写出。与 `body`、`status`、`headers`、`text`、`tool_calls`、`error`、`trajectory`、`policy` 互斥，注册时校验。
+- **`match.path` 可以指向标准路由**（`/v1/chat/completions`、`/v1/responses`、`/v1/messages` ……），命中时优先于正常的协议处理（先于 `--api-key` 校验），请求仍解析成 IR、日志保留路由的协议并记下命中的规则、`raw` 是客户端发来的正文。**行为变化**：以前带 `path` 的规则不会命中标准路由的请求（`tests/custom_protocols.rs` 的旧用例据此改写）。
+- 新增匹配条件 `match.nth`（只命中到达这条规则的第 N 个请求）、`match.method`（方法 glob）、`match.header`（头名到正则）；`method` 和 `header` 对所有规则都生效。`ctl scripts list` 显示这些条件和 `raw <状态码>`。
+- `sdk/js` 类型、Go 的 `Match` / `ReplySpec` / `RawReply`、`bindings/node` 文档同步；测试：`tests/custom.rs`（回放 `docs/research.md` 里的录制流、418、Responses 事件、`nth`、方法与头、校验）、`sdk/node` 的 openai SDK 回放用例（Chat 流、Responses）、`bindings/node` 用例。
+- 真实消费方验证（见 [docs/consumers.md](docs/consumers.md#替换原有测试)）：codex 核心套件加 fakellm 后端（`cli_stream` 9 / 9），ai-sdk 的 `createTestServer` 垫片（1786 / 1787 个原有测试不改文件），claude-agent-sdk-typescript 新增 `e2e-fakellm`（6 / 6），oar-codex 两个过期期望修复（codex 52 / 0）。已知缺口：请求日志不解码 zstd 请求正文。
+- 套件结果（2026-11-01）：`cargo test --workspace` 620 个通过（`--no-default-features` 610），clippy `-D warnings` 与 fmt 干净；`sdk/js` 33、`sdk/node` 110、`bindings/node` 41（Bun 40 加 1 跳过）、Go 17、Python 17，`e2e/*.sh` 与 `docker.sh` 全部通过。
+
 ## 未提交（内置 txiki.js：策略脚本进程内运行）
 
 - **策略脚本默认在进程内运行**：txiki.js（QuickJS-ng + libuv，提交 `e32a7386`）作为静态库编进二进制，新 crate `tjs-sys`（`build.rs` 用 cmake 编 `third_party/txiki.js` 子模块，加一层 C 胶水）；`src/policy/tjs.rs` 给每个策略一个专用线程，异步侧用 channel 和 `oneshot` 收发决定。语义和子进程运行时一致：`state` 只在回复带 `state` 时替换，decline 不计命中，超时用宿主机时钟（死循环和挂着的 `await` 都会被打断），超时或被取消后下一个请求重建运行时并计入 `restarts`，`files` 多文件照旧写进临时目录。删除、替换、`reset`、还原快照、热加载、`Server::shutdown` 和丢弃 `Server` 都会取消在途决定并 join 线程（最多等 3 秒）；客户端中途断开也会取消。

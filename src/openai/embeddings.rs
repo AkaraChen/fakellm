@@ -265,16 +265,17 @@ pub fn encode_base64(vector: &[f32]) -> String {
 /// log the IR, apply a matching `error` rule (`Engine::resolve_error`, delayed by its `delay_ms` on the
 /// server clock), else answer 200 with [`render`]. The logged outcome is a `Reply` with only `usage` set and
 /// `Source::Fallback`.
-pub(super) async fn respond(shared: &Shared, bytes: &[u8], trace: &mut super::Trace) -> Response {
+pub(super) async fn respond(shared: &Shared, parts: &http::request::Parts, bytes: &[u8], trace: &mut super::Trace) -> Response {
     let control = &shared.control;
     trace.seed = Some(crate::fallback::hash64(bytes));
     let Some(value) = super::note_body(trace, Some(bytes)) else {
         return super::reject(trace, super::Style::Openai, ApiError::invalid_request(super::JSON_PARSE_HINT));
     };
-    let parsed = match parse(&value) {
+    let mut parsed = match parse(&value) {
         Ok(p) => p,
         Err(e) => return super::reject(trace, super::Style::Openai, e),
     };
+    super::note_http(&mut parsed.request, parts);
     trace.request = Some(Arc::new(parsed.request.clone()));
     if let Some(outcome) = control.engine.resolve_error(&parsed.request) {
         trace.outcome = Some(Arc::new(outcome.clone()));

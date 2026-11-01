@@ -45,6 +45,11 @@ impl ScriptsControl {
     /// Replaces all rules. Takes an array of rule objects, or a JSON / YAML document as a string.
     /// Hit counts restart unless `keepHits` is true. Returns `{ added, count }`: the rules just
     /// loaded and the number now loaded, as `PUT /_fakellm/scripts` does.
+    ///
+    /// Rules take every field of the script format (docs/scripts.md), among them `match.path` /
+    /// `match.method` / `match.header` / `match.nth` and `reply.raw`, which replays a recorded
+    /// response verbatim (`{ status?, content_type?, body, headers?, stream? }`; an SSE body is
+    /// streamed one event per frame) and, on a standard route, takes precedence over the protocol handling.
     #[napi]
     pub fn put(&self, input: Value, keep_hits: Option<bool>) -> Result<ScriptsLoaded> {
         let rules = rules(input)?;

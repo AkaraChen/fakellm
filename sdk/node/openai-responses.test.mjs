@@ -72,3 +72,59 @@ test('retrieve and delete', async () => {
   await client.responses.delete(r.id);
   await assert.rejects(client.responses.retrieve(r.id), (e) => e.status === 404);
 });
+
+const recordedResponse = {
+  id: 'resp_recorded',
+  object: 'response',
+  created_at: 1770933892,
+  status: 'completed',
+  model: 'gpt-4.1-nano-2025-04-14',
+  output: [
+    {
+      id: 'msg_recorded',
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: 'recorded answer', annotations: [] }],
+    },
+  ],
+  usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+};
+
+test('raw rule: a recorded response body', async () => {
+  await srv.ctl.put('/scripts', [
+    { match: { path: '/v1/responses' }, reply: { raw: { body: JSON.stringify(recordedResponse) } } },
+  ]);
+  const r = await client.responses.create({ model: 'gpt-4o', input: 'hi' });
+  assert.equal(r.id, 'resp_recorded');
+  assert.equal(r.output_text, 'recorded answer');
+  assert.equal(r.usage.total_tokens, 8);
+});
+
+test('raw rule: recorded Responses events, one frame each', async () => {
+  const frames = [
+    ['response.created', { type: 'response.created', sequence_number: 0, response: { ...recordedResponse, status: 'in_progress', output: [] } }],
+    ['response.output_text.delta', { type: 'response.output_text.delta', sequence_number: 1, item_id: 'msg_recorded', output_index: 0, content_index: 0, delta: 'recorded ' }],
+    ['response.output_text.delta', { type: 'response.output_text.delta', sequence_number: 2, item_id: 'msg_recorded', output_index: 0, content_index: 0, delta: 'answer' }],
+    ['response.completed', { type: 'response.completed', sequence_number: 3, response: recordedResponse }],
+  ];
+  const body = frames.map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join('');
+  await srv.ctl.put('/scripts', [
+    {
+      match: { path: '/v1/responses', last_user: 'replay' },
+      reply: { raw: { content_type: 'text/event-stream', body } },
+    },
+  ]);
+  const stream = await client.responses.create({ model: 'gpt-4o', input: 'replay this', stream: true });
+  const events = [];
+  for await (const e of stream) events.push(e);
+  assert.deepEqual(events.map((e) => e.type), frames.map(([event]) => event));
+  assert.equal(
+    events.filter((e) => e.type === 'response.output_text.delta').map((e) => e.delta).join(''),
+    'recorded answer',
+  );
+  assert.equal(events.at(-1).response.id, 'resp_recorded');
+  // A request the rule does not match gets the generated reply.
+  const other = await client.responses.create({ model: 'gpt-4o', input: 'something else' });
+  assert.notEqual(other.id, 'resp_recorded');
+});

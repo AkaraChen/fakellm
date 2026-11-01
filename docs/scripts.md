@@ -58,9 +58,12 @@
 | `protocol` | 字符串 | 只匹配某个协议：`openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages`、`custom`（自定义端点，需要和 `path` / `reply.body` 一起写才有意义）。写别的值是 400 |
 | `probability` | 数字 | 0 到 1。其他条件都满足后，以这个概率命中。不在范围内（包括 NaN）是 400 |
 | `every_nth` | 整数 | 至少为 1。其他条件都满足的请求里，每第 N 个命中：`every_nth: 3` 命中第 3、6、9 个 |
+| `nth` | 整数 | 至少为 1。只命中其他条件都满足的请求里**第 N 个**（从 1 数，只命中这一个，不像 `every_nth` 周期性命中）：`nth: 2` 只让第二个到达的请求命中。不满足其他条件的请求不计数，所以不会“被无关请求消耗”。计数和 `every_nth` 一样是这条规则的 `reached`，见下面的细节 |
+| `method` | glob | 对 HTTP 方法做 glob，不区分大小写：`GET`、`P*`。适合自定义端点上区分 `GET` / `POST` / `HEAD` / `DELETE`，标准路由的规则也能用 |
+| `header` | 对象：头名 → 正则 | 请求头的正则，头名不区分大小写，写了的每个头都必须存在且值匹配（同名头有多个时任意一个匹配即可）。正则写法同其他正则字段，比如 `{ "x-env": "^stag(e\|ing)$", "authorization": "/^bearer /i" }` |
 | `after` | 规则名 | 序列匹配：名字为此值的规则至少回答过 `after_count` 次（缺省 1）之后，这条规则才可能命中。次数数的是整个服务里该规则的 `hits`，`reset` 或替换剧本后清零。整组规则里必须有这个名字，否则是 400（`names no rule`）；写自己的名字、几条规则互相引用成环（A after B、B after A，谁也无法开始）、`after_count` 没有 `after` 或为 0 也都是 400。`keep_hits=true` 替换时，计数按规则名沿用（没有名字的规则按同一位置沿用），所以调整顺序或插入规则不会让计数错位 |
 | `after_count` | 整数 | 至少为 1，配合 `after`：被引用规则的最少命中次数 |
-| `path` | glob | 自定义端点规则，见[自定义端点](#自定义端点)：匹配请求路径（去掉网关前缀之后），`*` 任意串、`?` 一个字符。必须和 `reply.body` 一起写 |
+| `path` | glob | 自定义端点规则，见[自定义端点](#自定义端点)：匹配请求路径（去掉网关前缀之后），`*` 任意串、`?` 一个字符。必须和 `reply.body` 或 `reply.raw` 一起写。也可以指向标准路由（`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 等），命中时**优先于**正常的协议处理，见[原样回放](#原样回放raw) |
 
 细节：
 
@@ -72,6 +75,7 @@
 - **`has_tool_result: false`** 不仅匹配“第一次请求”，还匹配所有不以 tool 消息结尾的请求（例如用户追问）。想只匹配第一次请求，用 `turn: 0`。
 - **`turn`** 数的是整个对话里的 assistant 消息数，不是工具调用次数。Responses 里连续的 `reasoning`、assistant `message` 和 `function_call` 项合并算一条 assistant 消息（一次模型输出）；带 `previous_response_id` 时，前面已存的对话也算进去。
 - **`probability` 和 `every_nth` 的计数**：它们数的是“到达过这条规则的请求”，也就是其他所有条件都满足、规则也没用完 `times` 的请求（`GET /_fakellm/scripts` 里每条规则的 `reached`），**不是 `hits`**。`probability` 的随机数由请求内容和 `reached` 决定，所以同一个测试每次运行的结果都一样；`reached` 不同，同样内容的重试也会抽到不同的数（用 `hits` 做计数的话，一次没抽中，`hits` 不变，重试会永远抽到同一个数）。同时写 `probability` 和 `every_nth` 时两者都要满足，`reached` 每个请求只加一次。`times` 只数真正命中的请求。
+- **`nth` 的计数**：每条规则各数各的 `reached`（其他条件都满足的请求数），而一条规则只能看到排在它前面的规则没有回答的请求。所以几条规则分别写 `nth: 1`、`nth: 2` 组成序列时，**后面的位置写在前面**：`[{nth: 2, ...}, {nth: 1, ...}, 兜底]`——第一个请求被 `nth: 2` 的规则看到（它的 `reached` 是 1，不命中），由 `nth: 1` 的规则回答；第二个请求 `nth: 2` 的规则看到的是第 2 个，命中。只需要“第 N 次特殊”时，一条 `nth: N` 的规则就够了；需要“先 A 后 B”并且 B 依赖 A 已经回答过，用 `after`。`nth` 和 `every_nth`、`probability` 同时写时都要满足。
 - **`protocol` 的用法**：同一个提示词在三种协议下需要不同的错误体或不同的行为时，写多条规则、各带一个 `protocol`。Anthropic 的 system 提示在 `system` 字段，Chat 在 `system` / `developer` 消息，Responses 在 `instructions` 或 `developer` 消息，它们都会被 `system` 条件看到。
 
 示例（每个都是独立的规则）：
@@ -114,6 +118,7 @@
 | `body` | 任意 JSON | 仅自定义端点规则：原样返回的 JSON 正文。见[自定义端点](#自定义端点) |
 | `status` | 整数 | 仅自定义端点规则：HTTP 状态码，默认 200，范围 100 到 599 |
 | `headers` | 对象 | 仅自定义端点规则：额外的响应头（可以覆盖 `content-type`） |
+| `raw` | 对象 | 仅自定义端点规则：把一个录制好的响应原样回放（状态码、`content-type`、正文，可以是 SSE 流）。不能和 `body`、`status`、`headers` 以及 `text`、`tool_calls`、`reasoning`、`reasoning_opaque`、`finish_reason`、`usage`、`error`、`trajectory`、`policy`、`hang*` 同时写；`stream`、`delay_ms`、`reset` 仍然生效。见[原样回放](#原样回放raw) |
 | `policy` | 字符串 | 把请求交给这个已注册的[策略脚本](agent.md#策略脚本)，由 JS 模块决定回复。同样不能和内容、`error`、`trajectory` 同时写，规则上的 `stream`、`delay_ms`、`hang*`、`reset`、`usage` 是策略回复的默认值。找不到是 400 `fakellm_policy_not_found`。策略可以“放弃”：`decide` 返回 `null` / `undefined` / `{decline: true}` 时这条规则视为没匹配上（不计命中，策略的 `hits` 也不加），引擎继续往下找后面的规则，直到有规则回答或落到 cassette / 回退 |
 
 没有被覆盖的 `usage` 字段由服务端用内置 tokenizer 算出：`prompt_tokens` 来自整个请求，`completion_tokens` 是文本、工具调用参数和推理文本的 token 之和。
@@ -309,13 +314,13 @@ HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}
 
 有些 SDK 和 harness 除了 LLM 路由，还会调用非标准的 JSON 接口。写一条带 `match.path` 和 `reply.body` 的规则就能回答它：
 
-- `match.path` 是路径 glob。设置之后这条规则适用于 API 下的任意路径，包括标准路由不认识的路径；它只看这类请求，不会被 `/v1/chat/completions` 等标准请求命中，反过来没有 `path` 的规则（包括 `any: true`）也不会命中自定义请求。
-- `reply.body` 是原样返回的 JSON；`reply.status`（默认 200）和 `reply.headers` 可选。`path` 和 `body` 必须成对出现，且这类回复不能再写 `text`、`tool_calls`、`error`、`trajectory`、`policy`、`reasoning`；`status` / `headers` 没有 `path` 是 400。
-- 用 `match.body`（正则，匹配原始请求正文）区分同一路径上的不同请求；`times`、`name`、`every_nth`、`probability` 照常生效，规则按顺序，第一条命中的回答。
+- `match.path` 是路径 glob。设置之后这条规则适用于任意路径：标准路由不认识的路径，以及标准路由本身（`/v1/chat/completions` 等，见[原样回放](#原样回放raw)）。带 `path` 的规则只看路径匹配的请求，没有 `path` 的规则（包括 `any: true`）只处理标准路由的正常流程，不会命中带 `path` 的请求所在的自定义路径。
+- `reply.body` 是原样返回的 JSON；`reply.status`（默认 200）和 `reply.headers` 可选。`path` 和 `body`（或 `raw`）必须成对出现，且这类回复不能再写 `text`、`tool_calls`、`error`、`trajectory`、`policy`、`reasoning`；`status` / `headers` 没有 `path` 是 400。需要别的 `content-type`、非 JSON 正文或流式时用 `reply.raw`。
+- 用 `match.body`（正则，匹配原始请求正文）区分同一路径上的不同请求；`method`、`header`、`nth`、`times`、`name`、`every_nth`、`probability` 照常生效，规则按顺序，第一条命中的回答。
 - 没有任何规则命中的未知路径仍是 404 `Invalid URL (POST /path)`。
 - 配置了 `--path-prefix` 时，匹配 `match.path` 之前先去掉这个前缀，所以 `/v1/systemone` 的规则同时回答 `/v1/systemone` 和 `/anthropic/v1/systemone`；其他前导路径段只在标准路由后缀前才会被去掉，自定义路径按字面匹配。请求日志保留完整路径。
-- 自定义端点**不经过 `--api-key` 校验**（校验在标准路由里），错误的密钥也会得到规则的回复；`tests/custom_protocols.rs` 把这个现状固定了下来。
-- 请求日志里 `protocol` 为 `"custom"`，`raw` 是原始正文，`rule` 和 `source` 是命中的规则，`reply.text` 是返回的 JSON 文本；`/_fakellm/requests?protocol=custom` 可以过滤。自定义请求不经过 cassette、上游和回退，不支持流式和 `delay_ms`。
+- 带 `path` 的规则命中时**不经过 `--api-key` 校验**（校验在标准路由的正常流程里），错误的密钥也会得到规则的回复，标准路由上也一样；`tests/custom_protocols.rs` 把这个现状固定了下来。
+- 请求日志里自定义路径的 `protocol` 为 `"custom"`；标准路由上被规则接管的请求保持该路由的协议（`openai.chat` 等）。`raw` 是原始正文，`rule` 和 `source` 是命中的规则，`reply.text` 是返回的正文文本；`/_fakellm/requests?protocol=custom` 可以过滤。自定义请求不经过 cassette、上游和回退；`reply.body` 不支持流式和 `delay_ms`，`reply.raw` 支持。
 
 示例：xsai 的 decide 包 `POST /v1/systemone`（请求 `{model, state, questions}`，响应 `{answers, usage}`，格式见 consumers.md），按 `state` 区分两个用例：
 
@@ -339,6 +344,52 @@ HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}
         damaged: { type: noul, noul: 0.1 }
       usage: { input_tokens: 42, output_tokens: 8 }
 ```
+
+### 原样回放（raw）
+
+`reply.raw` 把一个录制好的响应原样回放，用法同 msw / wiremock 的 fixture：从真实 API 抓下来的正文（包括 SSE 流）直接放进剧本，客户端看到的就是那些字节，不经过 fakellm 的渲染，也不重新生成 id、`created`、`usage`。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `body` | 字符串 | 必填。响应正文，一个字节都不改 |
+| `status` | 整数 | HTTP 状态码，默认 200，范围 100 到 599 |
+| `content_type` | 字符串 | `content-type`，默认 `application/json`。SSE 要写 `text/event-stream` |
+| `headers` | 对象 | 额外的响应头，可以覆盖 `content-type` |
+| `stream` | 布尔 | `true`：分块写出（chunked，没有 `content-length`）。`text/event-stream` 的正文在每个空行（`\n\n` 或 `\r\n\r\n`）之后切开，一个事件就是一帧；其他类型的正文是一帧。`false`：一次性写出整个正文，带 `content-length`。不写：`content_type` 是 `text/event-stream` 时为流，否则不是 |
+
+- **节奏**：流式回放走和普通回复同一套交付参数。`stream.ttft_ms`（或 `delay_ms`）是第一帧之前的等待，`stream.tokens_per_sec` / `chunk_tokens` 决定后面每帧的间隔（每帧算一个 token 位置，间隔 = `1 / tokens_per_sec * chunk_tokens`），`stream.cut_after_chunks` / `reset_after_chunks` / `reset` 在第几帧之后断开；全部走服务端时钟，冻结的时钟下 `clock advance` 才放出下一帧。非流式回放等 `ttft` 后一次写出，`reset: true` 写一半正文后断开。不写这些字段就尽快写完。
+- **接管标准路由**：`match.path` 可以是 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/embeddings` 等标准路径。命中的规则**优先于**该路由的正常处理（`--api-key` 校验、剧本里没有 `path` 的规则、cassette、上游、回退都不再看这个请求），所以 `raw` 规则是用来逐字节回放录制正文的，不是用来“修饰”fakellm 生成的回复。没命中的请求（`last_user`、`nth`、`header` 等条件不满足，或 `times` 用完）照常走正常流程，所以可以只接管某一次请求，其余仍由其他规则、cassette 或回退回答。
+- **请求照常解析**：在 Chat / Responses / Messages 上，请求体能解析时会先解析成 IR，`model`、`last_user`、`has_tool`、`stream`、`turn` 等条件在 `path` 规则上照常可用；解析不了（不是合法的请求）也能匹配，只是这些条件不满足。请求日志里该请求保留路由的协议，`source` 是命中的规则，`reply.text` 是回放的正文，`GET /_fakellm/requests?full=true` 的 `raw` 是客户端发来的原始正文。
+- **只是原样**：`raw` 不检查正文是否合法（JSON、SSE 都不检查），也不更新 Responses 存储，回放出来的 `resp_...` 不能被 `GET /v1/responses/{id}` 或 `previous_response_id` 找到。想要这些，用普通的 `text` / `tool_calls` 规则。
+
+示例：回放一段录制的 Chat Completions 流（`docs/research.md` 里的样本），openai SDK 的 `chat.completions.create({stream: true})` 读到的就是这些事件；第二个请求回放一个 418。
+
+```yaml
+- name: recorded-stream
+  match: { path: /v1/chat/completions, stream: true, nth: 1 }
+  reply:
+    raw:
+      content_type: text/event-stream
+      body: |+
+        data: {"id":"chatcmpl-D8Z5oo6uDh67AD85p73ksdT1KxhE0","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano-2025-04-14","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-D8Z5oo6uDh67AD85p73ksdT1KxhE0","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano-2025-04-14","choices":[{"index":0,"delta":{"content":"**"},"finish_reason":null}]}
+
+        data: {"id":"chatcmpl-D8Z5oo6uDh67AD85p73ksdT1KxhE0","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano-2025-04-14","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+        data: [DONE]
+
+    stream: { ttft_ms: 50, tokens_per_sec: 20 }
+- name: recorded-error
+  match: { path: /v1/chat/completions, header: { x-scenario: "^teapot$" }, method: POST }
+  reply:
+    raw:
+      status: 418
+      body: '{"error":{"message":"I am a teapot","type":"teapot"}}'
+      headers: { x-fixture: teapot }
+```
+
+`|+` 保留正文末尾的空行，最后一个事件才完整；`stream` 和 `raw` 同级，写在 `reply` 下。
 
 ## 与 cassette、上游的关系
 

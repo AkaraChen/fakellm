@@ -2,13 +2,14 @@
 
 > 本文是作者本机的一次性实验记录：`$RESEARCH_DIR`（即 fakellm-research 目录）不随仓库发布，其中的路径和本地分支不可直接复现。下面写的命令是当时的做法，换了机器要自己克隆这些仓库、重新建分支。
 
-在 `$RESEARCH_DIR` 下克隆了八个会调用 LLM API 的开源仓库，各开一个本地分支 `fakellm`，把它们的测试或 e2e 改成对着 fakellm 跑，用来找 fakellm 的缺口。实验分三轮，每轮用当时最新的二进制：
+在 `$RESEARCH_DIR` 下克隆了八个会调用 LLM API 的开源仓库（后面又加了 claude-agent-sdk-typescript），各开一个本地分支 `fakellm`，把它们的测试或 e2e 改成对着 fakellm 跑，用来找 fakellm 的缺口。实验分三轮，每轮用当时最新的二进制：
 
 - 第一轮（M1 二进制）：xsai、pi-mono、claude-agent-sdk-python、opencode、raft、oar 六个仓库。
 - 第二轮（M2 二进制）：新增 paseo 和 ai-sdk 一致性对照，重跑 oar。
 - 第三轮（M3 二进制：trajectory、JS 策略脚本、路径前缀、`args_chunk_bytes`、embeddings）：重跑 oar、xsai、raft、pi-mono。
 - 补充（M4 之后）：自定义端点规则让 xsai 的最后两个用例通过（`83f149e`，用当前工作区的二进制重跑确认）。
 - 收尾一轮（consumers）：oar 改用策略 decline 并重跑三个后端，codex 用 Rust SDK 重写一个 CLI 场景，paseo 改用 `match.after`。
+- 替换原有测试（`reply.raw` 之后）：不再手写规则，而是让原有的 wiremock / msw 夹具直接换成 fakellm 的原样回放；见[替换原有测试](#替换原有测试)。
 
 所有提交都只在本地，没有推送。
 
@@ -34,6 +35,10 @@
 | paseo | — | 6 个文件、16 个测试全部迁移并通过 | — | codex-auto-review 的顺序改用 `match.after`，2 / 2（`40fdc00`） | 全通过 |
 | codex（Rust SDK） | — | — | — | 新增 `fakellm-e2e`：cli_stream 的 `responses_mode_stream_cli` 用进程内 `fakellm::Server` 重写，1 / 1（`831fe79`） | 通过 |
 | ai-sdk 一致性 | — | 7 个对照测试全通过 | — | — | 全通过，差异见缺口 3 |
+| codex（核心测试套件） | — | — | — | `CODEX_TEST_FAKELLM=1`：`cli_stream` 9 / 9，85 个只用 SSE 挂载的模块 259 / 283（`e79b7d8`） | 部分通过，差异见缺口 11 |
+| ai-sdk（原有测试） | — | — | — | `AI_SDK_TEST_SERVER=fakellm`：openai 994 / 995，anthropic 792 / 792，未改测试文件（`4465312`） | 1 个 `controlled-stream` 用例未支持 |
+| claude-agent-sdk-typescript | — | — | — | 新增 `e2e-fakellm`：6 / 6（`1f77bed`） | 通过 |
+| oar-codex（诊断） | — | — | — | codex 50 / 2 → 52 / 0，claude 68 / 0，opencode 10 / 0（`18f262b`，只改两个测试文件） | 全通过 |
 
 阅读方法：第一轮的失败几乎全是 fakellm 缺的东西（`reply.usage`、embeddings、路径前缀、谓词与函数式回复、自定义端点）；到收尾一轮，没有已知的 fakellm 缺口会让这些仓库的测试失败，oar 剩下的 2 个 codex 失败已证明与 fakellm 无关（见[收尾一轮](#收尾一轮consumers)）。
 
@@ -48,10 +53,11 @@
 | `claude-agent-sdk-python` | `6bd191f` 可选的 fakellm 后端（`FAKELLM_BIN`） |
 | `opencode` | `c200d6b` session-runner 与真实 opencode CLI 对着 fakellm 跑 |
 | `raft-source` | `678808f` provider wire 测试改用 fakellm；`0adb751` 恢复 `/anthropic` 前缀，新增 reset 代理用例 |
-| `oar` | `a86b115` `OAR_MOCK=fakellm` 适配器；`3c66603` usage、latency、chunkSize 映射；`960a8ab` `last_user` / `any_message` 选择；`a6c4802` 无工具谓词与否定正则；`fee3096` 每个动态夹具一个策略加回调；`883154b` 改用策略 decline，Anthropic 用 `last_user`，文本按 aimock 的 20 字符分块 |
+| `oar` | `a86b115` `OAR_MOCK=fakellm` 适配器；`3c66603` usage、latency、chunkSize 映射；`960a8ab` `last_user` / `any_message` 选择；`a6c4802` 无工具谓词与否定正则；`fee3096` 每个动态夹具一个策略加回调；`883154b` 改用策略 decline，Anthropic 用 `last_user`，文本按 aimock 的 20 字符分块；`18f262b` 修两个过期的 codex 版本期望（只改 `failure-classes` 与 `service-tier` 的 vendor 测试） |
 | `paseo` | `50ee5ef` codex / claude / opencode 本地 e2e 改用 fakellm；`40fdc00` codex-auto-review 的 guardian / 主请求顺序改用 `match.after` |
-| `codex` | `831fe79` 独立 crate `fakellm-e2e`（自带 `[workspace]`），用 Rust SDK 重写 `cli_stream.rs` 的一个场景 |
-| `ai` | `23d6d62` openai 与 anthropic 的夹具一致性对照 |
+| `codex` | `831fe79` 独立 crate `fakellm-e2e`（自带 `[workspace]`），用 Rust SDK 重写 `cli_stream.rs` 的一个场景；`e79b7d8` `core_test_support` 的 fakellm 后端（`CODEX_TEST_FAKELLM=1`） |
+| `claude-agent-sdk-typescript` | `1f77bed` 新项目 `e2e-fakellm`（6 个用例） |
+| `ai` | `23d6d62` openai 与 anthropic 的夹具一致性对照；`4465312` `createTestServer` 的 fakellm 垫片（`AI_SDK_TEST_SERVER=fakellm`） |
 
 ## 如何复现
 
@@ -67,6 +73,9 @@
 | oar | `CI=1 OAR_MOCK=fakellm OAR_TEST=<claude\|codex\|opencode>-aimock npx vitest run sea-trial/vendor`（必须 `CI=1`） | [oar](#oar)、[第三轮](#第三轮m3-二进制) |
 | paseo | `cd packages/server && npx vitest run <文件>`（先构建没有 `dist` 的工作区包） | [paseo（第二轮）](#paseo第二轮) |
 | ai-sdk | `cd packages/<openai\|anthropic> && npx vitest run --config vitest.node.config.js src/fakellm-conformance.test.ts` | [ai-sdk 一致性对照（第二轮）](#ai-sdk-一致性对照第二轮) |
+| codex 核心套件 | `cd codex-rs && CODEX_TEST_FAKELLM=1 RUST_MIN_STACK=8388608 cargo test -p codex-core --test all cli_stream` | [替换原有测试](#替换原有测试) |
+| ai-sdk 原有测试 | 先在 `packages/test-server` 里 `npx tsdown`；`cd packages/<openai\|anthropic> && FAKELLM_BIN=<二进制> AI_SDK_TEST_SERVER=fakellm npx vitest run --config vitest.node.config.js` | [替换原有测试](#替换原有测试) |
+| claude-agent-sdk-typescript | `cd e2e-fakellm && npm install && node --test --test-concurrency=1 test/*.test.mjs` | [替换原有测试](#替换原有测试) |
 
 ## 结论
 
@@ -76,6 +85,7 @@ fakellm 解决了的：
 - **请求日志取代手写计数**：按规则、协议、原始正文断言（例如 `function_call_output`），比各家手写的内存数组直接。
 - **三轮里补上的功能都有对应的通过用例**：`reply.usage` 覆盖、embeddings（xsai）、路径前缀（raft）、`stream.args_chunk_bytes`（oar 的慢参数用例）、真正的 RST（pi-mono、raft）、trajectory 与策略（pi-mono 的 agent 循环）、谓词与函数式回复经策略实现（oar 从 49 / 41 提到 66 / 50）、自定义端点（xsai 14 / 14）。
 - **一致性对照**：汇总断言（文本、工具、finish reason、usage）与真实 API 抓包夹具一致。
+- **原样回放能直接替换原有的 HTTP mock**：ai-sdk 的 1786 / 1787 个原有测试不改测试文件就通过（见[替换原有测试](#替换原有测试)）。
 
 还没解决的：
 
@@ -471,6 +481,58 @@ M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前
 
 以后新的消费方不需要再抄 `startFakellm` 这类手写 harness（paseo 的 `test-utils/fakellm.ts`、oar 的适配器都是这样的一次性代码）：`sdk/js` 就是官方 helper，vitest 项目直接用它的 [globalSetup](../sdk/js/README.md#通用-helper-vitest-globalsetup)，一次启动、读取地址、结束时清理。
 
+## 替换原有测试
+
+`reply.raw`、`match.path` 指向标准路由、`match.nth` / `match.method` / `match.header` 实现之后，不再需要把期望改写成 fakellm 的剧本：原有测试里的 wiremock / msw 夹具（状态码、`content-type`、录制的 SSE 正文）可以逐字节原样回放。本节是这一轮的结果；所有提交只在本地，没有推送。
+
+### codex（`e79b7d8`，`codex-rs/core/tests/common/fakellm_backend.rs`）
+
+- 做法：`core_test_support` 新增依赖 `fakellm = { path = ..., default-features = false }` 和后端模块。`CODEX_TEST_FAKELLM=1` 时 `responses::start_mock_server()` 与新的 `responses::TestServer::start()` 启动进程内的 `fakellm::Server`（严格模式）；`mount_sse_once` / `mount_sse_sequence` 注册自定义端点规则（`match.path` 为 `*/responses`、方法 POST、`reply.raw` 的 `text/event-stream` 加原始 SSE 文本、每个正文 `times: 1`），`start_mock_server` 另挂一条默认的 `GET */models`。`ResponseMock` 在这个模式下读 fakellm 的请求日志（完整正文和头），转换成 `wiremock::Request`，原有的正文不变式检查照常跑。
+- API 变动：新增 `TestServer`（解引用到 wiremock 的 `MockServer`，有 `uri()` 和 `verify()`）和 `MockBackend` trait，`test_codex.rs` 的 builder 与两个挂载函数接受 `&impl MockBackend`；`code_mode_elicitation`、`hooks_executor`、`review`、`scenarios` 四个文件把类型从 `MockServer` 换成 `TestServer`；`cli_stream.rs` 的 `mount_sse_*` 用例改用 `TestServer::start()`，两个 personal-access-token 用例因为挂自定义 wiremock `Mock` 仍用 wiremock。
+- 结果（codex-core 的 `all` 测试二进制，要设 `RUST_MIN_STACK=8388608`，否则整个二进制栈溢出）：
+
+| 运行 | 不设变量 | `CODEX_TEST_FAKELLM=1` |
+|---|---|---|
+| `cli_stream` | 9 / 0 | 9 / 0 |
+| 完整 `all` 二进制 | 2456 通过、420 失败、8 忽略 | 未跑完（见下） |
+| 只用 `mount_sse_once` / `mount_sse_sequence` 的 85 个模块 | 282 通过、1 失败、3 忽略 | 259 通过、24 失败、3 忽略 |
+
+  完整运行里的 420 个失败不设变量也失败，是环境问题。fakellm 模式没跑完整：挂 wiremock `Mock`、`*_match` 或 `mount_response_*` 的测试会挂起，因为这些挂载落在客户端根本不连的 wiremock 上；85 个模块是用 grep 避开这些 helper 选出来的，选择是近似的，仍有几个会挂的混在里面。没有让这些 wiremock 专用 helper 在 fakellm 模式下 panic。
+- 24 个失败的原因：15 个是请求日志解不开 codex 在 ChatGPT 认证下发的 zstd 请求正文（记录里是有损的 `raw_text`，`body_json()` 报 "failed to decode zstd request body"，集中在 `search_tool`、`hooks_mcp`），属于 fakellm 缺口 11；5 个是 `unified_exec_process_events` 的 "deadline has elapsed"，4 个其他，这 9 个没有调查。
+- 限制：wiremock 的 `Match` 闭包没有对应物；要支持 `mount_sse_once_match` 之类得翻译成 `body` / `header` / `nth` 条件。`fakellm-e2e/target/*` 已被 git 跟踪、工作区里显示为删除，提交只含 codex-rs 的测试路径和 `Cargo.lock`。
+- 构建代价：codex-core 测试二进制约 40 分钟（主要是依赖和 rusty_v8 拉取），另有 `codex` 二进制 8 分钟；磁盘最低剩 17 GB。
+
+### ai-sdk（`4465312`，`packages/test-server/src/fakellm-test-server.ts`）
+
+- 做法：`create-test-server.ts` 只在 `AI_SDK_TEST_SERVER=fakellm` 时委托给垫片，默认的 msw 路径不变。`start()` 在空闲端口启动 `FAKELLM_BIN`，`stop()` 按 PID 结束。每个路由键翻成原样回放规则（`match.path` 是 URL 路径，`:param` 换成 `*`）；`json-value`、`stream-chunks`、`error`、`empty` 映射到 `reply.raw`；数组和函数每次调用一条 `nth` 规则（函数展开 12 次）；给 `server.urls[x].response` 赋值会通过 `curl` 同步推送规则。`server.calls` 从 `full=true` 的请求日志读（multipart 用 `raw_text` 加 `Response.formData()` 重建）。
+- 请求重定向：包装 `globalThis.fetch`，把每个路由的源站改写到 fakellm，因此显式传 `baseURL` 的测试也覆盖到；`AI_SDK_FAKELLM_ENV=1` 才额外设 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL`（会改变 provider 测试看到的 URL）。tests 引用的是 `test-server/dist`，改垫片后要在 `packages/test-server` 里 `npx tsdown`。
+- 结果：
+
+| 包 | 范围 | msw | fakellm |
+|---|---|---|---|
+| openai | `src/chat`、`src/responses` | 995 / 995 | 994 / 995 |
+| anthropic | `src` 全部 | 792 / 792（含 4 个没有 `FAKELLM_BIN` 就跳过的对照占位） | 792 / 792 |
+
+  只有 `openai-responses-language-model.test.ts` 与 msw 不同（389 / 390）；失败的是用 `controlled-stream` 的一个用例，垫片不支持（`binary` 也不支持，但这些文件没用到）。
+- 第一次全量运行 19 个失败，垫片修复后剩 1 个：响应头和快照（fakellm 加了 `x-request-id`、`request-id`、`openai-processing-ms`、`date`、`transfer-encoding`，垫片从响应里剔除；请求侧也隐藏 `host`、`content-length`、`accept: */*` 等传输头）、`content-type`（头里的值变成 `raw.content_type`，`error` 用 `text/plain`）、multipart 正文重建。
+- fakellm 一侧没有阻塞项：`raw` 回放处理了所有夹具；hyper 一定会加 `date` 和 `transfer-encoding`，不能关；非 JSON 正文以有损 UTF-8 文本保存，对这里的文本 multipart 够用。
+- 依赖 msw 内部行为的地方都由垫片处理：`requestCredentials` 写死 `same-origin`、头集合相等的断言依赖 msw 的 `Request` / `Response` 不带传输头、中途赋值 `.response` 的测试依赖全局的 `callNumber`（垫片的 `nth` 按 URL 计，靠已见的调用数补偿；目前没有用例因此失败）。
+- 没有跑 openai chat 与 responses 目录、anthropic 包之外的测试；默认 msw 路径只重跑了 `anthropic-language-model.test.ts`（404 通过）。
+
+### claude-agent-sdk-typescript（`1f77bed`，新项目 `e2e-fakellm/`）
+
+- 这个仓库没有 e2e，新建了一个私有的 ESM 项目（依赖 `@anthropic-ai/claude-agent-sdk` 和 `zod`）。`test/helpers.mjs` 从 `sdk/js/dist` 引入 `start`，每个测试文件启动一个 fakellm（`target/debug/fakellm`，`FAKELLM_BIN` 可换），`pathToClaudeCodeExecutable` 指向已安装的 `claude`（2.1.314，`CLAUDE_CLI` 可换），`CLAUDE_CONFIG_DIR` 用临时目录，设 `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK=1`。每个用例前 reset，再装该用例的规则加一条兜底。
+- 6 个用例，`node --test --test-concurrency=1 test/*.test.mjs`（Node 24）6 / 6：纯文本结果（日志里有自定义 system prompt 和非空 tools）；结构化输出（`StructuredOutput` 工具调用规则，`structured_output` 等于脚本的 JSON）；SDK MCP 工具往返（ToolSearch、工具调用、最终文本按 turn 匹配，`echo` 处理函数收到 `{text:'hi'}`，工具结果出现在下一条请求里）；`includePartialMessages` 打开时有 thinking 块、`thinking_delta` 和 `text_delta`；默认不打开时没有 stream 事件；模型名上的 404 错误规则（`is_error` 为真，日志里是该规则的 404）。
+- 发现：日志里的 system prompt 是 `request.messages` 里 `role: system` 的消息，不是顶层 `system` 字段；日志里的 `rule` 是规则名字符串；`path` 带查询串（`/v1/messages?beta=true`），要用 `startsWith`；CLI 会把 404 改写成 "There's an issue with the selected model…"，所以用例只断言 `is_error` 和日志里的 404，SDK 遇到 CLI 的错误结果会抛异常，helper 里接住。
+
+### oar-codex 诊断（`18f262b`）
+
+- 之前剩下的两个 codex 失败都是测试期望随 codex 版本过期，既不是适配器问题也不是 oar 的 bug，在不设 `OAR_MOCK` 的 aimock 基线上同样失败。
+- `failure-classes` "unknown model"：测试期望 `{failure: 'model_unavailable'}` 不带 status，对应 codex 0.165.0（provider 404 报成命名的 `codexErrorInfo: "modelNotFound"`）；已装的 0.162.1 报 `{"httpConnectionFailed":{"httpStatusCode":404}}`，oar 的分类（`packages/oar/src/runtimes/codex/failure.ts`）有意保留 status。修法：Cell 类型加可选 `alsoStatus`，这一格设 404，期望不变。
+- `service-tier` "resume preserves the saved tier"：codex 0.164.0 起省略 tier 的恢复沿用线程保存的 tier，之前取当前配置。新增 `codexKeepsSavedTier()` 读 `codex --version`，断言按版本分支。
+- 修复只改 `sea-trial/vendor/failure-classes.vendor.test.ts` 和 `service-tier.vendor.test.ts`；不设 `OAR_MOCK` 时这两个文件 14 / 0。`OAR_MOCK=fakellm`（`CI=1`，Node 24，逐个跑）：claude 68 / 0，codex 52 / 0（原 50 / 2），opencode 10 / 0。
+- 旧二进制：默认的 `$RESEARCH_DIR/bin/fakellm` 已过期，不认适配器现在发的 `{decline:true}`（"unknown field `decline`"），用它跑 codex 会多 3 个无关失败；要么刷新它，要么设 `FAKELLM_BIN=<仓库>/target/debug/fakellm`（上面的数字都是后者）。
+
 ## fakellm 缺口
 
 三轮和一次补充之后重新排序：先按需要它的仓库数，同数时按受影响的用例数；第三轮已解决的缺口移到表后。
@@ -487,6 +549,10 @@ M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前
 | 8 | 正则不支持环视（oar） | oar | Rust regex 无 lookahead；opencode 的“不含 X”已能靠规则顺序表达，适配器遇到其他环视仍抛错；回落路径也忽略否定正则。低优先级 |
 | 9 | 文档过时：RST 行为（raft）。文档已更正，仅剩代理验证 | raft | 二进制已发 RST（裸 `net` 客户端得到 `ECONNRESET`），README、`docs/scripts.md` 已改成 RST；未验证 CONNECT 代理会转发 RST 还是转成 FIN。经代理和 pi-ai 看到的都是 `terminated`，区分不了 |
 | 10 | trajectory/策略的覆盖缺口（pi-mono） | pi-mono | agent 测试只用 openai-completions，Responses 与 Anthropic 的 trajectory/策略没测；bun 与 tjs 运行时没试；`args_chunk_bytes`（仅 oar 间接覆盖）、`last_user_raw`、路径前缀容忍（仅 raft 覆盖）没有专门测试 |
+| 11 | 请求日志不解码 `content-encoding: zstd` 的请求正文（codex） | codex | codex 在 ChatGPT 认证下发 zstd 压缩的请求正文；记录里只有有损的 `raw_text`，`body_json()` 报 "failed to decode zstd request body"，核心套件 85 个模块里 15 个失败（`search_tool`、`hooks_mcp`）。未实现 |
+| 12 | 替换原有 mock 时的剩余差异（codex、ai-sdk） | codex、ai-sdk | wiremock 的 `Match` 闭包没有对应物（要翻成 `body` / `header` / `nth`）；hyper 一定会加 `date` 和 `transfer-encoding`，不能关；ai-sdk 垫片不支持 `controlled-stream` 和 `binary`（垫片侧，不是引擎缺口） |
+
+替换原有测试这一轮没有新增已解决的缺口；原样回放（`reply.raw`、`match.nth` / `method` / `header`）本身就是为这一轮做的。
 
 补充一轮已解决：
 

@@ -16,15 +16,16 @@ fn custom_rule() -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn standard_routes_ignore_custom_rules_on_every_protocol() {
+async fn custom_rules_take_over_standard_routes_on_every_protocol() {
     let s = start().await;
-    // Even a custom rule on a standard path, or one that matches everything, only sees custom requests.
+    // A custom rule on a standard path answers instead of the protocol handling, when the request meets
+    // its other conditions (the body is parsed into the IR for them); the rest is handled as usual.
     put_rules(
         &s,
         json!([
-            {"match": {"path": "/v1/messages", "body": "."}, "reply": {"body": {"custom": true}}},
-            {"match": {"path": "/v1/responses", "body": "."}, "reply": {"body": {"custom": true}}},
-            {"match": {"path": "/v1/chat/completions", "body": "."}, "reply": {"body": {"custom": true}}},
+            {"name": "m", "match": {"path": "/v1/messages", "last_user": "fixture"}, "reply": {"body": {"custom": "messages"}}},
+            {"name": "r", "match": {"path": "/v1/responses", "last_user": "fixture"}, "reply": {"body": {"custom": "responses"}}},
+            {"name": "c", "match": {"path": "/v1/chat/completions", "last_user": "fixture"}, "reply": {"body": {"custom": "chat"}}},
             custom_rule(),
             {"match": {"last_user": "ping"}, "reply": {"text": "pong"}},
         ]),
@@ -34,6 +35,19 @@ async fn standard_routes_ignore_custom_rules_on_every_protocol() {
         let r = p.send(&s, "ping", &[], &[]).await;
         assert_eq!(p.text(&r), "pong", "{p:?}: {}", r.body);
         assert!(!r.body.contains("\"custom\""), "{p:?}: {}", r.body);
+        let r = p.send(&s, "a fixture please", &[], &[]).await;
+        let want = match p {
+            P::Chat => "chat",
+            P::Responses => "responses",
+            P::Anthropic => "messages",
+        };
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json(), json!({"custom": want}), "{p:?}");
+        // Logged under the route's own protocol, with the parsed request and the rule.
+        let entry = log(&s, &format!("protocol={}", p.log_name())).await.pop().unwrap();
+        assert_eq!(entry["rule"], &want[..1], "{p:?}");
+        assert_eq!(entry["source"]["kind"], "script");
+        assert_eq!(entry["model"], p.model());
     }
     let r = post_json(&s, "/v1/systemone", &json!({"state": "angry"})).await;
     assert_eq!(r.json()["answers"]["damaged"]["noul"], 0.9);

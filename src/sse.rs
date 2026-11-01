@@ -96,20 +96,7 @@ pub fn respond(
     headers: Vec<(String, String)>,
     done_sentinel: Option<&'static str>,
 ) -> Response {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Result<Bytes, BoxError>>();
-    let start = clock.now();
-    tokio::spawn(async move {
-        tokio::select! {
-            () = tx.closed() => {}
-            reset = run(&clock, start, &delivery, &frames, done_sentinel, |bytes| tx.send(Ok(bytes)).is_ok()) => {
-                if reset {
-                    settle().await;
-                    let _ = tx.send(Err("fakellm: connection dropped".into()));
-                }
-            }
-        }
-    });
-    let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|o| o.map(|r| r.map(hyper::body::Frame::data))));
+    let items = frames.iter().map(|f| (f.kind, f.encode())).collect();
     let mut builder = http::Response::builder()
         .status(200)
         .header(http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -118,8 +105,45 @@ pub fn respond(
         builder = builder.header(k, v);
     }
     builder
-        .body(StreamBody::new(stream).boxed())
+        .body(stream_body(clock, delivery, items, done_sentinel))
         .expect("static response parts are valid")
+}
+
+/// A response whose body is `chunks`, written as they are with the pacing of [`respond`]: the first at
+/// `ttft`, each later one `token_interval * chunk_tokens` after the previous, all of them `Content`
+/// frames for `cut_after_chunks` / `reset_after_chunks` / `reset`. `status` and `headers` are the
+/// caller's, there is no `content-length`.
+pub fn respond_chunks(
+    clock: Arc<Clock>,
+    delivery: Delivery,
+    status: http::StatusCode,
+    headers: http::HeaderMap,
+    chunks: Vec<Bytes>,
+) -> Response {
+    let items = chunks.into_iter().map(|c| (FrameKind::Content, c)).collect();
+    let mut response = http::Response::new(stream_body(clock, delivery, items, None));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+/// The body that spawns the task writing `items` on the clock.
+fn stream_body(clock: Arc<Clock>, delivery: Delivery, items: Vec<(FrameKind, Bytes)>, done_sentinel: Option<&'static str>) -> crate::Body {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<Bytes, BoxError>>();
+    let start = clock.now();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = tx.closed() => {}
+            reset = run(&clock, start, &delivery, &items, done_sentinel, |bytes| tx.send(Ok(bytes)).is_ok()) => {
+                if reset {
+                    settle().await;
+                    let _ = tx.send(Err("fakellm: connection dropped".into()));
+                }
+            }
+        }
+    });
+    let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|o| o.map(|r| r.map(hyper::body::Frame::data))));
+    StreamBody::new(stream).boxed()
 }
 
 /// Walks the frames on the clock, handing each to `send`; stops when `send` returns false.
@@ -128,7 +152,7 @@ async fn run(
     clock: &Clock,
     start: SystemTime,
     delivery: &Delivery,
-    frames: &[Frame],
+    frames: &[(FrameKind, Bytes)],
     done_sentinel: Option<&str>,
     mut send: impl FnMut(Bytes) -> bool,
 ) -> bool {
@@ -147,14 +171,14 @@ async fn run(
         (None, None) => None,
     };
     let mut content_sent = 0usize;
-    for frame in frames {
+    for (kind, bytes) in frames {
         if let Some((n, is_reset)) = limit
-            && frame.kind != FrameKind::Head
+            && *kind != FrameKind::Head
             && content_sent >= n
         {
             return is_reset;
         }
-        if frame.kind == FrameKind::Content {
+        if *kind == FrameKind::Content {
             if content_sent > 0 {
                 deadline = deadline
                     .checked_add(delivery.token_interval.saturating_mul(delivery.chunk_tokens.max(1) as u32))
@@ -163,7 +187,7 @@ async fn run(
             }
             content_sent += 1;
         }
-        if !send(frame.encode()) {
+        if !send(bytes.clone()) {
             return false;
         }
     }

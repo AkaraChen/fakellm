@@ -188,6 +188,15 @@ $ curl -X DELETE $E/_fakellm/scripts
 {"cleared":true}
 ```
 
+带 `match.path` 的规则可以用 `reply.raw` 回放录制的响应（状态码、`content-type`、正文、SSE 流），`path` 也可以指向标准路由，命中时优先于正常的协议处理，另有 `match.nth`、`match.method`、`match.header`（语义见 [scripts.md](scripts.md#原样回放raw)）：
+
+```
+$ curl -X PUT $E/_fakellm/scripts -H 'content-type: application/json' -d '[{"name":"teapot","match":{"path":"/v1/chat/completions","nth":2,"header":{"x-scenario":"tea"}},"reply":{"raw":{"status":418,"headers":{"x-fixture":"teapot"},"body":"{\"error\":{\"message\":\"I am a teapot\"}}"}}}]'
+{"added":1,"count":1}
+```
+
+`raw` 规则的校验也是整体的：`raw` 和 `body` / `status` / `headers` / `text` / `tool_calls` / `error` / `trajectory` / `policy` 同时出现、没有 `match.path`、`raw.status` 不在 100 到 599、`nth: 0`、`header` 里的正则或头名不合法，都是 400。
+
 - `index` 是匹配顺序里的位置（从 0 开始）；`hits` 是注册以来回答了几个请求；`reached` 是其他条件都满足、到达过这条规则的请求数（`probability` 和 `every_nth` 就是按它计数，没被它们放行的请求也算）；`exhausted` 表示 `times` 用完了。
 - `PUT ?keep_hits=true` 按**位置**把旧规则的 `hits` 和 `reached` 带到同一位置的新规则上（新规则比旧的多就从 0 开始），适合在测试中途改某条规则的回复又不想丢计数；布尔值的写法同其他查询参数。
 - `PUT` 默认会重置命中计数（因为所有规则都是新的），`POST` 不影响已有规则的计数。
@@ -197,7 +206,7 @@ $ curl -X DELETE $E/_fakellm/scripts
 $ curl -X PUT $E/_fakellm/scripts -d '[{"reply":{}}]'
 {"error":{"code":"BadRequest","message":"rule 0: reply needs `text`, `tool_calls`, `error`, `trajectory` or `policy`"}}
 $ curl -X PUT $E/_fakellm/scripts -d '[{"match":{"bogus":1},"reply":{"text":"x"}}]'
-{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `body`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `last_tool_call_id`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`, `path`"}}
+{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `last_user_raw`, `system`, `any_message`, `body`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `last_tool_call_id`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`, `nth`, `path`, `method`, `header`, `after`, `after_count`"}}
 ```
 
 ### Cassette 与快照
@@ -272,7 +281,7 @@ duration 的单位：`ns` `us` `ms` `s` `m` `h` `d`（24 小时）`w`，可以�
 
 ### 请求日志
 
-每个 API 请求（`/v1/*` 和不带前缀的 `/chat/completions`、`/messages`、`/responses`、`/models`，包括 404 和认证失败的）都会被记录，除非日志被关掉。三种协议在同一个日志里，用 `protocol` 区分。命中[自定义端点规则](scripts.md#自定义端点)的请求也会被记录（`protocol: "custom"`），不论路径在不在 `/v1` 下；没命中的未知路径照旧 404。
+每个 API 请求（`/v1/*` 和不带前缀的 `/chat/completions`、`/messages`、`/responses`、`/models`，包括 404 和认证失败的）都会被记录，除非日志被关掉。三种协议在同一个日志里，用 `protocol` 区分。命中[自定义端点规则](scripts.md#自定义端点)的请求也会被记录，不论路径在不在 `/v1` 下：自定义路径的 `protocol` 是 `"custom"`；标准路由上被 `reply.raw` / `reply.body` 规则接管的请求（[原样回放](scripts.md#原样回放raw)）保持该路由的协议，`source` 是 `script`，`rule` 是命中的规则，`request` 是照常解析出的请求（解析不了则为空请求），`reply.text` 是回放的正文，`raw` 仍是客户端发来的正文；没命中的未知路径照旧 404。
 
 ```
 $ curl "$E/_fakellm/requests?full=true&limit=1"

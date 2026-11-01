@@ -95,11 +95,25 @@ pub struct Match {
     /// held), counting from 1; `every_nth: 3` matches the 3rd, 6th, 9th.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every_nth: Option<u32>,
+    /// Match only the nth request (1-based) that reached this rule (every other condition held), not the
+    /// nth, 2nth, ... like `every_nth`. Requests that fail another condition do not count, so a fixture
+    /// sequence (`nth: 1`, `nth: 2`, ...) is not consumed by traffic the rule was not meant for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nth: Option<u32>,
     /// Glob over the request path (`/v1/systemone`, `/v1/*`), after the gateway prefix is removed.
-    /// A rule with `path` is a custom endpoint rule: it applies to any path under the API, known
-    /// or not, needs `reply.body`, and only ever sees requests the standard routes do not serve.
+    /// A rule with `path` is a custom endpoint rule: it applies to any path under the API, needs
+    /// `reply.body` or `reply.raw`, and is the only kind of rule those paths see. It also applies
+    /// to the standard routes (`/v1/chat/completions`, ...), where a matching rule takes precedence
+    /// over the protocol handling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Glob over the HTTP method, case-insensitive (`GET`, `P*`, `POST`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Regexes over request headers, by (case-insensitive) header name; every header named has to be
+    /// present with a value the regex matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<BTreeMap<String, Pattern>>,
     /// Sequence matcher: only once the rule with this `name` has answered at least `after_count` times
     /// (default 1) in this server. Lets a later rule take over from an earlier one without relying on rule
     /// order and `times`.
@@ -255,6 +269,47 @@ pub struct ReplySpec {
     /// Custom endpoint rules: extra response headers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<BTreeMap<String, String>>,
+    /// Custom endpoint rules: answer with this response verbatim (a recorded body, an SSE stream), see
+    /// [`RawSpec`]. Excludes `body`, `status`, `headers` and every generated-reply field; `stream`,
+    /// `delay_ms` and `reset` pace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawSpec>,
+}
+
+/// A response replayed as it is: no JSON rendering, no protocol framing. The body is sent byte for byte.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSpec {
+    /// HTTP status, 200 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// `content-type` of the response, `application/json` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// The response body, verbatim.
+    pub body: String,
+    /// Extra response headers; they replace `content-type` when they name it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
+    /// `true`: write the body in chunks (an SSE body is split after each blank line, one event per
+    /// chunk; any other body is one chunk) paced by the reply's delivery, with chunked transfer
+    /// encoding. `false`: one buffered response with `content-length`. Unset: a stream when
+    /// `content_type` is `text/event-stream`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+}
+
+impl RawSpec {
+    /// Whether the body is written as a chunked stream.
+    pub fn streams(&self) -> bool {
+        self.stream.unwrap_or_else(|| self.is_event_stream())
+    }
+
+    pub fn is_event_stream(&self) -> bool {
+        self.content_type
+            .as_deref()
+            .is_some_and(|c| c.trim_start().to_ascii_lowercase().starts_with("text/event-stream"))
+    }
 }
 
 impl ReplySpec {
@@ -434,6 +489,8 @@ struct Matchers {
     any_message: Option<Re>,
     body: Option<Re>,
     tool_result_contains: Option<Re>,
+    /// `match.header`: lowercased header name and its regex.
+    headers: Vec<(String, Re)>,
 }
 
 impl Matchers {
@@ -450,6 +507,20 @@ impl Matchers {
             any_message: one("any_message", &m.any_message)?,
             body: one("body", &m.body)?,
             tool_result_contains: one("tool_result_contains", &m.tool_result_contains)?,
+            headers: m
+                .header
+                .iter()
+                .flatten()
+                .map(|(name, p)| {
+                    if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                        return Err(format!("match.header: invalid header name {name:?}"));
+                    }
+                    let re = p
+                        .compile()
+                        .map_err(|e| format!("match.header.{name}: invalid regex {:?}: {e}", p.0))?;
+                    Ok((name.to_ascii_lowercase(), re))
+                })
+                .collect::<Result<_, String>>()?,
         })
     }
 }
@@ -472,13 +543,25 @@ fn validate(rule: &Rule) -> Result<(), String> {
     if rule.matcher.every_nth == Some(0) {
         return Err("match.every_nth must be at least 1".into());
     }
+    if rule.matcher.nth == Some(0) {
+        return Err("match.nth must be at least 1".into());
+    }
+    if rule.matcher.method.as_deref().is_some_and(str::is_empty) {
+        return Err("match.method must not be empty".into());
+    }
     let custom = rule.matcher.path.is_some();
     let r = &rule.reply;
-    if custom != r.body.is_some() {
-        return Err("`match.path` and `reply.body` go together".into());
+    if r.body.is_some() && r.raw.is_some() {
+        return Err("`reply.body` and `reply.raw` exclude each other".into());
+    }
+    if custom != (r.body.is_some() || r.raw.is_some()) {
+        return Err("`match.path` and `reply.body` / `reply.raw` go together".into());
     }
     if !custom && (r.status.is_some() || r.headers.is_some()) {
         return Err("`reply.status` and `reply.headers` need `match.path`".into());
+    }
+    if let Some(raw) = &r.raw {
+        return validate_raw(r, raw);
     }
     if custom {
         if r.text.is_some()
@@ -495,14 +578,53 @@ fn validate(rule: &Rule) -> Result<(), String> {
         {
             return Err(format!("reply.status {s} is not an HTTP status"));
         }
-        for (k, v) in r.headers.iter().flatten() {
-            if http::HeaderName::from_bytes(k.as_bytes()).is_err() || http::HeaderValue::from_str(v).is_err() {
-                return Err(format!("reply.headers: invalid header {k:?}"));
-            }
-        }
-        return Ok(());
+        return validate_headers("reply.headers", r.headers.as_ref());
     }
     validate_reply(&rule.reply)
+}
+
+fn validate_headers(field: &str, headers: Option<&BTreeMap<String, String>>) -> Result<(), String> {
+    for (k, v) in headers.into_iter().flatten() {
+        if http::HeaderName::from_bytes(k.as_bytes()).is_err() || http::HeaderValue::from_str(v).is_err() {
+            return Err(format!("{field}: invalid header {k:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// A raw reply carries its response in `raw`; of the generated-reply fields only the delivery ones
+/// (`stream`, `delay_ms`, `reset`) mean anything to it.
+fn validate_raw(r: &ReplySpec, raw: &RawSpec) -> Result<(), String> {
+    if r.text.is_some()
+        || r.tool_calls.is_some()
+        || r.error.is_some()
+        || r.body.is_some()
+        || r.trajectory.is_some()
+        || r.policy.is_some()
+        || r.reasoning.is_some()
+        || r.reasoning_opaque.is_some()
+        || r.finish_reason.is_some()
+        || r.usage.is_some()
+        || r.hang.is_some()
+        || r.hang_ms.is_some()
+    {
+        return Err("reply `raw` excludes `text`, `tool_calls`, `reasoning`, `finish_reason`, `usage`, `error`, `body`, `trajectory`, `policy` and `hang`".into());
+    }
+    if r.status.is_some() || r.headers.is_some() {
+        return Err("a raw reply sets its status and headers in `raw.status` and `raw.headers`".into());
+    }
+    if let Some(s) = raw.status
+        && !(100..=599).contains(&s)
+    {
+        return Err(format!("reply.raw.status {s} is not an HTTP status"));
+    }
+    if let Some(c) = &raw.content_type
+        && http::HeaderValue::from_str(c).is_err()
+    {
+        return Err(format!("reply.raw.content_type: invalid value {c:?}"));
+    }
+    validate_headers("reply.raw.headers", raw.headers.as_ref())?;
+    validate_pacing(r)
 }
 
 /// The checks every reply spec must pass, whether it sits in a rule, a trajectory step or came
@@ -532,14 +654,7 @@ pub(crate) fn validate_reply(r: &ReplySpec) -> Result<(), String> {
         (Some(_), true) => return Err("reply `error` excludes `text` and `tool_calls`".into()),
         _ => {}
     }
-    if let Some(tps) = r.stream.as_ref().and_then(|s| s.tokens_per_sec)
-        && !(tps > 0.0 && tps.is_finite() && Duration::try_from_secs_f64(1.0 / tps).is_ok())
-    {
-        return Err("reply.stream.tokens_per_sec must be greater than 0 and not vanishingly small".into());
-    }
-    if r.stream.as_ref().and_then(|s| s.args_chunk_bytes) == Some(0) {
-        return Err("reply.stream.args_chunk_bytes must be at least 1".into());
-    }
+    validate_pacing(r)?;
     if let Some(e) = &r.error
         && !(100..=599).contains(&e.status)
     {
@@ -549,6 +664,18 @@ pub(crate) fn validate_reply(r: &ReplySpec) -> Result<(), String> {
         && Duration::try_from_secs_f64(ra).is_err()
     {
         return Err("reply.error.retry_after must be a non-negative number".into());
+    }
+    Ok(())
+}
+
+fn validate_pacing(r: &ReplySpec) -> Result<(), String> {
+    if let Some(tps) = r.stream.as_ref().and_then(|s| s.tokens_per_sec)
+        && !(tps > 0.0 && tps.is_finite() && Duration::try_from_secs_f64(1.0 / tps).is_ok())
+    {
+        return Err("reply.stream.tokens_per_sec must be greater than 0 and not vanishingly small".into());
+    }
+    if r.stream.as_ref().and_then(|s| s.args_chunk_bytes) == Some(0) {
+        return Err("reply.stream.args_chunk_bytes must be at least 1".into());
     }
     Ok(())
 }
@@ -606,6 +733,11 @@ impl Compiled {
         }
         self.reached += 1;
         let m = &self.rule.matcher;
+        if let Some(n) = m.nth
+            && self.reached != u64::from(n)
+        {
+            return false;
+        }
         if let Some(n) = m.every_nth
             && !self.reached.is_multiple_of(u64::from(n))
         {
@@ -625,6 +757,19 @@ impl Compiled {
             (Some(g), Some(p)) if glob_match(g, p) => {}
             (None, None) => {}
             _ => return false,
+        }
+        if let Some(g) = &m.method
+            && !req
+                .method
+                .as_deref()
+                .is_some_and(|v| glob_match(&g.to_ascii_uppercase(), &v.to_ascii_uppercase()))
+        {
+            return false;
+        }
+        for (name, re) in &self.re.headers {
+            if !req.headers.iter().any(|(k, v)| k == name && re.is_match(v)) {
+                return false;
+            }
         }
         if let Some(p) = m.protocol
             && p != req.protocol
@@ -879,6 +1024,11 @@ impl Scripts {
         self.resolve_from(req, 0)
     }
 
+    /// Whether any registered rule has `match.path`.
+    pub fn has_path_rules(&self) -> bool {
+        self.inner.lock().iter().any(|c| c.rule.matcher.path.is_some())
+    }
+
     /// [`Scripts::resolve`] looking only at rules from index `start` on (a policy declined the
     /// rules before).
     pub fn resolve_from(&self, req: &Request, start: usize) -> Option<(usize, Option<String>, ReplySpec)> {
@@ -1046,10 +1196,18 @@ impl Engine {
         }
     }
 
-    /// For a request on a path the standard routes do not serve: the first rule with `match.path`
-    /// and `reply.body` that matches, counting its hit.
-    pub fn resolve_custom(&self, req: &Request) -> Option<(usize, Option<String>, ReplySpec)> {
-        self.scripts.resolve_where(req, |r| r.body.is_some())
+    /// For a request on any path: the first rule with `match.path` and `reply.body` or `reply.raw` that
+    /// matches, counting its hit, with the delivery its `stream` / `delay_ms` / `reset` ask for.
+    pub fn resolve_custom(&self, req: &Request) -> Option<(usize, Option<String>, ReplySpec, Delivery)> {
+        let (index, name, spec) = self.scripts.resolve_where(req, |r| r.body.is_some() || r.raw.is_some())?;
+        let delivery = self.delivery_of(&spec);
+        Some((index, name, spec, delivery))
+    }
+
+    /// Whether any rule is a custom endpoint rule (`match.path`), so requests on the standard routes are
+    /// worth a look at their body before the protocol handling.
+    pub fn has_custom_rules(&self) -> bool {
+        self.scripts.has_path_rules()
     }
 
     /// For endpoints that generate nothing scriptable (`POST /v1/embeddings`): the first rule that
@@ -1066,6 +1224,35 @@ impl Engine {
             delivery: self.default_delivery.clone(),
             source,
         }
+    }
+
+    /// The delivery a spec asks for on top of the server defaults: `stream`, `delay_ms` and `reset`.
+    fn delivery_of(&self, spec: &ReplySpec) -> Delivery {
+        let mut delivery = self.default_delivery.clone();
+        if let Some(s) = &spec.stream {
+            if let Some(ms) = s.ttft_ms.or(spec.delay_ms) {
+                delivery.ttft = Duration::from_millis(ms);
+            }
+            if s.tokens_per_sec.is_some() {
+                delivery.token_interval = interval_from_tps(s.tokens_per_sec);
+            }
+            if let Some(n) = s.chunk_tokens {
+                delivery.chunk_tokens = n.max(1);
+            }
+            if s.cut_after_chunks.is_some() {
+                delivery.cut_after_chunks = s.cut_after_chunks;
+            }
+            if s.reset_after_chunks.is_some() {
+                delivery.reset_after_chunks = s.reset_after_chunks;
+            }
+            if let Some(n) = s.args_chunk_bytes {
+                delivery.args_chunk_bytes = n.max(1);
+            }
+        } else if let Some(ms) = spec.delay_ms {
+            delivery.ttft = Duration::from_millis(ms);
+        }
+        delivery.reset = spec.reset.unwrap_or(false);
+        delivery
     }
 
     /// Everything after a rule (and its policy, if any) produced `spec`: trajectory delegation,
@@ -1104,36 +1291,13 @@ impl Engine {
                 }
             }
         }
-        let mut delivery = self.default_delivery.clone();
-        if let Some(s) = &spec.stream {
-            if let Some(ms) = s.ttft_ms.or(spec.delay_ms) {
-                delivery.ttft = Duration::from_millis(ms);
-            }
-            if s.tokens_per_sec.is_some() {
-                delivery.token_interval = interval_from_tps(s.tokens_per_sec);
-            }
-            if let Some(n) = s.chunk_tokens {
-                delivery.chunk_tokens = n.max(1);
-            }
-            if s.cut_after_chunks.is_some() {
-                delivery.cut_after_chunks = s.cut_after_chunks;
-            }
-            if s.reset_after_chunks.is_some() {
-                delivery.reset_after_chunks = s.reset_after_chunks;
-            }
-            if let Some(n) = s.args_chunk_bytes {
-                delivery.args_chunk_bytes = n.max(1);
-            }
-        } else if let Some(ms) = spec.delay_ms {
-            delivery.ttft = Duration::from_millis(ms);
-        }
+        let delivery = self.delivery_of(&spec);
 
         let hang = match (spec.hang, spec.hang_ms) {
             (_, Some(ms)) => Some(Some(Duration::from_millis(ms))),
             (Some(true), None) => Some(None),
             _ => None,
         };
-        delivery.reset = spec.reset.unwrap_or(false);
         let outcome = Self::answer(req, spec, delivery, source);
         match hang {
             Some(until) => Outcome::Hang {

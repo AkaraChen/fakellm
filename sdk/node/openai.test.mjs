@@ -1,7 +1,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import OpenAI from 'openai';
-import { startServer } from './helpers.mjs';
+import { startServer, recordedChatEvents } from './helpers.mjs';
 
 let srv;
 let client;
@@ -188,4 +188,51 @@ test('reset_after_chunks: the SDK throws a connection error mid-stream', async (
   assert.ok(chunks.every((c) => !c.choices[0]?.finish_reason));
   const log = await srv.ctl.get('/requests');
   assert.equal(log.requests.length, 1);
+});
+
+test('raw rule: a recorded SSE stream is replayed verbatim', async () => {
+  const events = recordedChatEvents();
+  const payloads = events.map((e) => e.slice('data: '.length));
+  const text = payloads
+    .filter((p) => p !== '[DONE]')
+    .map((p) => JSON.parse(p).choices?.[0]?.delta?.content ?? '')
+    .join('');
+  assert.ok(text.length > 0);
+  await srv.ctl.put('/scripts', [
+    {
+      name: 'recorded',
+      match: { path: '/v1/chat/completions' },
+      reply: { raw: { content_type: 'text/event-stream', body: events.map((e) => `${e}\n\n`).join('') } },
+    },
+  ]);
+  const stream = await client.chat.completions.create({ model: 'gpt-4o', messages: user('anything'), stream: true });
+  const chunks = [];
+  for await (const c of stream) chunks.push(c);
+  assert.equal(chunks.map((c) => c.choices[0]?.delta?.content ?? '').join(''), text);
+  // Recorded, not generated.
+  assert.equal(chunks[0].id, 'chatcmpl-D8Z5oo6uDh67AD85p73ksdT1KxhE0');
+  assert.equal(chunks[0].model, 'gpt-4.1-nano-2025-04-14');
+  assert.ok(chunks.some((c) => c.choices[0]?.finish_reason === 'stop'));
+  const log = await srv.ctl.get('/requests?full=true');
+  assert.equal(log.requests[0].rule, 'recorded');
+  assert.equal(log.requests[0].source.kind, 'script');
+});
+
+test('raw rule: a recorded error body with its status', async () => {
+  await srv.ctl.put('/scripts', [
+    {
+      match: { path: '/v1/chat/completions' },
+      reply: {
+        raw: {
+          status: 418,
+          body: '{"error":{"message":"I am a teapot","type":"teapot","code":"brew"}}',
+          headers: { 'x-fixture': 'teapot' },
+        },
+      },
+    },
+  ]);
+  await assert.rejects(
+    client.chat.completions.create({ model: 'gpt-4o', messages: user('tea?') }),
+    (e) => e.status === 418 && e.message.includes('I am a teapot') && e.headers.get('x-fixture') === 'teapot',
+  );
 });

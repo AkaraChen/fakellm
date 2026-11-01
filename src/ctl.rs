@@ -760,7 +760,10 @@ const MATCH_FIELDS: &[&str] = &[
     "protocol",
     "probability",
     "every_nth",
+    "nth",
     "path",
+    "method",
+    "header",
 ];
 
 /// `#<index> <name or -> hits/<times or inf> [exhausted] <matcher> -> <reply>`, from one
@@ -803,6 +806,12 @@ fn reply_kind(reply: &Value) -> String {
     }
     if !reply["body"].is_null() {
         return "body".into();
+    }
+    if let Some(status) = reply["raw"]
+        .as_object()
+        .map(|r| r.get("status").and_then(Value::as_u64).unwrap_or(200))
+    {
+        return format!("raw {status}");
     }
     "text".into()
 }
@@ -999,6 +1008,9 @@ mod tests {
         assert_eq!(rule_line(&r), "#4 - 0/5 protocol=anthropic.messages every_nth=3 -> hang");
         let r = json!({"index": 5, "hits": 0, "match": {}, "reply": {"tool_calls": [{"name": "a"}]}});
         assert_eq!(rule_line(&r), "#5 - 0/inf any -> tool_calls");
+        let r = json!({"index": 6, "hits": 0, "match": {"path": "/v1/chat/completions", "method": "POST", "nth": 2},
+            "reply": {"raw": {"status": 418, "body": "x"}}});
+        assert_eq!(rule_line(&r), "#6 - 0/inf nth=2 path=/v1/chat/completions method=POST -> raw 418");
     }
 
     #[test]

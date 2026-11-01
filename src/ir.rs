@@ -268,9 +268,16 @@ pub struct Request {
     /// (hand-built requests) `Match.body` sees the IR serialized instead.
     #[serde(skip)]
     pub raw_body: Option<std::sync::Arc<str>>,
-    /// The API path of a custom endpoint request (`Protocol::Custom`), for `Match.path`; `None` on the standard routes.
+    /// The API path of a request a custom endpoint rule is tried on, for `Match.path`; `None` on requests the standard
+    /// pipeline resolves (rules with `match.path` never see those).
     #[serde(skip)]
     pub path: Option<String>,
+    /// The HTTP method (`POST`), for `Match.method`; `None` on requests built by hand.
+    #[serde(skip)]
+    pub method: Option<String>,
+    /// The request headers, names lowercased, for `Match.header`.
+    #[serde(skip)]
+    pub headers: Vec<(String, String)>,
 }
 
 fn one() -> u32 {
@@ -324,6 +331,8 @@ impl Request {
             extra: Map::new(),
             raw_body: None,
             path: None,
+            method: None,
+            headers: Vec::new(),
         }
     }
 

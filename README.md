@@ -155,6 +155,8 @@ fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json     # file
 | `stream` / `turn` | 只匹配流式 / 非流式；已经有几条 assistant 消息 |
 | `protocol` | 只匹配某个协议：`openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages` |
 | `path` / `body` | 自定义端点：请求路径的 glob / 原始请求正文的正则，见[自定义端点](#自定义端点) |
+| `method` / `header` | HTTP 方法的 glob（不区分大小写）/ 请求头名到正则的映射，写了的头都要匹配 |
+| `nth` | 只命中其他条件都满足的请求里的第 N 个（从 1 数），不像 `every_nth` 周期性命中 |
 | `probability` | 0 到 1，其他条件都满足后按这个概率命中（确定性的，同样的请求序列每次得到同样的结果） |
 | `every_nth` | 其他条件都满足的请求里，每第 N 个命中（`3` 命中第 3、6、9 个） |
 
@@ -166,6 +168,7 @@ fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json     # file
 |---|---|
 | `text` / `tool_calls` | 回复文本 / 工具调用（`arguments` 可以故意写成不完整的 JSON） |
 | `body` / `status` / `headers` | 自定义端点的回复：原样返回的 JSON / 状态码（默认 200）/ 响应头，必须和 `match.path` 一起写 |
+| `raw` | 原样回放录制的响应：`{status, content_type, body, headers, stream}`，SSE 正文每个事件一帧，可接管标准路由，见[自定义端点](#自定义端点) |
 | `usage` | 覆盖 tokenizer 的 token 计数：`prompt_tokens` / `input_tokens`、`completion_tokens` / `output_tokens`、`cached_tokens`、`reasoning_tokens`、`cache_creation_tokens`，只覆盖写了的字段；`count_tokens` 也会用它（见 [docs/scripts.md](docs/scripts.md#usage)） |
 | `reasoning` / `reasoning_opaque` | 推理文本，和随它发的 `signature`（Anthropic）/ `encrypted_content`（Responses） |
 | `error` | 错误：`status` 必填，`type` / `code` / `message` / `param` / `retry_after` 可覆盖；`in_stream: true` 把错误放进事件流；`headers` 加额外响应头（`retry-after-ms`、`x-should-retry`） |
@@ -423,7 +426,25 @@ Anthropic 路由上，上面的错误都用 Anthropic 的错误体，`code` 和 
   reply: { status: 202, headers: { x-fake: "1" }, body: { answers: { damaged: { type: noul, noul: 0.9 } } } }
 ```
 
-没有规则命中的未知路径仍是 404；请求日志里 `protocol` 为 `custom`（`ctl requests list --protocol custom`）；这类请求不经过 cassette、上游和回退，不支持流式和 `delay_ms`。完整规则见 [docs/scripts.md](docs/scripts.md#自定义端点)。
+没有规则命中的未知路径仍是 404；请求日志里 `protocol` 为 `custom`（`ctl requests list --protocol custom`）；这类请求不经过 cassette、上游和回退，`reply.body` 不支持流式和 `delay_ms`。完整规则见 [docs/scripts.md](docs/scripts.md#自定义端点)。
+
+### 原样回放录制的响应
+
+`reply.raw` 像 msw / wiremock 的 fixture 一样把录制好的响应逐字节回放：状态码、`content-type`、正文都由规则给出，`text/event-stream` 的正文在每个空行后切开，一个事件一帧，按普通的 `stream.ttft_ms` / `tokens_per_sec` 在服务端时钟上发出，客户端看到的是真的 SSE 流。`match.path` 可以指向标准路由（`/v1/chat/completions`、`/v1/responses`、`/v1/messages` ……），命中时**优先于**正常的协议处理（包括 `--api-key` 校验），请求仍会解析成 IR，所以 `last_user`、`model`、`stream` 等条件照常可用，请求日志里保留该路由的协议并记下命中的规则。`match.nth` 只命中第 N 个到达的请求，`match.method` 和 `match.header` 按方法和请求头匹配。
+
+```yaml
+- match: { path: /v1/chat/completions, stream: true, header: { x-scenario: "^recorded$" } }
+  reply:
+    raw:
+      content_type: text/event-stream
+      body: |+
+        data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+        data: [DONE]
+
+```
+
+细节、字段表和 `nth` 的计数规则见 [docs/scripts.md](docs/scripts.md#原样回放raw)。
 
 ## Fake agent
 
@@ -822,11 +843,11 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 | 套件 | 命令 | 当前结果 |
 |---|---|---|
 | 格式与 lint | `cargo fmt --check`；`cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单元和集成测试 | `cargo test` | 605 个通过（`cargo test --workspace`）：库 252、二进制 12、`tests/*.rs` 28 个文件共 317（含 `faults.rs`、`agent_protocols.rs`、`custom_protocols.rs`、`python_sdk.rs`）、文档测试 2、`tjs-sys` 22；`--no-default-features` 下 573 个通过 |
-| 官方 SDK 套件（`sdk/node`） | 先 `cd sdk/node && npm ci`；`cargo test` 里的 `tests/node_sdk.rs` 会自动跑它，也可以 `npm test` 或 `bun test` | 106 个通过（node 和 bun 都是），11 个测试文件，覆盖 `openai`、`@anthropic-ai/sdk`、`@ai-sdk/openai`、`@ai-sdk/anthropic` 以及 agent、cassette、结构化输出、故障注入 |
+| Rust 单元和集成测试 | `cargo test` | 620 个通过（`cargo test --workspace`）：库 254、二进制 12、`tests/*.rs` 28 个文件共 330（含 `faults.rs`、`agent_protocols.rs`、`custom.rs`、`custom_protocols.rs`、`python_sdk.rs`）、文档测试 2、`tjs-sys` 22；`--no-default-features` 下 610 个通过 |
+| 官方 SDK 套件（`sdk/node`） | 先 `cd sdk/node && npm ci`；`cargo test` 里的 `tests/node_sdk.rs` 会自动跑它，也可以 `npm test` 或 `bun test` | 110 个通过（node 和 bun 都是），11 个测试文件，覆盖 `openai`、`@anthropic-ai/sdk`、`@ai-sdk/openai`、`@ai-sdk/anthropic` 以及 agent、cassette、结构化输出、故障注入、`reply.raw` 回放 |
 | Python 官方客户端（`sdk/python`） | `cd sdk/python && uv run --frozen pytest`；`tests/python_sdk.rs` 会在 `cargo test` 里自动跑它（没有 `uv` 时 skip） | 17 个通过：`openai` / `anthropic` 官方包加 `fakellm_sdk` helper |
-| JS / TS 客户端（`sdk/js`） | `cd sdk/js && npm ci && npm test`；`bun test` | 32 个通过（node 和 bun 都是） |
-| Node 原生绑定（`bindings/node`） | `cd bindings/node && npm ci && npm run build:debug && npm test`；Bun：`bun test __test__/openai.test.mjs` | node 40 个通过；Bun 39 个通过、1 个跳过（那一条需要 `node --expose-gc`）；Bun 跑 `__test__/` 下全部文件 |
+| JS / TS 客户端（`sdk/js`） | `cd sdk/js && npm ci && npm test`；`bun test` | 33 个通过（node 和 bun 都是） |
+| Node 原生绑定（`bindings/node`） | `cd bindings/node && npm ci && npm run build:debug && npm test`；Bun：`bun test __test__/openai.test.mjs` | node 41 个通过；Bun 40 个通过、1 个跳过（那一条需要 `node --expose-gc`）；Bun 跑 `__test__/` 下全部文件 |
 | Go helper（`go/`） | `cd go && go vet ./... && go test -count=1 ./...` | 17 个通过 |
 | 发布前检查 | `npm pack --dry-run`（`sdk/js`、`bindings/node`）；`cargo publish --dry-run` 目前**不通过**：默认依赖的 `tjs-sys` 没有版本号、`publish = false`（见 [docs/release.md](docs/release.md)） | `npm pack` 通过；`cargo publish` 待作者决定 |
 
@@ -848,7 +869,7 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 
 这十一个脚本在 2026-11-01 的最后一轮集成中全部以退出码 0 通过（含 `pi`，没有 skip；`docker.sh` 那一轮策略还跑在 node 上；内置 `tjs` 之后重新跑过 `opencode-policy.sh` 和 `docker.sh`）。pi 的版本是 pi-mono 1.4.0。版本：codex 0.162.1、Claude Code 2.1.314、opencode 1.18.29。内置的 txiki.js 由 `tests/policy*.rs` 覆盖；没有覆盖的只有真实付费上游，见 [TODO.md](TODO.md)。
 
-消费方实验（八个真实仓库的测试对着 fakellm 跑）的结果和复现方法见 [docs/consumers.md](docs/consumers.md)。
+消费方实验（九个真实仓库的测试对着 fakellm 跑，含替换原有的 wiremock / msw 夹具）的结果和复现方法见 [docs/consumers.md](docs/consumers.md)。
 
 ## 路线图
 

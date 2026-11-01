@@ -340,6 +340,27 @@ test('start: cassettes, upstream and record', async () => {
   }
 });
 
+test('raw rule: typed fields replay an SSE body on a standard route', async () => {
+  const body = 'data: {"n":1}\n\ndata: [DONE]\n\n';
+  /** @type {import('../dist/index.js').Rule} */
+  const rule = {
+    match: { path: '/v1/chat/completions', method: 'POST', header: { 'x-replay': '^yes$' }, nth: 1 },
+    reply: { raw: { status: 203, content_type: 'text/event-stream', body, headers: { 'x-c': 'y' }, stream: true } },
+  };
+  await srv.scripts.put([rule]);
+  const post = (replay) =>
+    fetch(`${srv.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-replay': replay },
+      body: JSON.stringify({ model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+  const r = await post('yes');
+  assert.equal(r.status, 203);
+  assert.equal(r.headers.get('x-c'), 'y');
+  assert.equal(await r.text(), body);
+  assert.notEqual(await (await post('yes')).text(), body);
+});
+
 test('custom endpoint rule: match.path/body and reply body/status/headers', async () => {
   /** @type {import('../dist/index.js').Rule} */
   const rule = { match: { path: '/v1/systemone', body: 'angry' }, reply: { body: { mood: 'x' }, status: 202, headers: { 'x-c': 'y' } } };

@@ -448,6 +448,38 @@ func TestCustomEndpointRule(t *testing.T) {
 	}
 }
 
+func TestRawRuleReplaysAnSSEStream(t *testing.T) {
+	s, ctx := start(t, fakellm.Options{})
+	body := "data: {\"n\":1}\n\ndata: [DONE]\n\n"
+	_, err := s.Scripts().Put(ctx, []fakellm.Rule{{
+		Match: fakellm.Match{Path: "/v1/chat/completions", Method: "post", Header: map[string]string{"x-replay": "^yes$"}, Nth: fakellm.Ptr(uint32(1))},
+		Reply: fakellm.ReplySpec{Raw: &fakellm.RawReply{Status: 203, ContentType: "text/event-stream", Body: body, Headers: map[string]string{"x-c": "y"}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(replay string) (*http.Response, string) {
+		req, _ := http.NewRequest("POST", s.URL()+"/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("x-replay", replay)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		b, _ := io.ReadAll(res.Body)
+		return res, string(b)
+	}
+	res, got := post("yes")
+	if res.StatusCode != 203 || res.Header.Get("x-c") != "y" || res.Header.Get("content-type") != "text/event-stream" || got != body {
+		t.Fatalf("got %d %v %q", res.StatusCode, res.Header, got)
+	}
+	// nth: 1 is spent and the header gate holds: generated replies from here on.
+	if res, got = post("yes"); res.StatusCode != 200 || got == body {
+		t.Fatalf("second request: %d %q", res.StatusCode, got)
+	}
+}
+
 func TestRuntimeOptionsAndLastUserRaw(t *testing.T) {
 	// MaxSnapshots reaches the binary: the second snapshot is refused.
 	s, ctx := start(t, fakellm.Options{MaxSnapshots: 1, PolicyTimeoutMs: 1000, UpstreamTimeoutSecs: 0})
