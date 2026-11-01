@@ -139,6 +139,9 @@ impl Drop for PolicyDir {
 /// Longest stdout line read from a policy; a longer one is treated as a broken policy.
 pub const MAX_LINE: u64 = 16 * 1024 * 1024;
 
+/// Longest policy log line kept (bytes); longer lines are truncated.
+const MAX_LOG_LINE: usize = 8 * 1024;
+
 /// `read_line` capped at [`MAX_LINE`]: `Ok(0)` is EOF, an unterminated line at the cap is an error.
 pub async fn read_line_bounded(stdout: &mut BufReader<ChildStdout>, buf: &mut String) -> std::io::Result<usize> {
     let n = stdout.take(MAX_LINE).read_line(buf).await?;
@@ -231,7 +234,17 @@ pub async fn spawn(
     let stderr = child.stderr.take().expect("stderr is piped");
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        while let Ok(Some(mut line)) = lines.next_line().await {
+            // Same cap as the in-process runtime: a policy that logs megabytes per line must not
+            // make the host allocate them.
+            if line.len() > MAX_LOG_LINE {
+                let mut cut = MAX_LOG_LINE;
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                line.truncate(cut);
+                line.push_str(" ...[truncated]");
+            }
             on_log(line);
         }
     });
