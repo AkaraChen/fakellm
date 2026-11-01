@@ -5,7 +5,7 @@ edition = "2024"
 description = "Embeds the txiki.js JavaScript runtime (QuickJS + libuv) as a static library, for fakellm policy scripts"
 license = "MIT"
 repository = "https://github.com/AkaraChen/fakellm"
-rust-version = "1.88"
+rust-version = "1.95"
 links = "tjs"
 build = "build.rs"
 # The txiki.js sources (a git submodule at ../third_party/txiki.js, about 145 MB with the four nested submodules it needs)

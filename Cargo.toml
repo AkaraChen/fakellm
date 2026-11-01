@@ -10,7 +10,7 @@ documentation = "https://docs.rs/fakellm"
 readme = "README.md"
 keywords = ["llm", "openai", "testing", "mock", "anthropic"]
 categories = ["development-tools::testing", "web-programming::http-server"]
-rust-version = "1.88"
+rust-version = "1.95"
 exclude = [
     "/sdk",
     "/bindings",
