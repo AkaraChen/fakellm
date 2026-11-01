@@ -184,3 +184,118 @@ fn policy_and_trajectory_files_load_at_start() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn ctl_stdin(endpoint: &str, args: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fakellm"))
+        .args(["ctl", "--endpoint", endpoint])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn ctl_trajectories_policies_and_stdin() {
+    let (_child, endpoint) = spawn_with(&["--policy-runtime", "node"]);
+    let ok = |out: std::process::Output| {
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // Scripts from stdin, JSON and YAML.
+    let out = ok(ctl_stdin(
+        &endpoint,
+        &["scripts", "put", "-"],
+        r#"[{"reply": {"text": "from stdin"}}]"#,
+    ));
+    assert!(out.contains("1 rules loaded"), "{out}");
+    let out = ok(ctl_stdin(&endpoint, &["scripts", "add", "-"], "- reply:\n    text: yaml too\n"));
+    assert!(out.contains("(2 total)"), "{out}");
+    // Trajectories: put/add from stdin, list, get, delete, clear.
+    let out = ok(ctl_stdin(
+        &endpoint,
+        &["trajectories", "put", "-"],
+        r#"{"name": "walk", "steps": [{"reply": {"text": "hi"}}]}"#,
+    ));
+    assert!(out.contains("1 trajectories loaded"), "{out}");
+    ok(ctl_stdin(
+        &endpoint,
+        &["trajectories", "add", "-"],
+        "{\"kind\":\"trajectory\",\"name\":\"two\"}\n{\"reply\":{\"text\":\"yo\"}}\n",
+    ));
+    let out = ok(ctl_stdin(&endpoint, &["trajectories", "list"], ""));
+    assert!(out.contains("walk") && out.contains("two"), "{out}");
+    let out = ok(ctl_stdin(&endpoint, &["trajectories", "get", "walk"], ""));
+    assert!(out.contains("\"name\": \"walk\""), "{out}");
+    let out = ok(ctl_stdin(&endpoint, &["trajectories", "get", "walk", "--jsonl"], ""));
+    assert!(out.lines().count() >= 2, "{out}");
+    ok(ctl_stdin(&endpoint, &["trajectories", "delete", "two"], ""));
+    let out = ctl_stdin(&endpoint, &["trajectories", "delete", "two"], "");
+    assert!(!out.status.success());
+    ok(ctl_stdin(&endpoint, &["trajectories", "clear"], ""));
+    assert!(ok(ctl_stdin(&endpoint, &["trajectories", "list"], "")).contains("no trajectories"));
+
+    // Policies need a JS runtime; the rest of the test needs node.
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skip policies: node not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("fakellm-bin-ctl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let js = dir.join("greeter.mjs");
+    std::fs::write(&js, "export default () => ({ text: 'hello from ctl policy' });").unwrap();
+    let out = ok(ctl_stdin(&endpoint, &["policies", "put", js.to_str().unwrap()], ""));
+    assert!(out.contains("1 policies loaded"), "{out}");
+    ok(ctl_stdin(
+        &endpoint,
+        &["policies", "add", "-", "--name", "second"],
+        "export default () => null;",
+    ));
+    let out = ok(ctl_stdin(&endpoint, &["policies", "list"], ""));
+    assert!(out.contains("greeter") && out.contains("second"), "{out}");
+    ok(ctl_stdin(
+        &endpoint,
+        &["scripts", "put", "-"],
+        r#"[{"reply": {"policy": "greeter"}}]"#,
+    ));
+    let r = http_post(
+        &endpoint,
+        "/v1/chat/completions",
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"x"}]}"#,
+    );
+    assert!(r.contains("hello from ctl policy"), "{r}");
+    let out = ok(ctl_stdin(&endpoint, &["policies", "get", "greeter"], ""));
+    assert!(out.contains("\"hits\""), "{out}");
+    let bad = ctl_stdin(&endpoint, &["policies", "add", "-", "--name", "broken"], "export default (");
+    assert!(!bad.status.success());
+    ok(ctl_stdin(&endpoint, &["policies", "delete", "second"], ""));
+    ok(ctl_stdin(&endpoint, &["policies", "clear"], ""));
+    assert!(ok(ctl_stdin(&endpoint, &["policies", "list"], "")).contains("no policies"));
+    let help = ok(run(&["ctl", "--help"]));
+    for word in ["trajectories", "policies", "cassettes", "snapshot"] {
+        assert!(help.contains(word), "{word}: {help}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn policy_without_runtime_fails_clearly() {
+    let dir = std::env::temp_dir().join(format!("fakellm-bin-nort-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let js = dir.join("p.mjs");
+    std::fs::write(&js, "export default () => null;").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fakellm"))
+        .args(["--port", "0", "--policy", js.to_str().unwrap()])
+        .env("PATH", "/nonexistent")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    println!("{err}");
+    assert!(err.contains("JavaScript runtime"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

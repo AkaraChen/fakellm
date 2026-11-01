@@ -107,8 +107,9 @@ pub fn wire(target: &str, endpoint: &str) -> Result<WireOutput, String> {
             WireOutput {
                 env: env(&[("OPENCODE_CONFIG_CONTENT", &config.to_string())]),
                 files: vec![("opencode.json".into(), pretty(&config))],
-                snippet: "# Save opencode.json in the project root or ~/.config/opencode/, or use the \
-                          OPENCODE_CONFIG_CONTENT variable above (the same JSON, compact).\n"
+                snippet: "# OPENCODE_CONFIG_CONTENT above is the whole config. For a file instead, save the output of \
+                          `fakellm wire opencode --file opencode.json` as opencode.json in the project root or \
+                          ~/.config/opencode/.\n"
                     .to_owned(),
             }
         }
@@ -234,6 +235,11 @@ pub fn format(out: &WireOutput, format: Format) -> Result<String, String> {
         Format::Shell => {
             let mut s: String = out.env.iter().map(|(k, v)| format!("export {k}={}\n", shell_quote(v))).collect();
             for (name, text) in &out.files {
+                // A file whose JSON is already in an exported variable (opencode.json / OPENCODE_CONFIG_CONTENT) is not printed twice.
+                let doc = serde_json::from_str::<Value>(text).ok();
+                if doc.is_some() && out.env.iter().any(|(_, v)| serde_json::from_str::<Value>(v).ok() == doc) {
+                    continue;
+                }
                 if !s.is_empty() {
                     s.push('\n');
                 }
@@ -317,6 +323,20 @@ mod tests {
         assert_eq!(v["providers"]["fakellm"]["api"], "openai-completions");
         assert_eq!(v["providers"]["fakellm"]["models"][0]["id"], "fake-model");
         assert!(o.snippet.contains("~/.pi/agent/models.json"));
+    }
+
+    #[test]
+    fn shell_prints_the_opencode_config_once() {
+        let o = get("opencode");
+        let shell = format(&o, Format::Shell).unwrap();
+        assert_eq!(shell.matches("\"$schema\"").count(), 1, "{shell}");
+        assert!(shell.starts_with("export OPENCODE_CONFIG_CONTENT="));
+        assert!(shell.contains("--file opencode.json"));
+        // Targets whose files are not in a variable keep printing them.
+        let pi = format(&get("pi"), Format::Shell).unwrap();
+        assert!(pi.contains("# models.json\n{"), "{pi}");
+        let codex = format(&get("codex"), Format::Shell).unwrap();
+        assert!(codex.contains("# config.toml"), "{codex}");
     }
 
     #[test]

@@ -1,0 +1,60 @@
+name: e2e
+
+# Runs every e2e/*.sh against the real claude, codex and opencode CLIs, installed fresh from npm. They need the
+# network and move with upstream releases, so this is not part of ci.yml: start it by hand (and before a release)
+# or let the weekly schedule catch an upstream change.
+on:
+  workflow_dispatch:
+    inputs:
+      codex:
+        description: "@openai/codex version or dist-tag"
+        default: latest
+      claude:
+        description: "@anthropic-ai/claude-code version or dist-tag"
+        default: latest
+      opencode:
+        description: "opencode-ai version or dist-tag"
+        default: latest
+  schedule:
+    - cron: "17 5 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  harnesses:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      FAKELLM_BIN: ${{ github.workspace }}/target/debug/fakellm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install the CLIs
+        run: |
+          npm install -g \
+            "@openai/codex@${{ inputs.codex || 'latest' }}" \
+            "@anthropic-ai/claude-code@${{ inputs.claude || 'latest' }}" \
+            "opencode-ai@${{ inputs.opencode || 'latest' }}"
+          codex --version
+          claude --version
+          opencode --version
+      - run: cargo build
+      - name: Run every e2e script
+        run: |
+          # docker.sh needs a Docker build and has its own job in ci.yml; the others each print PASS or fail.
+          failed=()
+          for script in "$GITHUB_WORKSPACE"/e2e/*.sh; do
+            case "$(basename "$script")" in docker.sh) continue ;; esac
+            echo "::group::$(basename "$script")"
+            if "$script"; then echo "ok  $(basename "$script")"; else failed+=("$(basename "$script")"); fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::failed: ${failed[*]}"
+            exit 1
+          fi

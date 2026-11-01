@@ -87,6 +87,11 @@ struct Opt {
     #[arg(long, requires = "record")]
     record_errors: bool,
 
+    /// Replace every match of this regex in the recorded texts (messages, tool arguments and results, extra,
+    /// replies) with "<redacted>". Repeatable.
+    #[arg(long, value_name = "REGEX")]
+    record_redact: Vec<String>,
+
     /// Seconds the upstream may take to send response headers; 0 means no limit.
     #[arg(long, env = "FAKELLM_UPSTREAM_TIMEOUT", requires = "upstream", default_value_t = 600)]
     upstream_timeout: u64,
@@ -130,6 +135,10 @@ struct Opt {
     #[arg(long, env = "FAKELLM_REDACT_AUTH", value_parser = BoolishValueParser::new(), num_args = 0..=1,
         default_missing_value = "true", default_value_t = false)]
     redact_auth: bool,
+
+    /// Most named snapshots held at once; more get a 409.
+    #[arg(long, default_value_t = fakellm::MAX_SNAPSHOTS, env = "FAKELLM_MAX_SNAPSHOTS")]
+    max_snapshots: usize,
 }
 
 fn at_least_one(s: &str) -> Result<usize, String> {
@@ -143,7 +152,7 @@ fn at_least_one(s: &str) -> Result<usize, String> {
 #[allow(clippy::large_enum_variant)] // parsed once per process
 #[derive(clap::Subcommand)]
 enum Cmd {
-    /// Control a running server: reset, scripts, clock, request log.
+    /// Control a running server: reset, scripts, trajectories, policies, cassettes, snapshots, clock, request log.
     Ctl(ctl::Ctl),
     /// Convert Hugging Face dataset rows (or a local dump of them) into a cassette or trajectories.
     Import(import_cli::Import),
@@ -280,6 +289,7 @@ fn run() -> std::io::Result<std::process::ExitCode> {
         request_log: !opt.no_request_log,
         request_log_capacity: opt.request_log_capacity,
         redact_auth: opt.redact_auth,
+        max_snapshots: opt.max_snapshots,
         path_prefix: opt.path_prefix,
         trajectories,
         policies,
@@ -290,6 +300,7 @@ fn run() -> std::io::Result<std::process::ExitCode> {
         upstream_api_key: opt.upstream_api_key,
         record: opt.record,
         record_errors: opt.record_errors,
+        record_redact: opt.record_redact,
         upstream_timeout_secs: opt.upstream_timeout,
         watch,
     };

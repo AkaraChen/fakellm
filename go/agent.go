@@ -12,12 +12,14 @@ import (
 // Name is unique; the zero values of the other fields are the server defaults (on_divergence
 // strict, cursor by_turn, unknown_tool error).
 type Trajectory struct {
-	Kind         string                 `json:"kind,omitempty"`
-	Name         string                 `json:"name"`
-	Steps        []TrajectoryStep       `json:"steps"`
-	OnDivergence string                 `json:"on_divergence,omitempty"` // strict | lenient | stop
-	StopText     *string                `json:"stop_text,omitempty"`
-	Cursor       string                 `json:"cursor,omitempty"` // by_turn | by_hits
+	Kind         string           `json:"kind,omitempty"`
+	Name         string           `json:"name"`
+	Steps        []TrajectoryStep `json:"steps"`
+	OnDivergence string           `json:"on_divergence,omitempty"` // strict | lenient | stop
+	StopText     *string          `json:"stop_text,omitempty"`
+	Cursor       string           `json:"cursor,omitempty"` // by_turn | by_hits
+	// Dedupe (by_hits only): nil or true replays the step for a request identical to the previous one; false counts every call.
+	Dedupe       *bool                  `json:"dedupe,omitempty"`
 	ToolMap      map[string]ToolMapping `json:"tool_map,omitempty"`
 	UnknownTool  string                 `json:"unknown_tool,omitempty"` // stop | error | pass
 	CheckPairing bool                   `json:"check_pairing,omitempty"`
@@ -166,6 +168,8 @@ type Policy struct {
 	Name    string `json:"name"`
 	Source  string `json:"source"`
 	Runtime string `json:"runtime,omitempty"`
+	// Files are extra modules written next to the entry module (relative paths), importable from Source.
+	Files map[string]string `json:"files,omitempty"`
 }
 
 // PolicyInfo is a registered policy with its process state.

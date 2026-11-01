@@ -121,12 +121,12 @@ fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json     # file
 
 | 客户端 | 结果 | 要点 |
 |---|---|---|
-| codex（0.162.1） | 通过：纯文本，和一轮 `exec_command` 工具调用 | 不读 `OPENAI_BASE_URL`，必须写自定义 provider（`wire codex` 生成）；`env_key` 可选（输出里注释掉了，启用后对应的环境变量必须非空）；故障只能用流内 `response.failed` |
-| Claude Code（2.1.314） | 通过：`claude -p` 得到 `FAKELLM_OK` | 需要 `ANTHROPIC_API_KEY`；它在 `messages` 里放 `role: system` 的条目，fakellm 为此放宽了校验 |
-| opencode（1.18.29） | 通过：标题旁路请求加主请求 | 要写一条 `no_tools` + `system` 的规则接住标题生成；隔离测试设 `OPENCODE_DISABLE_MODELS_FETCH=1`；第一次运行曾卡死一次，没能复现 |
-| pi | **没有用真实的 pi 验证** | 只生成配置，格式按约定写，没有 e2e 脚本 |
+| codex（0.162.1） | 通过：纯文本、`exec_command`、`apply_patch`，以及 `response.failed` / `response.incomplete` / 挂起等故障 | 不读 `OPENAI_BASE_URL`，必须写自定义 provider（`wire codex` 生成）；`env_key` 可选（输出里注释掉了，启用后对应的环境变量必须非空）；故障只能用流内 `response.failed` |
+| Claude Code（2.1.314） | 通过：`claude -p` 得到 `FAKELLM_OK`，`Bash` 工具循环，429 / 500 / 529 / 流内错误的重试 | 需要 `ANTHROPIC_API_KEY`；它在 `messages` 里放 `role: system` 的条目，fakellm 为此放宽了校验 |
+| opencode（1.18.29） | 通过：标题旁路请求加主请求，配置文件和 `OPENCODE_CONFIG_CONTENT` 两种形式 | 要写一条 `no_tools` + `system` 的规则接住标题生成；隔离测试设 `OPENCODE_DISABLE_MODELS_FETCH=1`；曾有一次首次运行卡死，5 次全新目录的运行都没复现，不设该变量时慢 10 秒以上 |
+| pi（pi-mono 1.4.0，从源码克隆运行） | 通过：`models.json` 原样被接受，一轮文本和 `bash` 工具循环（`e2e/pi.sh`） | 没有全局安装时用 `PI_MONO` 指向克隆，找不到就跳过 |
 
-这些 e2e 只验证“能完成一轮对话”，没有用真实 harness 测过 429 重试、断流、挂起这些故障。
+故障下 codex 和 Claude Code 的实测行为（重试次数、文案、退出码）见 [docs/wire.md](docs/wire.md)。
 
 ## 剧本
 
@@ -552,9 +552,9 @@ docker run --rm -p 4010:4010 fakellm
 
 - 镜像基于 Alpine，里面只有一个静态链接的 musl 二进制，以非 root 用户（uid 10001）运行；默认监听 `0.0.0.0:4010`（`FAKELLM_HOST` / `FAKELLM_PORT`），配置项见[配置](#配置)，环境变量和命令行参数都可以，如 `docker run fakellm --strict`。启动完成后 stdout 第一行是 `http://0.0.0.0:4010`，可以作为就绪信号。
 - 带 `HEALTHCHECK`（`GET /_fakellm`），只跟随 `FAKELLM_PORT`；用 `--port` 参数改端口，或只跑 `wire` / `ctl` 这类一次性命令时加 `docker run --no-healthcheck`。
-- 镜像里没有 JS 运行时，[策略脚本](docs/agent.md#策略脚本)跑不起来（轨迹不受影响）；需要策略时基于它做派生镜像 `apk add nodejs`。
+- 默认镜像里没有 JS 运行时，[策略脚本](docs/agent.md#策略脚本)跑不起来（轨迹不受影响）：注册策略时得到 400 `no JavaScript runtime found: ...`。要用策略就用 node 变体 `fakellm:node`（`Dockerfile.node`，`node:22-alpine` 加同一个静态二进制，环境变量 `FAKELLM_POLICY_RUNTIME=node`；发布后的 tag 是 `node` 和 `<版本>-node`），本地构建：`docker build -f Dockerfile.node -t fakellm:node .`。
 - 控制面没有认证，容器里监听 `0.0.0.0`：只发布到本机（`-p 127.0.0.1:4010:4010`），不要暴露到公网。
-- 发布后的 tag 是 `latest`、完整版本（`0.1.0`）、`主版本.次版本`（`0.1`）和提交短 sha；手动触发 release 工作流时 `publish` 默认是 `false`，只构建和冒烟测试。`e2e/docker.sh` 是本地的镜像冒烟脚本（构建、随机端口启动、请求一次 chat completion）。
+- 发布后的 tag 是 `latest`、完整版本（`0.1.0`）、`主版本.次版本`（`0.1`）和提交短 sha；手动触发 release 工作流时 `publish` 默认是 `false`，只构建和冒烟测试。`e2e/docker.sh` 是本地的镜像冒烟脚本：构建两个镜像，随机端口启动，请求一次 chat completion；默认镜像必须拒绝策略，node 变体必须跑通一个策略。
 
 ### 在 Testcontainers 里使用
 
@@ -667,7 +667,7 @@ test('agent 调用工具', async () => {
 
 ## Node.js 原生绑定（bindings/node）
 
-[`bindings/node`](bindings/node/) 是一个 [napi-rs](https://napi.rs) 插件，服务器直接跑在 Node / Bun 进程里：不起子进程、不需要二进制，也不用协商端口。包名 `@fakellm/native`，**尚未发布到 npm**（`node.yml` 在推送 `v*` tag 时发布，其余情况只做 `npm publish --dry-run`）。控制面的操作是同步方法，不走 HTTP（`policies.put` / `add` 要启动并加载策略子进程，会阻塞 JS 线程约 100 ms）：
+[`bindings/node`](bindings/node/) 是一个 [napi-rs](https://napi.rs) 插件，服务器直接跑在 Node / Bun 进程里：不起子进程、不需要二进制，也不用协商端口。包名 `@fakellm/native`，**尚未发布到 npm**（`node.yml` 在推送 `v*` tag 时发布，其余情况只做 `npm publish --dry-run`）。控制面的操作是同步方法，不走 HTTP；例外是 `policies.put` / `add`，它们要启动并加载策略子进程（约 100 ms），所以返回 Promise，在工作线程里做，不阻塞 JS 线程：`await server.policies.put([...])`：
 
 ```js
 import { createRequire } from 'node:module';
@@ -683,10 +683,10 @@ server.reset();
 await server.stop();                    // 关闭监听和所有未结束的连接（包括挂起的请求）
 ```
 
-`start(options?)` 的选项：`host`、`port`、`apiKey`、`models`、`strict`、`scripts`（规则数组，或 JSON / YAML 字符串）、`trajectories`、`policies`（数组，或 JSON / YAML / JSONL 字符串）、`policyRuntime`、`cassettes`（数组，或 JSON / YAML / JSONL 字符串）、`upstream`、`upstreamApiKey`、`record`（文件路径）、`watch`（`{ scripts?, trajectories?, policies?, cassettes? }` 文件路径，变化时重新加载；默认什么都不监视）、`pathPrefix`、`ttft`、`tokensPerSec`、`fallbackTokens`、`chunkTokens`、`argsChunkBytes`、`requestLog`、`requestLogCapacity`、`redactAuth`。服务器对象的属性有 `endpoint`、`baseUrl`、`anthropicBaseUrl`、`host`、`port`，以及 `scripts`、`trajectories`、`cassettes`、`snapshots`、`policies`、`requests`、`responses`、`clock`、`reset()`、`status()`、`wire(target, format?)`、`stop()`。类型声明由 `napi build` 生成（`index.d.ts`）。没有调用 `stop()` 的服务器对象被垃圾回收时也会停止，所以在用到它的地址期间要保留引用。
+`start(options?)` 的选项：`host`、`port`、`apiKey`、`models`、`strict`、`scripts`（规则数组，或 JSON / YAML 字符串）、`trajectories`、`policies`（数组，或 JSON / YAML / JSONL 字符串）、`policyRuntime`、`cassettes`（数组，或 JSON / YAML / JSONL 字符串）、`upstream`、`upstreamApiKey`、`record`（文件路径）、`scriptsFile`、`trajectoryFiles`、`policyFiles`、`cassetteFiles`（启动时从文件加载，策略以文件名命名）、`watch`（默认 `true`：监视上面这些文件，变化时重新加载，和 CLI、`sdk/js` 一致；`false` 不监视；也可以是 `{ scripts?, trajectories?, policies?, cassettes? }` 显式指定要监视的路径）、`recordRedact`（正则数组）、`recordErrors`、`upstreamTimeout`、`policyTimeoutMs`、`maxSnapshots`、`pathPrefix`、`ttft`、`tokensPerSec`、`fallbackTokens`、`chunkTokens`、`argsChunkBytes`、`requestLog`、`requestLogCapacity`、`redactAuth`。服务器对象的属性有 `endpoint`、`baseUrl`、`anthropicBaseUrl`、`host`、`port`，以及 `scripts`、`trajectories`、`cassettes`、`snapshots`、`policies`、`requests`、`responses`、`clock`、`reset()`、`status()`、`wire(target, format?)`、`stop()`。类型声明由 `napi build` 生成（`index.d.ts`）。没有调用 `stop()` 的服务器对象被垃圾回收时也会停止，所以在用到它的地址期间要保留引用。
 
-- **Bun**：同一个 `.node` 在 Bun 下可以加载，`bun test __test__/openai.test.mjs` 在本机通过（25 通过，1 跳过：那一条需要 `node --expose-gc`）；CI 的 `napi-bun` 任务会跑它。Bun 的 napi 实现和 Node 不是同一个，除这个测试覆盖的内容外没有别的保证。
-- **平台**：构建目标是 Linux 的 x64 / arm64，glibc 和 musl；macOS 和 Windows 没有构建，也没有验证过。
+- **Bun**：同一个 `.node` 在 Bun 下可以加载，`bun test`（`__test__/` 下全部文件，含 `agent.test.mjs`）在本机通过（37 通过，1 跳过：那一条需要 `node --expose-gc`）；CI 的 `napi-bun` 任务跑全部文件。Bun 的 napi 实现和 Node 不是同一个，除测试覆盖的内容外没有别的保证。
+- **平台**：构建目标是 Linux 的 x64 / arm64，glibc 和 musl；macOS 和 Windows 有意不提供预编译包（没有环境验证，原因见 [docs/release.md](docs/release.md)）；那两个平台用 `fakellm` 二进制配合 `sdk/js`。
 - 自己编译：`cd bindings/node && npm ci && npm run build`（需要 Rust 工具链），`npm test` 用官方 `openai` 和 `@anthropic-ai/sdk` 跑一遍。
 
 ## Go helper（go/）
@@ -744,6 +744,8 @@ func TestAgent(t *testing.T) {
 | `--upstream` | `FAKELLM_UPSTREAM` | 无 | 没有剧本和 cassette 命中的请求转发到这个 OpenAI 兼容或 Anthropic 服务（`http://` 或 `https://`，不能带用户名密码），并记录回答 |
 | `--upstream-api-key` | `FAKELLM_UPSTREAM_API_KEY` | 无 | 发给上游的密钥，替代客户端自己的凭证；不设则客户端的 `authorization` / `x-api-key` 原样转发 |
 | `--record` | `FAKELLM_RECORD` | 无 | 把从上游录到的 exchange 追加写进这个 JSONL 文件（可以跨多次运行继续录） |
+| `--record-redact` | 无 | 无 | 正则，可重复：录制时把 request 和 outcome 里所有匹配的文本换成 `<redacted>`，见 [docs/cassette.md](docs/cassette.md#脱敏) |
+| `--max-snapshots` | `FAKELLM_MAX_SNAPSHOTS` | `100` | 同时保留的快照数，超出创建返回 409 |
 | `--record-errors` | 无 | 关 | 也录上游的 401、403、408、409、429 和 5xx（默认转发但不录，免得盖住随后重试成功的那次） |
 | `--upstream-timeout` | `FAKELLM_UPSTREAM_TIMEOUT` | `600` | 上游发响应头最多等多少秒，`0` 为不限；超时是 502 |
 | `--no-watch` | `FAKELLM_NO_WATCH` | 关 | 不监视 `--scripts`、`--trajectory`、`--policy`、`--cassette` 的文件变化 |
@@ -810,16 +812,17 @@ fakellm ctl requests list --status 0   # 此刻被 hang 挂住的请求（JSON �
 
 ## 测试与验证
 
-CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`sdk/js` 与 `sdk/node` 的 `npm test` 和 `bun test`、Go 的 `go vet` 和 `go test`、`bindings/node` 的 Bun 测试和 `e2e/docker.sh`。需要真实 claude / codex / opencode 的 e2e 脚本不在 CI 里，手工运行。下面的数字是 2026-11-01 在本机的结果。
+CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`sdk/js` 与 `sdk/node` 的 `npm test` 和 `bun test`、Go 的 `go vet` 和 `go test`、`bindings/node` 的 Bun 测试和 `e2e/docker.sh`。需要真实 claude / codex / opencode 的 e2e 脚本不在 `ci.yml` 里（要联网装 CLI，也随上游版本变化）：`.github/workflows/e2e.yml` 单独负责，只能手动触发（`workflow_dispatch`，可指定三个 CLI 的版本）或每周一自动跑一次，它用 `npm install -g` 装 `@openai/codex`、`@anthropic-ai/claude-code`、`opencode-ai`，再跑 `e2e/*.sh`（`docker.sh` 除外，它在 `ci.yml` 里）；发版前也在本机跑一遍。下面的数字是 2026-11-01 在本机的结果。
 
 | 套件 | 命令 | 当前结果 |
 |---|---|---|
 | 格式与 lint | `cargo fmt --check`；`cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单元和集成测试 | `cargo test` | 491 个通过：库 243、二进制 11、`tests/*.rs` 22 个文件共 235、文档测试 2 |
-| 官方 SDK 套件（`sdk/node`） | 先 `cd sdk/node && npm ci`；`cargo test` 里的 `tests/node_sdk.rs` 会自动跑它，也可以 `npm test` 或 `bun test` | 59 个通过（node 和 bun 都是），10 个测试文件，覆盖 `openai`、`@anthropic-ai/sdk`、`@ai-sdk/openai`、`@ai-sdk/anthropic` 以及 agent、cassette、结构化输出 |
-| JS / TS 客户端（`sdk/js`） | `cd sdk/js && npm ci && npm test`；`bun test` | 21 个通过（node 和 bun 都是） |
-| Node 原生绑定（`bindings/node`） | `cd bindings/node && npm ci && npm run build:debug && npm test`；Bun：`bun test __test__/openai.test.mjs` | node 26 个通过；Bun 25 个通过、1 个跳过（那一条需要 `node --expose-gc`） |
-| Go helper（`go/`） | `cd go && go vet ./... && go test -count=1 ./...` | 15 个通过 |
+| Rust 单元和集成测试 | `cargo test` | 551 个通过：库 251、二进制 12、`tests/*.rs` 28 个文件共 286（含 `faults.rs`、`agent_protocols.rs`、`custom_protocols.rs`、`python_sdk.rs`）、文档测试 2 |
+| 官方 SDK 套件（`sdk/node`） | 先 `cd sdk/node && npm ci`；`cargo test` 里的 `tests/node_sdk.rs` 会自动跑它，也可以 `npm test` 或 `bun test` | 106 个通过（node 和 bun 都是），11 个测试文件，覆盖 `openai`、`@anthropic-ai/sdk`、`@ai-sdk/openai`、`@ai-sdk/anthropic` 以及 agent、cassette、结构化输出、故障注入 |
+| Python 官方客户端（`sdk/python`） | `cd sdk/python && uv run --frozen pytest`；`tests/python_sdk.rs` 会在 `cargo test` 里自动跑它（没有 `uv` 时 skip） | 17 个通过：`openai` / `anthropic` 官方包加 `fakellm_sdk` helper |
+| JS / TS 客户端（`sdk/js`） | `cd sdk/js && npm ci && npm test`；`bun test` | 31 个通过（node 和 bun 都是） |
+| Node 原生绑定（`bindings/node`） | `cd bindings/node && npm ci && npm run build:debug && npm test`；Bun：`bun test __test__/openai.test.mjs` | node 37 个通过；Bun 36 个通过、1 个跳过（那一条需要 `node --expose-gc`）；Bun 跑 `__test__/` 下全部文件 |
+| Go helper（`go/`） | `cd go && go vet ./... && go test -count=1 ./...` | 16 个通过 |
 | 发布前检查 | `cargo publish --dry-run`（工作区有未提交改动时加 `--allow-dirty`）；`npm pack --dry-run`（`sdk/js`、`bindings/node`） | 通过 |
 
 真实 harness 和镜像的 e2e 脚本（`e2e/*.sh`），每个都会先 `cargo build`，用 `FAKELLM_BIN` 可以换二进制，成功时最后一行如下：
@@ -829,13 +832,16 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 | `e2e/claude.sh` | `claude` | `claude -p` 得到 `FAKELLM_OK` | `PASS` |
 | `e2e/claude-trajectory.sh` | `claude` | 轨迹加 `tool_map`（shell 到 Bash）驱动 Claude Code 的工具循环 | `claude trajectory e2e ok` |
 | `e2e/codex.sh` | `codex` | 纯文本和一轮 `exec_command` 工具调用 | `codex e2e ok` |
-| `e2e/codex-faults.sh` | `codex` | 流内 `context_length_exceeded` 错误 | `codex faults e2e ok` |
+| `e2e/claude-faults.sh` | `claude` | `Bash` 工具循环；429、500、529、流内错误后重试成功，400、404 失败；`HEAD /api/hello` | `claude e2e faults ok` |
+| `e2e/codex-faults.sh` | `codex` | `response.failed`（上下文、额度、限流）、`response.incomplete`、重试、`apply_patch`、挂起与 idle timeout | `codex faults e2e ok` |
 | `e2e/codex-trajectory.sh` | `codex` | 轨迹驱动 codex 的工具循环 | `codex trajectory e2e ok` |
-| `e2e/opencode.sh` | `opencode` | 标题旁路请求加主请求 | `PASS` |
+| `e2e/pi.sh` | pi-mono 克隆、node | `wire pi` 的 `models.json`，文本和 `bash` 工具循环 | `pi e2e ok` |
+| `e2e/connect-rst.sh` | node | CONNECT 代理后面的 `reset_after_chunks`：直连是 RST，`pipe()` 式代理变成 EOF | `connect rst e2e ok` |
+| `e2e/opencode.sh` | `opencode` | 标题旁路请求加主请求，配置文件和环境变量两种形式，5 次全新目录运行 | `PASS` |
 | `e2e/opencode-policy.sh` | `opencode`、node | 策略脚本驱动 opencode | `opencode policy e2e ok` |
 | `e2e/docker.sh` | `docker` | 构建镜像、随机端口启动、请求一次 chat completion | `PASS docker ...` |
 
-这八个脚本在 M4 之后的核对中全部通过（记下的是每个脚本最后一行输出，没有逐个记退出码）。版本：codex 0.162.1、Claude Code 2.1.314、opencode 1.18.29。没有覆盖的部分（pi、真实 `tjs`、真实上游、各 harness 的故障重试）见 [TODO.md](TODO.md)。
+这十一个脚本在 2026-11-01 的最后一轮集成中全部以退出码 0 通过（含 `pi`，没有 skip；`docker.sh` 的默认镜像拒绝策略、`node` 变体跑通策略）。pi 的版本是 pi-mono 1.4.0。版本：codex 0.162.1、Claude Code 2.1.314、opencode 1.18.29。`tjs` 在自编译的 txiki.js v26.6.0 上验证过；没有覆盖的只有真实付费上游，见 [TODO.md](TODO.md)。
 
 消费方实验（八个真实仓库的测试对着 fakellm 跑）的结果和复现方法见 [docs/consumers.md](docs/consumers.md)。
 
@@ -855,17 +861,17 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 | M4 | cassette 录制回放（`--upstream`、`--record`）、`fakellm import hf`、快照、热加载，见 [docs/cassette.md](docs/cassette.md) | 已完成 |
 | M4 | 按 `json_schema` 生成结构化输出 | 已完成 |
 | M4 之后 | 自定义端点规则（`match.path` / `reply.body`）、策略脚本的 `decline`、启动错误信息、LICENSE | 已完成（未提交） |
+| 再之后 | 响应保真字段、`sdk/python`、故障注入与 pi / CONNECT 的 e2e、`e2e.yml`、真实 `tjs` 和真实数据集验证、`xlam` 导入 | 已完成（未提交） |
 
 每个里程碑的细节见 [CHANGELOG.md](CHANGELOG.md)。M0 到 M4 的路线图都已完成。
 
 **有意没做的**（不是遗漏，原因见[不做的事](#不做的事)）：真正的推理和与任何真实模型一致的 tokenizer、多模态生成、内容审核、持久化、分发数据集、向量相似度式的语义匹配。
 
-**还没做的**（详见 [TODO.md](TODO.md)）：
+**没有未完成的开发项**。剩下的只有需要作者决定或外部凭证的事（详见 [TODO.md](TODO.md)）：
 
-- **发布**：第一次推 `v*` tag，发布 GHCR 镜像、GitHub release 二进制（`go/` 的 `Download` 依赖它）和 npm 包（`@fakellm/native`、`sdk/js`），之后在真实镜像上验证 testcontainers 片段；发布到 crates.io；`bindings/node` 的 macOS / Windows 构建。
-- **验证**：e2e 进 CI，补 pi 的 e2e；Docker 镜像（alpine）里没有 JS 运行时，策略脚本跑不起来；用真实的 `tjs` 跑一遍策略脚本的测试；对着真实上游录制回放。
-- **协议**：Responses 的 WebSocket、`background`、`/cancel`、`/input_items`。
-- **消费方缺口**：跨请求的序列/状态匹配、Anthropic 缓存与 `input_tokens` 的耦合、与真实 API 的响应保真差异（`docs/consumers.md` 整理的缺口）。
+- **发布**：推 `v*` tag、发布 npm 和 crates.io 是需要外部账号的动作，清单见 [docs/release.md](docs/release.md)。
+- **验证**：对着真实 OpenAI / Anthropic / CLIProxyAPI 录制回放缺凭证，命令见 [docs/cassette.md](docs/cassette.md#对真实上游的验证状态)。
+- **有意不做的协议能力**：Responses 的 WebSocket、`background`、`/cancel`、`/input_items`，原因见 [docs/control-plane.md](docs/control-plane.md)；响应保真的有意差异见 [docs/wire.md](docs/wire.md#与真实-api-有意保留的差异)。
 
 完整的设计思路见 [docs/design.md](docs/design.md)。
 
@@ -877,4 +883,4 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 - 不做内容审核、安全策略这类模型行为；`content_filter` 只能在剧本里通过 `finish_reason` 手动指定。
 - 不持久化：服务端状态在内存里，重启即清空。唯一写盘的是你主动给的 `--record` 文件；导入（`fakellm import`）是离线命令，产物是你仓库里的夹具文件。
 - 不分发数据集：`fakellm import` 只转换你自己取的行，许可证由你确认，见 [docs/import.md](docs/import.md#数据集与许可证)。
-- 不做真正的“语义”匹配：cassette 的“含义”指规范化之后的消息和工具相等（`fuzzy` 也只是按末尾消息相近选一个），不是向量相似度，也不会改写回复。
+- 不做真正的“语义”匹配：cassette 的“含义”指规范化之后的消息和工具相等（`fuzzy` 是整段对话的词集合 Jaccard 相似度，`sample` 是按 seed 抽样，都不是向量相似度），不是向量相似度，也不会改写回复。

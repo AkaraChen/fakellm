@@ -2,6 +2,8 @@
 //! (docs/m4-spec.md section 3.3) and compare that, never bytes. A request recorded through Chat matches the
 //! same conversation sent through Responses or Messages because the form is built from the IR.
 
+use std::collections::HashSet;
+
 use serde_json::{Map, Value, json};
 
 use crate::cassette::CassetteError;
@@ -120,35 +122,39 @@ impl Matcher {
         Key(canonical(&Value::Object(doc)))
     }
 
-    /// For `fuzzy` lookups: `None` unless both requests have the same number of messages and the same normalized
-    /// last user text; else the number of messages (compared from the end) that are equal after normalization; `None` as well when the last
-    /// message differs.
-    /// The exchange with the highest score wins, the earliest on a tie.
-    #[cfg(test)]
-    pub fn similarity(&self, req: &Request, recorded: &Request) -> Option<usize> {
-        if self.last_user(req) != self.last_user(recorded) {
-            return None;
+    /// The token set of a whole conversation for `fuzzy` lookups: the lower-cased alphanumeric words of every
+    /// message (normalized like the exact key, thinking left out), tool-call names and arguments included. Computed
+    /// once per live request and once per exchange at registration.
+    pub fn tokens(&self, req: &Request) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut add = |text: &str| {
+            let text = self.normalizers.apply(text);
+            out.extend(
+                text.split(|c: char| !c.is_alphanumeric())
+                    .filter(|w| !w.is_empty())
+                    .map(str::to_lowercase),
+            );
+        };
+        for m in &req.messages {
+            for part in &m.content {
+                if let Some(text) = self.part(part) {
+                    add(&text);
+                }
+            }
+            for call in &m.tool_calls {
+                add(&call.name);
+                add(&call.arguments);
+            }
         }
-        self.similarity_same_last(req, recorded)
+        out
     }
 
-    /// The normalized text of the last user message: the part of [`Matcher::similarity`] that is computed once per
-    /// request (live) or once per exchange (recorded, at registration) instead of once per comparison.
-    pub fn last_user(&self, req: &Request) -> Option<String> {
-        req.last_user_text().map(|t| self.normalizers.apply(&t))
-    }
-
-    /// [`Matcher::similarity`] for two requests already known to have equal [`Matcher::last_user`] texts.
-    pub fn similarity_same_last(&self, req: &Request, recorded: &Request) -> Option<usize> {
-        if req.messages.len() != recorded.messages.len() {
-            return None;
-        }
-        let pairs = req.messages.iter().rev().zip(recorded.messages.iter().rev());
-        let score = pairs
-            .take_while(|(a, b)| canonical(&self.message(a)) == canonical(&self.message(b)))
-            .count();
-        // The last message must be equal too: a different tool result is a different request.
-        (score > 0).then_some(score)
+    /// Jaccard similarity of two token sets: `|a & b| / |a | b|`; two empty sets are not similar (0).
+    pub fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
+        let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        let inter = small.iter().filter(|t| large.contains(*t)).count();
+        let union = a.len() + b.len() - inter;
+        if union == 0 { 0.0 } else { inter as f64 / union as f64 }
     }
 
     fn message(&self, m: &Message) -> Value {
@@ -327,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn similarity_needs_same_shape_and_last_user_text() {
+    fn jaccard_over_the_whole_conversation() {
         let c = Cassette::new("c");
         let m = matcher(&c);
         let mk = |texts: &[&str]| {
@@ -340,11 +346,19 @@ mod tests {
                     .collect(),
             )
         };
-        let rec = mk(&["a", "b", "c"]);
-        assert_eq!(m.similarity(&mk(&["a", "b", "c"]), &rec), Some(3));
-        assert_eq!(m.similarity(&mk(&["x", "b", "c"]), &rec), Some(2));
-        assert_eq!(m.similarity(&mk(&["a", "y", "c"]), &rec), Some(1));
-        assert_eq!(m.similarity(&mk(&["a", "b", "z"]), &rec), None);
-        assert_eq!(m.similarity(&mk(&["b", "c"]), &rec), None);
+        let sim = |a: &Request, b: &Request| Matcher::jaccard(&m.tokens(a), &m.tokens(b));
+        let rec = mk(&["Please fix the failing test in parser.rs", "ok", "run it again"]);
+        assert_eq!(sim(&rec, &rec), 1.0);
+        // Case, punctuation and message boundaries do not matter.
+        assert_eq!(
+            sim(&rec, &mk(&["please FIX the failing test, in parser.rs!", "ok", "run it again"])),
+            1.0
+        );
+        // One word of ten differs: near.
+        let near = sim(&rec, &mk(&["Please fix the failing test in lexer.rs", "ok", "run it again"]));
+        assert!(near > 0.7 && near < 1.0, "{near}");
+        // Unrelated: far.
+        assert!(sim(&rec, &mk(&["what is the weather in Paris"])) < 0.2);
+        assert_eq!(Matcher::jaccard(&HashSet::new(), &HashSet::new()), 0.0);
     }
 }

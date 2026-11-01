@@ -52,11 +52,58 @@ await llm.clock.advance('500ms');   // 现在首个 chunk 到达
 
 连一个已经在运行的服务（不管理进程）：`const llm = connect('http://127.0.0.1:4010')`。
 
+## 通用 helper：vitest globalSetup
+
+几个真实仓库的实验都各自写了一遍同样的 helper：起一个进程、读到地址、每个用例前 reset、停掉。这些现在都在包里，全局只起一个服务，各个测试文件（vitest 默认多个 worker）共用：
+
+```ts
+// vitest.config.ts
+import { defineConfig } from 'vitest/config';
+export default defineConfig({ test: { globalSetup: ['./test/fakellm.global.ts'] } });
+```
+
+```ts
+// test/fakellm.global.ts：在主进程里启动一次，把地址交给 worker
+import { start } from 'fakellm';
+import type { TestProject } from 'vitest/node';
+
+export default async function setup(project: TestProject) {
+  const llm = await start({ stderr: 'ignore' });          // 二进制来自 FAKELLM_BIN 或 PATH
+  project.provide('fakellmUrl', llm.url);                 // 在 worker 里用 inject('fakellmUrl') 取
+  return () => llm.stop();                                // teardown
+}
+declare module 'vitest' {
+  export interface ProvidedContext { fakellmUrl: string }
+}
+```
+
+```ts
+// test/agent.test.ts：worker 里 connect 到同一个服务，不管理进程
+import { beforeEach, expect, inject, test } from 'vitest';
+import { connect, text } from 'fakellm';
+
+const llm = connect(inject('fakellmUrl'));
+beforeEach(() => llm.reset());                             // 每个用例一个干净的服务
+
+test('回复', async () => {
+  await llm.scripts.put([text('hi')]);
+  // ... 把 llm.baseURL（OpenAI）或 llm.anthropicBaseURL 交给被测代码 ...
+  expect(await llm.requests.count()).toBe(0);
+});
+```
+
+要点：
+
+- 多个 worker 共用一个服务时，`reset()` 会互相清掉对方的规则，需要并行跑的文件要么各自 `start()` 一个（毫秒级），要么用 `--pool=forks --poolOptions.forks.singleFork` / `fileParallelism: false`。
+- `start()` 的 `stderr: 'ignore'` 避免管道里的 `bun run test` 因为子进程继承了 stderr 而不退出；默认是 `'inherit'`，启动失败时能看到二进制的报错。
+- 读不到地址、二进制找不到、策略加载失败都在 `start()` 里抛 `FakeLLMError`，globalSetup 因此直接失败，不会留下孤儿进程。
+- bun test、node:test 同理，用 `before` / `after` 或预加载脚本调用 `start()` / `stop()`，把 `llm.url` 放进环境变量即可。
+
 ## API
 
 | 名字 | 说明 |
 |---|---|
-| `start(options?)` | 启动二进制，返回 `FakeLLM`。选项：`bin`、`host`、`port`（默认 0）、`apiKey`、`models`、`strict`、`scripts`（规则数组，或剧本文件路径）、`trajectories`、`policies`、`policyRuntime`、`cassettes`（`Cassette[]`，或 cassette 文件路径）、`upstream`、`upstreamApiKey`、`record`（JSONL 文件路径，需要 `upstream`）、`watch`（`false` 则不再监视文件）、`pathPrefix`、`ttft`、`tokensPerSec`、`args`、`env`、`readyTimeoutMs` |
+| `start(options?)` | 启动二进制，返回 `FakeLLM`。选项：`bin`、`host`、`port`（默认 0）、`apiKey`、`models`、`strict`、`scripts`（规则数组，或剧本文件路径）、`trajectories`、`policies`、`policyRuntime`、`cassettes`（`Cassette[]`，或 cassette 文件路径）、`upstream`、`upstreamApiKey`、`record`（JSONL 文件路径，需要 `upstream`）、`watch`（`false` 则不再监视文件）、`pathPrefix`、`ttft`、`tokensPerSec`、`chunkTokens`、`argsChunkBytes`、`policyTimeoutMs`、`maxSnapshots`、`stderr`（`'inherit'` 默认 / `'ignore'`）、`args`、`env`、`readyTimeoutMs` |
 | `connect(url)` | 连接已运行的服务；`stop()` 和 `wire()` 对它无效 |
 | `llm.url` / `baseURL` / `anthropicBaseURL` / `port` | 地址；`baseURL` 是 `url + '/v1'`（OpenAI SDK），`anthropicBaseURL` 是 `url`（Anthropic SDK 自己加 `/v1`） |
 | `llm.scripts` | `put(rules, { keepHits })` 替换，`add(rules)` 追加，`list()`（带 `hits`、`reached`、`exhausted`），`clear()` |

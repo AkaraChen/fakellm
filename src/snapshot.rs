@@ -21,8 +21,9 @@ use crate::script::ScriptState;
 /// Longest snapshot name.
 pub const MAX_NAME: usize = 64;
 
-/// Most snapshots held at once; each pins the state it captured (recording, stored responses) in memory.
-pub const MAX_SNAPSHOTS: usize = 64;
+/// Default for `Config::max_snapshots`: most snapshots held at once; each pins the state it captured
+/// (recording, stored responses) in memory.
+pub const MAX_SNAPSHOTS: usize = 100;
 
 /// What `POST/GET /_fakellm/snapshots` report about one snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,8 +52,8 @@ pub(crate) struct Snapshot {
 }
 
 /// The named snapshots of one server.
-#[derive(Default)]
 pub struct Snapshots {
+    limit: usize,
     inner: Mutex<BTreeMap<String, Arc<Snapshot>>>,
     /// For names made up when `POST` gives none: `snapshot-1`, `snapshot-2`, ...
     counter: AtomicU64,
@@ -63,9 +64,24 @@ pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= MAX_NAME && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+impl Default for Snapshots {
+    fn default() -> Self {
+        Self {
+            limit: MAX_SNAPSHOTS,
+            inner: Default::default(),
+            counter: Default::default(),
+        }
+    }
+}
+
 impl Snapshots {
     pub fn len(&self) -> usize {
         self.inner.lock().len()
+    }
+
+    /// An empty store that refuses a snapshot beyond `limit`.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit, ..Self::default() }
     }
 
     /// Infos, oldest name first (alphabetical).
@@ -88,9 +104,10 @@ impl Snapshots {
         if inner.contains_key(&name) {
             return Err(ControlError::Conflict(format!("a snapshot named {name:?} already exists")));
         }
-        if inner.len() >= MAX_SNAPSHOTS {
-            return Err(ControlError::BadRequest(format!(
-                "too many snapshots ({MAX_SNAPSHOTS}): delete some first, each one holds the state it captured"
+        if inner.len() >= self.limit {
+            return Err(ControlError::Conflict(format!(
+                "too many snapshots ({}): delete some first, each one holds the state it captured (--max-snapshots raises the limit)",
+                self.limit
             )));
         }
         inner.insert(name, Arc::new(snapshot));

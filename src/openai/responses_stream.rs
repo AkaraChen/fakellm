@@ -65,7 +65,7 @@ fn split_bytes(s: &str, max: usize) -> Vec<&str> {
 }
 
 /// The item as `response.output_item.added` shows it: final identity, empty payload.
-fn added_item(item: &Value) -> Value {
+fn added_item(item: &Value, explicit_opaque: bool) -> Value {
     let mut v = item.clone();
     match item["type"].as_str() {
         Some("message") => {
@@ -80,7 +80,14 @@ fn added_item(item: &Value) -> Value {
             v["status"] = "in_progress".into();
             v["input"] = "".into();
         }
-        Some("reasoning") => v["summary"] = json!([]),
+        Some("reasoning") => {
+            v["summary"] = json!([]);
+            // The real API sends a different blob on `added` than on `done`; the generated one is cut short here.
+            // A blob the rule set itself is kept as it is.
+            if !explicit_opaque && let Some(enc) = item["encrypted_content"].as_str() {
+                v["encrypted_content"] = enc[..enc.len() / 2].into();
+            }
+        }
         _ => {}
     }
     v
@@ -105,7 +112,7 @@ pub fn frames(req: &Request, reply: &Reply, meta: &ResponseMeta, chunk_tokens: u
         let item_id = item["id"].clone();
         b.event(
             "response.output_item.added",
-            json!({"output_index": output_index, "item": added_item(item)}),
+            json!({"output_index": output_index, "item": added_item(item, reply.reasoning_opaque.is_some())}),
         );
         match item["type"].as_str() {
             Some("reasoning") => {
@@ -441,6 +448,11 @@ mod tests {
         assert_eq!(last["response"]["output"][0]["type"], "reasoning");
         assert_eq!(last["response"]["output"][0]["summary"][0]["text"], "think hard");
         assert!(last["response"]["output"][0]["encrypted_content"].is_string());
+        // `added` and `done` carry different blobs, as the real API does.
+        assert_ne!(
+            item["item"]["encrypted_content"],
+            last["response"]["output"][0]["encrypted_content"]
+        );
         assert_eq!(last["response"]["output"][1]["type"], "message");
     }
 

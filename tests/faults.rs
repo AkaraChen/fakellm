@@ -197,3 +197,65 @@ async fn sync_reset_sends_headers_then_dies() {
         .expect("content-length");
     assert!(head.starts_with("HTTP/1.1 200") && rest.len() < declared, "{raw:?}");
 }
+
+/// Reads until the first error or EOF and returns the error kind (None for a clean EOF).
+async fn read_until_end(s: &fakellm::Server, body: &serde_json::Value) -> Option<std::io::ErrorKind> {
+    use std::io::{Read, Write};
+    let addr = s.addr();
+    let b = body.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut sock = std::net::TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let req = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{b}",
+            b.len()
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(e) => return Some(e.kind()),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// The RST itself: a bare socket must see ECONNRESET, not a clean FIN (Linux only; other
+/// platforms fall back to FIN).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reset_after_chunks_is_a_real_rst() {
+    let s = start().await;
+    put_rules(
+        &s,
+        json!([{"reply": {"text": "one two three four", "stream": {"reset_after_chunks": 2}}}]),
+    )
+    .await;
+    let mut body = chat_body("gpt-4o", "hi");
+    body["stream"] = json!(true);
+    assert_eq!(read_until_end(&s, &body).await, Some(std::io::ErrorKind::ConnectionReset));
+
+    // The clean cut ends with FIN: no error.
+    put_rules(
+        &s,
+        json!([{"reply": {"text": "one two three four", "stream": {"cut_after_chunks": 2}}}]),
+    )
+    .await;
+    assert_eq!(read_until_end(&s, &body).await, None);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reply_reset_is_a_real_rst() {
+    let s = start().await;
+    put_rules(&s, json!([{"reply": {"text": "hello there", "reset": true}}])).await;
+    let sync = chat_body("gpt-4o", "hi");
+    assert_eq!(read_until_end(&s, &sync).await, Some(std::io::ErrorKind::ConnectionReset));
+    let mut streamed = chat_body("gpt-4o", "hi");
+    streamed["stream"] = json!(true);
+    assert_eq!(read_until_end(&s, &streamed).await, Some(std::io::ErrorKind::ConnectionReset));
+}

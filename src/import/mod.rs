@@ -12,6 +12,7 @@ pub mod openhands;
 pub mod sharegpt;
 pub mod swe_agent;
 pub mod wildchat;
+pub mod xlam;
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -40,6 +41,8 @@ pub enum Format {
     SweAgent,
     /// `events: [{source, action|observation, args, content, ...}]`.
     OpenHands,
+    /// `query`, `answers`, `tools` (Salesforce/xlam-function-calling-60k): one request and its function calls.
+    Xlam,
 }
 
 impl Format {
@@ -51,13 +54,14 @@ impl Format {
             Self::HermesFc => "hermes-fc",
             Self::SweAgent => "swe-agent",
             Self::OpenHands => "openhands",
+            Self::Xlam => "xlam",
         }
     }
 
     /// What `--as` defaults to: cassettes for chat corpora, trajectories for agent runs.
     pub fn default_output(self) -> Output {
         match self {
-            Self::SweAgent | Self::OpenHands | Self::HermesFc => Output::Trajectory,
+            Self::SweAgent | Self::OpenHands | Self::HermesFc | Self::Xlam => Output::Trajectory,
             Self::Auto | Self::ShareGpt | Self::WildChat => Output::Cassette,
         }
     }
@@ -74,9 +78,10 @@ impl FromStr for Format {
             "hermes-fc" => Self::HermesFc,
             "swe-agent" => Self::SweAgent,
             "openhands" => Self::OpenHands,
+            "xlam" => Self::Xlam,
             _ => {
                 return Err(format!(
-                    "unknown format {s:?}, expected auto, sharegpt, wildchat, hermes-fc, swe-agent or openhands"
+                    "unknown format {s:?}, expected auto, sharegpt, wildchat, hermes-fc, swe-agent, openhands or xlam"
                 ));
             }
         })
@@ -167,6 +172,9 @@ pub fn detect(row: &Value) -> Option<Format> {
     if openhands::matches(row) {
         return Some(Format::OpenHands);
     }
+    if xlam::matches(row) {
+        return Some(Format::Xlam);
+    }
     None
 }
 
@@ -185,6 +193,7 @@ pub fn convert_rows(rows: &[Value], format: Format) -> Converted {
             Some(Format::HermesFc) => hermes::convert(row, index),
             Some(Format::SweAgent) => swe_agent::convert(row, index),
             Some(Format::OpenHands) => openhands::convert(row, index),
+            Some(Format::Xlam) => xlam::convert(row, index),
             Some(Format::Auto) | None => Err("unrecognized row shape".to_owned()),
         };
         match result {
@@ -531,6 +540,7 @@ pub fn to_trajectories(conversations: &[Conversation], opts: &BuildOptions) -> V
             on_divergence: Default::default(),
             stop_text: None,
             cursor: Default::default(),
+            dedupe: true,
             tool_map: conversation.tool_map.clone(),
             unknown_tool: Default::default(),
             check_pairing: false,

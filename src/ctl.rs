@@ -3,11 +3,15 @@
 //! Commands: `status`, `reset [--keep-clock] [--keep-requests] [--keep-scripts] [--keep-responses]`,
 //! `responses {list, clear}`,
 //! `scripts {list, put FILE [--keep-hits], add FILE, clear}` (FILE is JSON or YAML by extension),
+//! `trajectories {list, put FILE, add FILE, get NAME [--jsonl], delete NAME, clear}` (FILE is JSON, JSONL or YAML),
+//! `policies {list, put FILE, add FILE, get NAME, delete NAME, clear}` (FILE is an ES module `.js`/`.mjs`/`.cjs`
+//! named after its stem, or a JSON/YAML registration body),
 //! `cassettes {list, put FILE, add FILE, get NAME [--jsonl], delete NAME, clear}` (FILE is JSON, JSONL or YAML by extension),
 //! `snapshot {create [NAME], list, restore NAME, delete NAME}`,
 //! `clock {get, freeze [AT], unfreeze, set AT, advance BY, reset}`,
 //! `requests {list [--model] [--has-tool] [--stream] [--protocol] [--status] [--source] [--rule] [--path]
 //! [--since] [--after] [--limit] [--full] [--count], clear, config [--enable|--disable] [--capacity N]}`.
+//! Every `put` and `add` reads standard input when FILE is `-`.
 //! `--endpoint` (env `FAKELLM_ENDPOINT`, default `http://127.0.0.1:4010`) and `--json` are global.
 //! `fakellm import` (dataset converters) is a separate offline subcommand; its output files are loaded with `cassettes put|add`.
 //! Human output is a compact text rendering; `--json` prints the server's JSON.
@@ -24,6 +28,7 @@ use tokio::net::TcpStream;
 
 #[derive(Args)]
 #[command(
+    about = "Control a running fakellm: reset, scripts, trajectories, policies, cassettes, snapshots, clock, request log",
     after_help = "Importing is offline and not a ctl command: `fakellm import ... -o FILE` converts Hugging Face dataset rows \
 into a cassette or trajectory file, which `ctl cassettes put FILE` loads into a running server (trajectories: `--trajectory FILE` at start)."
 )]
@@ -65,6 +70,12 @@ enum Command {
     /// Manage scripted replies.
     #[command(subcommand)]
     Scripts(Scripts),
+    /// Manage agent trajectories: scripted multi-step tool loops.
+    #[command(subcommand, alias = "trajectory")]
+    Trajectories(Trajectories),
+    /// Manage JavaScript policies: programs that decide replies.
+    #[command(subcommand, alias = "policy")]
+    Policies(Policies),
     /// Manage cassettes: recorded or imported exchanges replayed by meaning.
     #[command(subcommand)]
     Cassettes(Cassettes),
@@ -94,16 +105,70 @@ enum Responses {
 enum Scripts {
     /// List rules in match order.
     List,
-    /// Replace all rules with those in a JSON or YAML file.
+    /// Replace all rules with those in a JSON or YAML file (`-` reads stdin).
     Put {
         file: PathBuf,
         /// Keep the hit counts of rules that stay at the same position.
         #[arg(long)]
         keep_hits: bool,
     },
-    /// Append the rules in a JSON or YAML file.
+    /// Append the rules in a JSON or YAML file (`-` reads stdin).
     Add { file: PathBuf },
     /// Delete all rules.
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum Trajectories {
+    /// List trajectories with their step counts and hits.
+    List,
+    /// Replace all trajectories with those in a JSON, JSONL or YAML file (`-` reads stdin).
+    Put { file: PathBuf },
+    /// Add the trajectories in a JSON, JSONL or YAML file (`-` reads stdin); a same-named one is replaced.
+    Add { file: PathBuf },
+    /// Print one trajectory as JSON.
+    Get {
+        name: String,
+        /// One step per line, after a header line.
+        #[arg(long)]
+        jsonl: bool,
+    },
+    /// Remove one trajectory.
+    Delete { name: String },
+    /// Remove all trajectories.
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum Policies {
+    /// List policies with their runtime, hits and whether the subprocess is running.
+    List,
+    /// Replace all policies. FILE is an ES module (`.js`, `.mjs`, `.cjs`; named after the file stem or `--name`)
+    /// or a JSON/YAML body `{name, source, runtime?}`; `-` reads stdin (a module when `--name` is given).
+    Put {
+        file: PathBuf,
+        /// Policy name for a module file or stdin.
+        #[arg(long)]
+        name: Option<String>,
+        /// Runtime for this policy: tjs, node, bun or a path.
+        #[arg(long)]
+        runtime: Option<String>,
+    },
+    /// Add policies (same FILE forms as `put`); a same-named one is replaced.
+    Add {
+        file: PathBuf,
+        /// Policy name for a module file or stdin.
+        #[arg(long)]
+        name: Option<String>,
+        /// Runtime for this policy: tjs, node, bun or a path.
+        #[arg(long)]
+        runtime: Option<String>,
+    },
+    /// Print one policy: runtime, hits, state and recent log lines.
+    Get { name: String },
+    /// Remove one policy.
+    Delete { name: String },
+    /// Remove all policies.
     Clear,
 }
 
@@ -111,9 +176,9 @@ enum Scripts {
 enum Cassettes {
     /// List loaded cassettes (and the in-memory recording).
     List,
-    /// Replace all cassettes with those in a JSON, JSONL or YAML file.
+    /// Replace all cassettes with those in a JSON, JSONL or YAML file (`-` reads stdin).
     Put { file: PathBuf },
-    /// Add the cassettes in a JSON, JSONL or YAML file; a same-named one is replaced.
+    /// Add the cassettes in a JSON, JSONL or YAML file (`-` reads stdin); a same-named one is replaced.
     Add { file: PathBuf },
     /// Print one cassette as JSON; `recording` is what the upstream proxy has recorded so far.
     Get {
@@ -249,29 +314,64 @@ impl From<Value> for Body {
 
 type Call = (&'static str, String, Option<Body>);
 
-fn script_content_type(file: &Path) -> &'static str {
-    match file.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
-        Some("yaml" | "yml") => "application/yaml",
-        _ => "application/json",
+fn ext_of(file: &Path) -> Option<String> {
+    file.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase)
+}
+
+/// The file's bytes, or standard input for `-`.
+fn read_input(file: &Path) -> Result<Vec<u8>> {
+    if file == Path::new("-") {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut bytes).map_err(|e| format!("cannot read stdin: {e}"))?;
+        return Ok(bytes);
     }
+    std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))
 }
 
-fn script_body(file: &Path) -> Result<Body> {
-    let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    Ok(Body {
-        bytes,
-        content_type: script_content_type(file),
-    })
-}
-
-fn cassette_body(file: &Path) -> Result<Body> {
-    let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    let content_type = match file.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+/// A data file for scripts, trajectories or cassettes. The content type follows the extension; stdin and
+/// unknown extensions go out as `text/plain`, which the server sniffs (JSON, JSONL or YAML).
+fn data_body(file: &Path) -> Result<Body> {
+    let bytes = read_input(file)?;
+    let content_type = match ext_of(file).as_deref() {
         Some("jsonl" | "ndjson") => "application/x-ndjson",
         Some("yaml" | "yml") => "application/yaml",
-        _ => "application/json",
+        Some("json") => "application/json",
+        _ => "text/plain",
     };
     Ok(Body { bytes, content_type })
+}
+
+/// A policy registration: a module becomes `{name, source, runtime?}`, anything else is sent as it is.
+fn policy_body(file: &Path, name: &Option<String>, runtime: &Option<String>) -> Result<Body> {
+    let stdin = file == Path::new("-");
+    let module = match ext_of(file).as_deref() {
+        Some("js" | "mjs" | "cjs") => true,
+        _ => stdin && name.is_some(),
+    };
+    if !module {
+        if name.is_some() || runtime.is_some() {
+            return Err("--name and --runtime apply to a module file (.js, .mjs, .cjs) or to stdin with --name".into());
+        }
+        return data_body(file);
+    }
+    let name = match name {
+        Some(n) => n.clone(),
+        None => file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("cannot derive a policy name from {}", file.display()))?
+            .to_owned(),
+    };
+    let source = String::from_utf8(read_input(file)?).map_err(|_| "a policy module must be UTF-8".to_owned())?;
+    let mut spec = json!({ "name": name, "source": source });
+    if let Some(r) = runtime {
+        spec["runtime"] = json!(r);
+    }
+    Ok(spec.into())
+}
+
+fn enc(name: &str) -> percent_encoding::PercentEncode<'_> {
+    percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC)
 }
 
 fn requests_query(r: &Requests) -> String {
@@ -347,8 +447,8 @@ fn plan(command: &Command) -> Result<Call> {
         ),
         Command::Cassettes(c) => match c {
             Cassettes::List => ("GET", "/_fakellm/cassettes".into(), None),
-            Cassettes::Put { file } => ("PUT", "/_fakellm/cassettes".into(), Some(cassette_body(file)?)),
-            Cassettes::Add { file } => ("POST", "/_fakellm/cassettes".into(), Some(cassette_body(file)?)),
+            Cassettes::Put { file } => ("PUT", "/_fakellm/cassettes".into(), Some(data_body(file)?)),
+            Cassettes::Add { file } => ("POST", "/_fakellm/cassettes".into(), Some(data_body(file)?)),
             Cassettes::Get { name, jsonl } => (
                 "GET",
                 format!(
@@ -367,6 +467,26 @@ fn plan(command: &Command) -> Result<Call> {
                 None,
             ),
             Cassettes::Clear => ("DELETE", "/_fakellm/cassettes".into(), None),
+        },
+        Command::Trajectories(t) => match t {
+            Trajectories::List => ("GET", "/_fakellm/trajectories".into(), None),
+            Trajectories::Put { file } => ("PUT", "/_fakellm/trajectories".into(), Some(data_body(file)?)),
+            Trajectories::Add { file } => ("POST", "/_fakellm/trajectories".into(), Some(data_body(file)?)),
+            Trajectories::Get { name, jsonl } => (
+                "GET",
+                format!("/_fakellm/trajectories/{}{}", enc(name), if *jsonl { "?format=jsonl" } else { "" }),
+                None,
+            ),
+            Trajectories::Delete { name } => ("DELETE", format!("/_fakellm/trajectories/{}", enc(name)), None),
+            Trajectories::Clear => ("DELETE", "/_fakellm/trajectories".into(), None),
+        },
+        Command::Policies(p) => match p {
+            Policies::List => ("GET", "/_fakellm/policies".into(), None),
+            Policies::Put { file, name, runtime } => ("PUT", "/_fakellm/policies".into(), Some(policy_body(file, name, runtime)?)),
+            Policies::Add { file, name, runtime } => ("POST", "/_fakellm/policies".into(), Some(policy_body(file, name, runtime)?)),
+            Policies::Get { name } => ("GET", format!("/_fakellm/policies/{}", enc(name)), None),
+            Policies::Delete { name } => ("DELETE", format!("/_fakellm/policies/{}", enc(name)), None),
+            Policies::Clear => ("DELETE", "/_fakellm/policies".into(), None),
         },
         Command::Snapshot(s) => match s {
             Snapshot::Create { name } => ("POST", "/_fakellm/snapshots".into(), Some(json!({ "name": name }).into())),
@@ -393,9 +513,9 @@ fn plan(command: &Command) -> Result<Call> {
             Scripts::Put { file, keep_hits } => (
                 "PUT",
                 format!("/_fakellm/scripts{}", if *keep_hits { "?keep_hits=true" } else { "" }),
-                Some(script_body(file)?),
+                Some(data_body(file)?),
             ),
-            Scripts::Add { file } => ("POST", "/_fakellm/scripts".into(), Some(script_body(file)?)),
+            Scripts::Add { file } => ("POST", "/_fakellm/scripts".into(), Some(data_body(file)?)),
             Scripts::Clear => ("DELETE", "/_fakellm/scripts".into(), None),
         },
         Command::Clock(c) => match c {
@@ -495,6 +615,54 @@ fn print_human(command: &Command, v: &Value) {
             _ => println!("ok"),
         },
         Command::Scripts(Scripts::Clear) => println!("cleared"),
+        Command::Trajectories(t) => match t {
+            Trajectories::List => {
+                for t in v["trajectories"].as_array().into_iter().flatten() {
+                    println!(
+                        "{:<24} {:>4} steps  {:>4} hits  cursor={} on_divergence={}",
+                        text(t, "name"),
+                        t["steps"],
+                        t["hits"],
+                        text(t, "cursor"),
+                        text(t, "on_divergence"),
+                    );
+                }
+                if v["trajectories"].as_array().is_none_or(Vec::is_empty) {
+                    println!("no trajectories");
+                }
+            }
+            Trajectories::Put { .. } | Trajectories::Add { .. } => match (v["added"].as_u64(), v["count"].as_u64()) {
+                (Some(n), Some(total)) => println!("{n} trajectories loaded ({total} total)"),
+                _ => println!("ok"),
+            },
+            Trajectories::Get { jsonl: true, .. } => print!("{}", v.as_str().unwrap_or_default()),
+            Trajectories::Get { .. } => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
+            Trajectories::Delete { .. } => println!("deleted"),
+            Trajectories::Clear => println!("cleared"),
+        },
+        Command::Policies(p) => match p {
+            Policies::List => {
+                for p in v["policies"].as_array().into_iter().flatten() {
+                    println!(
+                        "{:<24} {:<6} {:>5} hits  {}",
+                        text(p, "name"),
+                        text(p, "runtime"),
+                        p["hits"],
+                        if p["running"] == true { "running" } else { "idle" },
+                    );
+                }
+                if v["policies"].as_array().is_none_or(Vec::is_empty) {
+                    println!("no policies");
+                }
+            }
+            Policies::Put { .. } | Policies::Add { .. } => match (v["added"].as_u64(), v["count"].as_u64()) {
+                (Some(n), Some(total)) => println!("{n} policies loaded ({total} total)"),
+                _ => println!("ok"),
+            },
+            Policies::Get { .. } => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
+            Policies::Delete { .. } => println!("deleted"),
+            Policies::Clear => println!("cleared"),
+        },
         Command::Cassettes(c) => match c {
             Cassettes::List => {
                 for c in v["cassettes"].as_array().into_iter().flatten() {
@@ -898,7 +1066,9 @@ mod tests {
         let mut cmd = Cli::command();
         let help = cmd.render_long_help().to_string();
         assert!(help.contains("fakellm import") && help.contains("cassettes put"), "{help}");
-        assert!(help.contains("cassettes") && help.contains("snapshot"), "{help}");
+        for word in ["scripts", "trajectories", "policies", "cassettes", "snapshot"] {
+            assert!(help.contains(word), "{word}: {help}");
+        }
     }
 
     #[test]
@@ -932,6 +1102,49 @@ mod tests {
         assert_eq!((m, p.as_str(), b.is_none()), ("DELETE", "/_fakellm/snapshots/seeded", true));
         assert_eq!(plan_of(&["snapshot", "list"]).0, "GET");
         assert!(plan_of(&["reset", "--drop-snapshots"]).1.ends_with("&snapshots=true"));
+    }
+
+    #[test]
+    fn trajectories_and_policies() {
+        let dir = std::env::temp_dir().join(format!("fakellm-ctl-tp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("t.yaml");
+        std::fs::write(&t, "name: a\nsteps: []\n").unwrap();
+        let (m, p, b) = plan_of(&["trajectories", "put", t.to_str().unwrap()]);
+        assert_eq!(
+            (m, p.as_str(), b.unwrap().content_type),
+            ("PUT", "/_fakellm/trajectories", "application/yaml")
+        );
+        assert_eq!(plan_of(&["trajectory", "add", t.to_str().unwrap()]).0, "POST");
+        assert_eq!(
+            plan_of(&["trajectories", "get", "a b", "--jsonl"]).1,
+            "/_fakellm/trajectories/a%20b?format=jsonl"
+        );
+        assert_eq!(plan_of(&["trajectories", "delete", "a"]).0, "DELETE");
+        assert_eq!(plan_of(&["trajectories", "clear"]).1, "/_fakellm/trajectories");
+
+        let js = dir.join("my-policy.mjs");
+        std::fs::write(&js, "export default () => null;\n").unwrap();
+        let (m, p, b) = plan_of(&["policies", "put", js.to_str().unwrap(), "--runtime", "node"]);
+        assert_eq!((m, p.as_str()), ("PUT", "/_fakellm/policies"));
+        let body: Value = serde_json::from_slice(&b.unwrap().bytes).unwrap();
+        assert_eq!(
+            body,
+            json!({"name": "my-policy", "source": "export default () => null;\n", "runtime": "node"})
+        );
+        let (_, _, b) = plan_of(&["policies", "add", js.to_str().unwrap(), "--name", "other"]);
+        let body: Value = serde_json::from_slice(&b.unwrap().bytes).unwrap();
+        assert_eq!(body["name"], "other");
+        let spec = dir.join("p.json");
+        std::fs::write(&spec, r#"{"name":"x","source":"s"}"#).unwrap();
+        let (_, _, b) = plan_of(&["policies", "put", spec.to_str().unwrap()]);
+        assert_eq!(b.unwrap().bytes, br#"{"name":"x","source":"s"}"#);
+        let cli = Cli::try_parse_from(["ctl", "policies", "put", spec.to_str().unwrap(), "--name", "n"]).unwrap();
+        assert!(plan(&cli.ctl.command).is_err());
+        assert_eq!(plan_of(&["policies", "get", "p"]).1, "/_fakellm/policies/p");
+        assert_eq!(plan_of(&["policies", "delete", "p"]).0, "DELETE");
+        assert_eq!(plan_of(&["policies", "clear"]).1, "/_fakellm/policies");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

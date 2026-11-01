@@ -290,16 +290,32 @@ test('trajectories: put/add/list/clear and replay through a rule', () =>
     assert.equal(s.trajectories.list().length, 0)
   }))
 
+test('policies: put/add return promises and do not block the JS thread', () =>
+  withServer(undefined, async (s) => {
+    let ticks = 0
+    const timer = setInterval(() => ticks++, 5)
+    try {
+      const pending = s.policies.put([{ name: 'slow', source: policySource, runtime: 'node' }])
+      assert.ok(pending instanceof Promise)
+      // Control calls from the JS thread stay usable while the subprocess loads.
+      assert.equal(s.status().version.length > 0, true)
+      assert.deepEqual(await pending, { added: 1, count: 1 })
+      assert.ok(ticks >= 0)
+    } finally {
+      clearInterval(timer)
+    }
+  }))
+
 test('policies: put/add/list/clear and a load error', () =>
   withServer({ scripts: [{ reply: { policy: 'p1' } }] }, async (s) => {
-    assert.deepEqual(s.policies.put([{ name: 'p1', source: policySource, runtime: 'node' }]), { added: 1, count: 1 })
+    assert.deepEqual(await s.policies.put([{ name: 'p1', source: policySource, runtime: 'node' }]), { added: 1, count: 1 })
     const r = await openai(s).chat.completions.create({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
     assert.equal(r.choices[0].message.content, 'from policy')
     const [info] = s.policies.list()
     assert.equal(info.runtime, 'node')
     assert.equal(info.hits, 1)
-    assert.equal(s.policies.add([{ name: 'p2', source: policySource, runtime: 'node' }]).count, 2)
-    assert.throws(() => s.policies.put([{ name: 'bad', source: 'export default 1 +', runtime: 'node' }]))
+    assert.equal((await s.policies.add([{ name: 'p2', source: policySource, runtime: 'node' }])).count, 2)
+    await assert.rejects(s.policies.put([{ name: 'bad', source: 'export default 1 +', runtime: 'node' }]))
     assert.equal(s.policies.list().length, 2)
     s.policies.clear()
     assert.equal(s.policies.list().length, 0)

@@ -281,6 +281,10 @@ export async function start(opts: StartOptions = {}): Promise<FakeLLM> {
   if (opts.requestLogCapacity !== undefined) args.push('--request-log-capacity', String(opts.requestLogCapacity));
   if (opts.redactAuth) args.push('--redact-auth');
   if (opts.policyRuntime) args.push('--policy-runtime', opts.policyRuntime);
+  if (opts.policyTimeoutMs !== undefined) args.push('--policy-timeout-ms', String(opts.policyTimeoutMs));
+  if (opts.maxSnapshots !== undefined) args.push('--max-snapshots', String(opts.maxSnapshots));
+  if (opts.recordErrors) args.push('--record-errors');
+  if (opts.upstreamTimeout !== undefined) args.push('--upstream-timeout', String(opts.upstreamTimeout));
   if (opts.pathPrefix) args.push('--path-prefix', opts.pathPrefix);
   if (typeof opts.scripts === 'string') {
     args.push('--scripts', opts.scripts);
@@ -301,11 +305,14 @@ export async function start(opts: StartOptions = {}): Promise<FakeLLM> {
   if (opts.upstream !== undefined) args.push('--upstream', opts.upstream);
   if (opts.upstreamApiKey !== undefined) args.push('--upstream-api-key', opts.upstreamApiKey);
   if (opts.record !== undefined) args.push('--record', opts.record);
+  for (const re of opts.recordRedact ?? []) args.push('--record-redact', re);
+  for (const f of opts.trajectoryFiles ?? []) args.push('--trajectory', f);
+  for (const f of opts.policyFiles ?? []) args.push('--policy', f);
   if (opts.watch === false) args.push('--no-watch');
   args.push(...(opts.args ?? []));
 
   const { bin, how } = resolveBin(opts);
-  const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, ...opts.env } });
+  const child = spawn(bin, args, { stdio: ['ignore', 'pipe', opts.stderr ?? 'inherit'], env: { ...process.env, ...opts.env } });
   const outcome = await ready(child, opts.readyTimeoutMs ?? 10_000);
   if (outcome.kind === 'ok') {
     const srv = new FakeLLM(reachable(outcome.url), child, bin, tmp);

@@ -55,15 +55,18 @@
 | `stream` | 布尔 | `true` 只匹配流式请求，`false` 只匹配非流式 |
 | `turn` | 整数 | 请求里已有多少条 assistant 消息；第一次请求是 `0` |
 | `any` | 布尔 | 显式的“全部匹配”，只为可读，`{}` 等价 |
-| `protocol` | 字符串 | 只匹配某个协议：`openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages`。写别的值是 400 |
+| `protocol` | 字符串 | 只匹配某个协议：`openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages`、`custom`（自定义端点，需要和 `path` / `reply.body` 一起写才有意义）。写别的值是 400 |
 | `probability` | 数字 | 0 到 1。其他条件都满足后，以这个概率命中。不在范围内（包括 NaN）是 400 |
 | `every_nth` | 整数 | 至少为 1。其他条件都满足的请求里，每第 N 个命中：`every_nth: 3` 命中第 3、6、9 个 |
+| `after` | 规则名 | 序列匹配：名字为此值的规则至少回答过 `after_count` 次（缺省 1）之后，这条规则才可能命中。次数数的是整个服务里该规则的 `hits`，`reset` 或替换剧本后清零。整组规则里必须有这个名字，否则是 400（`names no rule`）；写自己的名字、几条规则互相引用成环（A after B、B after A，谁也无法开始）、`after_count` 没有 `after` 或为 0 也都是 400。`keep_hits=true` 替换时，计数按规则名沿用（没有名字的规则按同一位置沿用），所以调整顺序或插入规则不会让计数错位 |
+| `after_count` | 整数 | 至少为 1，配合 `after`：被引用规则的最少命中次数 |
 | `path` | glob | 自定义端点规则，见[自定义端点](#自定义端点)：匹配请求路径（去掉网关前缀之后），`*` 任意串、`?` 一个字符。必须和 `reply.body` 一起写 |
 
 细节：
 
 - **文本**：消息里 `text` 类型的 part 用换行连在一起；图片、音频等 part 不参与。字符串 content 就是它自己。
-- **正则**：Rust `regex` 语法，不是 PCRE（没有环视和反向引用）。写法有三种：`"pattern"`（子串搜索，不要求整串匹配，要整串自己写 `^...$`）、`"/pattern/"`、`"/pattern/i"`（忽略大小写）。YAML 里含 `:`、`#`、`{` 的要加引号。不合法的正则在注册时报错并指出规则序号和字段。
+- **序列匹配（`after`）**：不靠规则顺序和 `times: 1` 区分“先到的”和“后到的”请求。例如 paseo 里 guardian 请求先于主请求：`[{name: guardian, match: {last_user: "guard"}, reply: {text: "ok"}, times: 1}, {name: main, match: {after: guardian, last_user: "work"}, reply: {text: "done"}}]`，guardian 没答过之前 `main` 不会命中，调换 codex 发请求的顺序也不会错位。门槛只看被引用规则的命中数，所以被引用的规则最好有 `name` 且不是 `times: 0` 之类永远不会命中的规则。
+- **正则**：先用 Rust `regex`（快）；写了它不支持的语法（环视 `(?=…)` `(?!…)` `(?<=…)` `(?<!…)`、反向引用 `\1`）时自动改用 `fancy-regex`，所以 `"foo(?!bar)"` 可以直接写。回溯超过上限的匹配按不匹配处理。写法有三种：`"pattern"`（子串搜索，不要求整串匹配，要整串自己写 `^...$`）、`"/pattern/"`、`"/pattern/i"`（忽略大小写）。YAML 里含 `:`、`#`、`{` 的要加引号。不合法的正则在注册时报错并指出规则序号和字段。
 - **`last_tool_result` 里的函数名**：通过 tool 消息的 `tool_call_id` 找到前面 assistant 消息里同 id 的调用，取它的函数名；找不到时才退而用 tool 消息自己的 `name`。所以客户端必须把 assistant 的 `tool_calls` 带回来（所有 SDK 都会）。名字是精确匹配。
 - **tool 结果的判定**：看“最后一条 assistant 消息之后”的所有 tool 结果，不要求它们是整个对话的最后几条。Claude Code 会把 `tool_result` 块和一段附加文本放进同一个 user 消息，fakellm 把它拆成 tool 消息加 user 消息，`has_tool_result` / `last_tool_result` 仍然命中。Responses 里 `function_call_output` 和 `custom_tool_call_output` 也算，Anthropic 里 `tool_result` 块算，`is_error: true` 的也算（想区分就用 `tool_result_contains` 匹配错误文本）。
 - **`has_tool_result: false`** 不仅匹配“第一次请求”，还匹配所有不以 tool 消息结尾的请求（例如用户追问）。想只匹配第一次请求，用 `turn: 0`。
@@ -101,7 +104,7 @@
 | `reasoning` | 字符串 | 推理文本（流式在正文之前）。Chat 里是 `reasoning_content`；Anthropic 里是 `thinking` 块；Responses 里是 `reasoning` 项的 `summary_text`。不受 `max_tokens` 约束，计入 `reasoning_tokens` |
 | `reasoning_opaque` | 字符串 | 跟 `reasoning` 一起发的不透明串：Anthropic `thinking` 块的 `signature`，Responses `reasoning` 项的 `encrypted_content`（请求的 `include` 里有 `reasoning.encrypted_content` 时才发）。不写则由请求派生一个确定的值。Chat 里没有对应物，被忽略 |
 | `hang` | 布尔 | `true`：收到请求后不回答，一直挂到客户端放弃。见[挂起](#挂起) |
-| `hang_ms` | 整数 | 挂这么久（服务端时钟，毫秒）再按这条规则的其余部分回答。隐含 `hang` |
+| `hang_ms` | 整数 | 挂这么久（服务端时钟，毫秒）再按这条规则的其余部分回答。隐含 `hang`。不能和 `delay_ms` / `stream.ttft_ms` 同时写：前者连响应头都不发，后者先发响应头再延迟首字节，同时写注册时 400 |
 | `usage` | 对象 | 覆盖 tokenizer 的计数，只覆盖写了的字段，其余照常计算。见下 |
 | `error` | 对象 | 见下 |
 | `finish_reason` | `stop` / `length` / `tool_calls` / `content_filter` | 覆盖自动推断的结束原因。默认：被 `max_tokens` 截断为 `length`，有工具调用为 `tool_calls`，否则 `stop` |
@@ -145,7 +148,9 @@
 
 ### Usage
 
-`usage` 的字段同时接受 OpenAI 和 Anthropic 的写法：`prompt_tokens` / `input_tokens`、`completion_tokens` / `output_tokens`（含推理）、`cached_tokens`（`cache_read_tokens`）、`reasoning_tokens`、`cache_creation_tokens`（`cache_creation_input_tokens`）。写了的字段原样出现在响应的 usage 里（流式也是），没写的照常用 tokenizer 计算（Anthropic 协议下 `input_tokens` 同样原样输出：规则里写 `input_tokens: 20236` 又写 `cached_tokens: 5`，响应里是 `input_tokens: 20236`、`cache_read_input_tokens: 5`，请求日志里的 `prompt_tokens` 是 20241。真实 API 的 `input_tokens` 不含缓存读写、`count_tokens` 返回总数；没有写 `input_tokens` 的规则时，fakellm 按真实语义由 tokenizer 总数扣减缓存得出。`count_tokens` 返回规则里写的值）；`completion_tokens` 没写时，会用你给的 `reasoning_tokens` 重新累加。
+`usage` 的字段同时接受 OpenAI 和 Anthropic 的写法：`prompt_tokens` / `input_tokens`、`completion_tokens` / `output_tokens`（含推理）、`cached_tokens`（`cache_read_tokens`）、`reasoning_tokens`、`cache_creation_tokens`（`cache_creation_input_tokens`）。写了的字段原样出现在响应的 usage 里（流式也是），没写的照常用 tokenizer 计算（Anthropic 协议下 `input_tokens` 同样原样输出：规则里写 `input_tokens: 20236` 又写 `cached_tokens: 5`，响应里是 `input_tokens: 20236`、`cache_read_input_tokens: 5`，请求日志里的 `prompt_tokens` 是 20241。真实 API 的 `input_tokens` 不含缓存读写、`count_tokens` 返回总数；没有写 `input_tokens` 的规则时，fakellm 按真实语义由 tokenizer 总数扣减缓存得出。规则里写的 `input_tokens` **永远不会被 `cached_tokens` 扣减**，`cache_read_input_tokens` / `cache_creation_input_tokens` 也原样输出；`count_tokens` 返回规则里写的值）；
+
+Anthropic 流式里 `input_tokens` 出现在哪个事件由 `input_tokens_in` 控制：`start`（默认）放在 `message_start` 的 usage（连同两个缓存字段），`message_delta` 只带 `output_tokens`；`delta` 反过来，`message_start` 的 usage 只有 `output_tokens: 1`，`input_tokens` 和缓存字段在 `message_delta`。同步响应不受影响；`completion_tokens` 没写时，会用你给的 `reasoning_tokens` 重新累加。
 
 `POST /v1/messages/count_tokens` 也会查剧本：第一条匹配且写了 `usage.input_tokens` 的规则，它的值就是返回的 `input_tokens`，并**算一次命中**（受 `times` 约束）；没有这样的规则时返回 tokenizer 的计数。没写 `input_tokens` 的规则在 count_tokens 里被整条跳过，不会被消耗。
 
@@ -242,6 +247,34 @@ Responses 的 `response.error.code` 由规则决定：写了 `code` 就用它；
 - **只想让它失败几次**：加 `times: N`，或者用 `every_nth` / `probability` 做间歇故障；再用 `ctl requests list --rule X --count` 断言重试次数。
 - **混合**：同一个规则列表里按 `protocol` 区分不同协议的错误体（见下面的完整例子），一份剧本可以同时给三种客户端用。
 
+### 官方 SDK 实测
+
+下面是 `sdk/node/faults.test.mjs`用官方 SDK 逐类跑出来的结果，默认重试设置（openai / Anthropic 的 `maxRetries` 和 ai-sdk 的 `maxRetries` 都是 2，所以“3”表示发了 3 个请求）。格子里是 `错误类 状态码 / 请求数`；OpenAI 协议的规则用 openai 和 ai-sdk（`@ai-sdk/openai` 的 `.chat`），Anthropic 协议的规则用 `@anthropic-ai/sdk` 和 `@ai-sdk/anthropic`。ai-sdk 重试用尽后抛 `RetryError`（`lastError` 是最后一个 `APICallError`，`errors` 里有每次的错误），表里写成 `RetryError(状态码)`。
+
+| 类别（规则） | `openai` | `@anthropic-ai/sdk` | ai-sdk + OpenAI | ai-sdk + Anthropic |
+|---|---|---|---|---|
+| `auth` 401 | `AuthenticationError` 401 / 1 | `AuthenticationError` 401 / 1 | `APICallError` 401 / 1 | `APICallError` 401 / 1 |
+| `quota`（OpenAI 429 `insufficient_quota`；Anthropic 400） | `RateLimitError` 429 / **3**，`code` / `type` 是 `insufficient_quota` | `BadRequestError` 400 / 1 | `RetryError(429)` / **3** | `APICallError` 400 / 1 |
+| `rate_limited` 429 | `RateLimitError` / 3 | `RateLimitError` / 3 | `RetryError(429)` / 3 | `RetryError(429)` / 3 |
+| `rate_limited` + `x-should-retry: false` | `RateLimitError` / **1** | `RateLimitError` / **1** | `RetryError(429)` / **3**（不读这个头） | `RetryError(429)` / **3** |
+| `billing`（OpenAI 400；Anthropic 402） | `BadRequestError` 400 / 1，`code: billing_hard_limit_reached` | `APIError` 402 / 1（402 没有专门的类） | `APICallError` 400 / 1 | `APICallError` 402 / 1 |
+| `model_unavailable` 404 | `NotFoundError` / 1，`code: model_not_found` | `NotFoundError` / 1 | `APICallError` 404 / 1 | `APICallError` 404 / 1 |
+| `input_too_large` 400 | `BadRequestError` / 1，`code: context_length_exceeded`、`param: messages` | `BadRequestError` / 1 | `APICallError` 400 / 1 | `APICallError` 400 / 1 |
+| `overloaded`（OpenAI 503；Anthropic 529） | `InternalServerError` 503 / 3 | `InternalServerError` 529 / 3 | `RetryError(503)` / 3 | `RetryError(529)` / 3 |
+| `provider` 500 | `InternalServerError` / 3 | `InternalServerError` / 3 | `RetryError(500)` / 3 | `RetryError(500)` / 3 |
+| 流中途 `cut_after_chunks`（流干净结束，无结尾事件） | 迭代正常结束，只收到前几块，**没有报错** | `stream()` 的 `finalMessage()` 抛 `AnthropicError: stream ended without producing a Message`；直接迭代事件则正常结束 | `streamText` 正常结束，文本被截短，没有 `error` 部分 | 同左 |
+| 流中途 RST `reset_after_chunks` / `reset` | `TypeError: terminated`，`cause.code` 是 `ECONNRESET`（Bun 直接是 `ECONNRESET` 错误），不重试 | `AnthropicError: terminated`（`finalMessage()`），不重试 | `streamText` 的错误（`Failed to process successful response` 或连接错误），不重试 | 同左 |
+| 流内错误 `in_stream: true` | `APIError`，**没有 `status`**，有 `type`（如 `server_error`），不重试 | `APIError`，没有 `status`，`type: overloaded_error`，不重试 | `error` 部分是 `RetryError`，重试 3 次（流还没产出内容时 ai-sdk 把它当 HTTP 错误处理） | `error` 部分是 `AI_StreamProviderError`（`type`、`statusCode: 529`、`isRetryable: true`），**不重试**，1 次 |
+| 挂起 `hang_ms` + 冻结时钟 | 请求一直不返回，`ctl clock advance` 后正常返回 | 同左 | 同左 | 同左 |
+
+SDK 差异里值得记住的几点：
+
+- **429 `insufficient_quota` 会被 openai 和 ai-sdk 重试**，它们只看状态码；想让调用方“立刻失败”，用 `x-should-retry: "false"`（openai / Anthropic SDK 认；ai-sdk 不认，它只按 408 / 409 / 429 / 5xx 判断，所以 ai-sdk 下只能用 `times: 1` 控制次数或设 `maxRetries: 0`）。
+- `x-should-retry: "true"` 能让 openai / Anthropic SDK 重试 400，`"false"` 能让它们不重试 500；ai-sdk 两个方向都忽略。
+- `retry-after-ms`（以及 `retry-after`，60 秒以内）决定两个官方 SDK 的等待；没有这个头时它们按 0.5 秒起步的指数退避等，测试里的重试用 `headers: { retry-after-ms: "5" }` 来加速。
+- `@anthropic-ai/sdk` 的错误 `message` 是 `状态码 + 整个错误体 JSON`（如 `429 {"type":"error","error":{...}}`），不是只有文案；要看 `type` 用 `e.error.error.type`（HTTP 错误）或 `e.type`（流内 `error` 事件）。
+- 不带 `in_stream` 的 HTTP 错误在流式请求上也是普通 HTTP 错误，各 SDK 会照常重试；`in_stream` 之后的错误不会被 openai / Anthropic SDK 重试。
+
 ### Responses（codex）的限制
 
 codex 对 HTTP 错误体不做细分类：**400 的 body 一律是不重试的 `InvalidRequest`**，所以 `context_length_exceeded`、`insufficient_quota` 这类要被 codex 认出来的错误，**必须作为流内的 `response.failed` 注入**，即错误规则写 `in_stream: true`，并且请求是流式的（codex 总是流式）。codex 对 `response.error.code` 的反应（来自对 codex 源码的调研，见 [research.md](research.md)）：
@@ -258,7 +291,19 @@ codex 对 HTTP 错误体不做细分类：**400 的 body 一律是不重试的 `
 HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}}` 是 usage limit（codex 会读 `x-codex-active-limit` 头，用 `error.headers` 加）；`insufficient_quota` 是额度错误；其他 429 是 RetryLimit；5xx 重试；401、404 也会被当成可重试的意外状态码。
 `response.incomplete` 的 `content_filter` 原因会被 codex 重试，`max_output_tokens` 是硬错误；对应 `finish_reason: content_filter` 和 `finish_reason: length`。
 
-以上这些除了 `e2e/codex.sh` 的两个正常场景和 `e2e/codex-faults.sh`（真实 codex 0.162.1）验证的 `context_length_exceeded` 外，没有用真实 codex 逐项验证过：`in_stream: true` 时 codex 打印 “Codex ran out of room in the model's context window...” 并退出码 1，不重试（只有 1 个请求）；同一条规则不加 `in_stream`（HTTP 400）时，codex 原样打印错误体 JSON，没有这句友好提示。`response.failed` 的形状有 `tests/responses.rs` 覆盖。
+上表现已用真实 codex 0.162.1 验证（`e2e/codex-faults.sh`）：`context_length_exceeded`、`insufficient_quota`、`rate_limit_exceeded`（带 `error.headers`，`stream_max_retries = 2` 时重试）、`server_is_overloaded`（无 `retry_after` 不重试，有则重试）、`response.incomplete` 的 `max_output_tokens`、`apply_patch`、挂起；每一项的输出和请求数见 [wire.md](wire.md#codexopenai-codex-cli)。`in_stream: true` 的 `context_length_exceeded` 打印 “Codex ran out of room in the model's context window...” 并退出码 1，不重试；同一条规则不加 `in_stream`（HTTP 400）时，codex 原样打印错误体 JSON，没有这句友好提示。`response.failed` 的形状有 `tests/responses.rs` 覆盖。
+
+### RST 经过 CONNECT 代理
+
+`reset_after_chunks` / `reset` 的 RST 是 fakellm 到它的直接对端的 TCP RST。中间隔着 HTTP CONNECT 代理时，客户端看到什么取决于代理怎么处理“上游连接被重置”，fakellm 无法控制。`e2e/connect-rst.sh`（`e2e/connect-proxy.mjs` 加一个裸 socket 客户端）实测：
+
+| 路径 | 客户端看到 |
+|---|---|
+| 直连 fakellm | `ECONNRESET`，没有结尾 chunk |
+| 经过 `socket.pipe()` 式的代理，上游出错时 `client.destroy()`（最常见的写法） | **干净的 EOF（FIN）**，没有结尾 chunk；客户端的 HTTP 层报“流提前结束”（pi-ai 等看到的 `terminated`），区分不了是 RST 还是正常关闭 |
+| 同样的代理，但上游出错时 `client.resetAndDestroy()` | `ECONNRESET`，和直连一样 |
+
+所以：想在代理后面测“连接被重置”，要么让代理转发 RST，要么接受客户端看到的是“body 没有结尾 chunk 的 EOF”；两种情况下 chunked 响应都是不完整的，客户端不会把它当成功。需要区分 RST 和 FIN 的测试请直连 fakellm。
 
 ## 自定义端点
 
@@ -268,6 +313,8 @@ HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}
 - `reply.body` 是原样返回的 JSON；`reply.status`（默认 200）和 `reply.headers` 可选。`path` 和 `body` 必须成对出现，且这类回复不能再写 `text`、`tool_calls`、`error`、`trajectory`、`policy`、`reasoning`；`status` / `headers` 没有 `path` 是 400。
 - 用 `match.body`（正则，匹配原始请求正文）区分同一路径上的不同请求；`times`、`name`、`every_nth`、`probability` 照常生效，规则按顺序，第一条命中的回答。
 - 没有任何规则命中的未知路径仍是 404 `Invalid URL (POST /path)`。
+- 配置了 `--path-prefix` 时，匹配 `match.path` 之前先去掉这个前缀，所以 `/v1/systemone` 的规则同时回答 `/v1/systemone` 和 `/anthropic/v1/systemone`；其他前导路径段只在标准路由后缀前才会被去掉，自定义路径按字面匹配。请求日志保留完整路径。
+- 自定义端点**不经过 `--api-key` 校验**（校验在标准路由里），错误的密钥也会得到规则的回复；`tests/custom_protocols.rs` 把这个现状固定了下来。
 - 请求日志里 `protocol` 为 `"custom"`，`raw` 是原始正文，`rule` 和 `source` 是命中的规则，`reply.text` 是返回的 JSON 文本；`/_fakellm/requests?protocol=custom` 可以过滤。自定义请求不经过 cassette、上游和回退，不支持流式和 `delay_ms`。
 
 示例：xsai 的 decide 包 `POST /v1/systemone`（请求 `{model, state, questions}`，响应 `{answers, usage}`，格式见 consumers.md），按 `state` 区分两个用例：

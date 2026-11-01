@@ -17,6 +17,8 @@ JSON、YAML 或 JSONL（第一行是头，后面每行一个 exchange），扩�
   "match_tool_schemas": false,
   "model_glob": "*",
   "fuzzy": false,
+  "fuzzy_threshold": 0.6,
+  "sample": false,
   "once": false,
   "exchanges": [
     {"request": {"model": "gpt-4o", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]},
@@ -55,8 +57,13 @@ JSON、YAML 或 JSONL（第一行是头，后面每行一个 exchange），扩�
 ### 查找顺序
 
 1. 按注册顺序看每个 cassette：模型符合 `model_glob`，且有 key 相等的 exchange（`once` 的跳过已用掉的），第一个命中的 cassette 和 exchange 胜出。
-2. 没有精确命中时，再看 `fuzzy: true` 的 cassette：消息条数相同、最后一条用户文本相同，并且**最后一条消息也相同**；从末尾往前相等的消息越多得分越高，同分取靠前的。
-3. 都没有：走上游，或兜底，或 strict 的 400。没命中不是错误。
+2. 没有精确命中时，再看 `fuzzy: true` 的 cassette：把整段对话（所有消息的文本，经过同样的归一化，加上工具调用的名字和参数）切成小写的字母数字词集合，算与每个 exchange 的 Jaccard 相似度（交集除以并集）；最高的那个达到 `fuzzy_threshold`（0 到 1，默认 0.6）就用它，同分取靠前的，`once` 的跳过已用掉的。差一两个词的“近似提问”命中，换了话题的不会。
+3. 再没有，看 `sample: true` 的 cassette（语料抽样，见下）。
+4. 都没有：走上游，或兜底，或 strict 的 400。没命中不是错误。
+
+### 语料抽样：`sample`
+
+`sample: true` 的 cassette 在精确和 `fuzzy` 都没命中时，从自己的回复型 exchange（错误型跳过，`once` 的跳过已用掉的）里按**请求的 seed**（模型和消息内容的哈希）确定地挑一条：同一个请求永远得到同一条，不同请求散布在整个语料上。这是 `docs/design.md` 里“数据集回放”的第一点：导入一份对话数据集（`fakellm import`）后，任何提示都能得到语料里的真实回复，而不用提示完全一致。多个 `sample` cassette 时按注册顺序，第一个有可用回复的回答。导入用的 `fakellm import` 目前不会自动加这个标记，在文件头里写 `"sample": true` 即可。
 
 `once: true` 的 cassette 每个 exchange 只回放一次，同一个请求录了两次不同回复时，按录制顺序依次回放，用完后才落空。不加 `once` 则同一个 exchange 可以回答任意多次。
 回放按**请求的协议**和流式与否渲染，所以用 Chat 录的可以用 Responses 或 Anthropic 回放。请求日志里这类请求的 `source` 是 `{"kind":"cassette","name":"...","index":N}`，可以用 `?source=cassette` 过滤。
@@ -74,7 +81,7 @@ fakellm --upstream https://api.openai.com --upstream-api-key $OPENAI_API_KEY --r
 - `--record` 追加写已有文件，可以跨多次运行继续录；若上次中途被杀导致最后一行不完整，会先补一个换行再追加。
 - **默认不录** 401、403、408、409、429 和 5xx 的回答（仍然会转发给客户端）：它们与随后重试成功的请求 key 相同，录下来会在回放时盖住成功的那次。要录就加 `--record-errors`。
 - 上游响应体超过 64 MiB 时照常转发但不录；上游 5 分钟没有任何数据则断开并记为未录制。
-- 录制文件里不含凭证（请求头不录），但**请求和回复的内容原样保存**，别把含敏感内容的录制提交进仓库。详见下面的[脱敏](#脱敏)。
+- 录制文件里不含凭证（请求头不录）；**请求和回复的内容默认原样保存**，可以用 `--record-redact REGEX`（可重复）把匹配的片段抹掉，详见下面的[脱敏](#脱敏)。
 - 上游迟迟不发响应头时（非流式的长推理最典型）最多等 `--upstream-timeout` 秒（`FAKELLM_UPSTREAM_TIMEOUT`，默认 600，0 为不限），超时返回 502 `upstream_unreachable`。
 - 内存里的 `recording` 最多保留最近 10000 个 exchange（`--record` 文件不截断）。
 - 回环保护：转发带 `x-fakellm-hop`，上游指回自己或环状连接返回 508。
@@ -99,6 +106,19 @@ fakellm --port 4010 --cassette fixtures/fix-bug.jsonl --strict
 
 不加 `--upstream-api-key` 时 agent 自己的凭证原样转发，适合上游认的就是 agent 的密钥的情形。agent 的主请求之外还有标题生成之类的旁路请求，它们一并录进去，回放时因为内容相同同样命中；想把整段会话变成按步骤推进的轨迹，见[转成轨迹](#转成轨迹)。
 
+### 对真实上游的验证状态
+
+到目前为止，上游代理只在对着另一个 fakellm 时端到端测过（`tests/upstream.rs`）。对着真实 OpenAI、Anthropic 或 CLIProxyAPI 的验证**被外部条件挡住**：这台机器上没有任何上游凭证（环境里没有 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`，`127.0.0.1:8317` 没有 CLIProxyAPI 在监听），而 claude / codex 自带的登录态在用户的家目录配置里，e2e 脚本按约定不碰它。所以上面 CLIProxyAPI 的默认地址和密钥仍然只来自它的文档，没有实测。有凭证的人可以这样验证：
+
+```bash
+# 单次往返（OpenAI 兼容上游）；密钥走 FAKELLM_UPSTREAM_TEST_KEY，模型走 FAKELLM_UPSTREAM_TEST_MODEL
+FAKELLM_UPSTREAM_TEST=https://api.openai.com FAKELLM_UPSTREAM_TEST_KEY=sk-... \
+  cargo test --test upstream real_upstream_round_trip_when_configured -- --nocapture
+# 整段会话：按上面“用 CLIProxyAPI 当上游”的两步录制，再用 --cassette --strict 回放
+```
+
+没设 `FAKELLM_UPSTREAM_TEST` 时这个测试打印 `skip` 并通过（在这台机器上已确认）。
+
 ### 凭证怎么转发
 
 | `--upstream-api-key` | 客户端带了 | 上游收到 |
@@ -111,7 +131,7 @@ fakellm --port 4010 --cassette fixtures/fix-bug.jsonl --strict
 
 ### 脱敏
 
-录制只保存请求体和回复内容，不保存任何请求头。除此之外，请求体里**不认识的顶层字段**（IR 的 `extra`）如果名字里含 `api_key`、`apikey`、`authorization`、`token`、`secret` 或 `password`（不分大小写，`-` 当 `_`），值在录制里写成 `<redacted>`。匹配默认忽略 `extra.*`，所以这不影响回放。**消息文本、工具参数、工具结果不做脱敏**：如果 agent 把密钥读进了对话（`cat .env`），它就在录制文件里。录完检查一遍再入库，或者用 `normalize` 在比较时抹掉可变部分（那只影响匹配，不改文件）。
+录制只保存请求体和回复内容，不保存任何请求头。除此之外，请求体里**不认识的顶层字段**（IR 的 `extra`）如果名字里含 `api_key`、`apikey`、`authorization`、`token`、`secret` 或 `password`（不分大小写，`-` 当 `_`），值在录制里写成 `<redacted>`。匹配默认忽略 `extra.*`，所以这不影响回放。**消息文本、工具参数、工具结果默认不做脱敏**：如果 agent 把密钥读进了对话（`cat .env`），它就在录制文件里。要抹掉就加 `--record-redact REGEX`（可重复；`Config::record_redact`；语法同剧本的[正则](scripts.md#match)，支持 `/…/i` 和环视）：录制时对 request 和 outcome 里**所有字符串**（消息文本、推理、工具定义、工具调用的参数、工具结果、`extra`、回复文本）把每处匹配替换成 `<redacted>`，内存里的 `recording` 和 `--record` 文件都是替换后的；转发给客户端的回复不受影响。例如 `--record-redact 'sk-[A-Za-z0-9]{20,}' --record-redact '/password=\S+/i'`。替换会改变请求，所以回放时同样的请求（含原始密钥）不再精确命中，需要配合 `normalize` 或 `fuzzy`。脱敏失败时按“宁可多抹”处理：某个字符串上正则在运行时出错（环视写法触发回溯上限，如 `(a+)+\1b` 遇到很长的 `aaaa…`），这整个字符串被替换成 `<redacted>` 并打一条 `warn`；整个 exchange 无法脱敏（序列化往返失败）时不录制并打 `warn`。录完还是建议检查一遍再入库；`normalize` 只在比较时抹掉可变部分，不改文件。
 
 把录制文件用 `--cassette chats.jsonl` 加载就是回放。`--cassette` 的文件和 `--record` 是同一个文件时，这个文件不会被热加载（否则每录一条就会重置命中计数）。
 
@@ -141,7 +161,7 @@ fakellm cassette to-trajectory recorded.jsonl -o agent.jsonl --with-expect
 
 ## 快照
 
-`POST /_fakellm/snapshots` 把剧本（含命中计数）、轨迹进度、策略（含状态）、cassette（含已用标记和录制）、保存的 Responses 对象和时钟存下来，`POST /_fakellm/snapshots/{name}/restore` 原样放回，快照不会被消耗。请求日志、启动配置和其他快照不在其中。适合在测试之间使用，不要在有请求在飞时还原。名字是 1 到 64 个 `A-Za-z0-9._-` 字符，不给则是 `snapshot-N`。`fakellm ctl snapshot create|list|restore|delete`。
+`POST /_fakellm/snapshots` 把剧本（含命中计数）、轨迹进度、策略（含状态）、cassette（含已用标记和录制）、保存的 Responses 对象和时钟存下来，`POST /_fakellm/snapshots/{name}/restore` 原样放回，快照不会被消耗。请求日志、启动配置和其他快照不在其中。适合在测试之间使用，不要在有请求在飞时还原。名字是 1 到 64 个 `A-Za-z0-9._-` 字符，不给则是 `snapshot-N`；最多 100 个（`--max-snapshots`），超出是 409。`fakellm ctl snapshot create|list|restore|delete`。
 快照里的 cassette 是共享的，不会复制；每个快照仍然占用与其内容相当的内存，用完请删除（`reset?snapshots=true` 会删掉全部）。
 
 ## 热加载

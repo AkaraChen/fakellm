@@ -74,6 +74,9 @@ s, err := fakellm.Start(ctx, fakellm.Options{Bin: bin})
 | `Cassettes` | 启动后注册的 cassette：`Cassette`、`[]Cassette`，或 JSON / YAML / JSONL 字符串（`string` / `[]byte`） |
 | `Upstream`、`UpstreamAPIKey` | `--upstream`、`--upstream-api-key`：没有规则和 cassette 命中的请求转发给这个上游并录下来 |
 | `Record` | `--record`：把从上游录到的交换追加到这个 JSONL 文件，需要 `Upstream` |
+| `RecordRedact`、`RecordErrors` | `--record-redact`（正则，匹配到的录制文本换成 `<redacted>`）、`--record-errors`（也录上游的 401、429、5xx 等），需要 `Upstream` |
+| `UpstreamTimeoutSecs`、`PolicyTimeoutMs`、`MaxSnapshots` | `--upstream-timeout`、`--policy-timeout-ms`、`--max-snapshots`；0 为服务器默认 |
+| `TrajectoryFiles`、`PolicyFiles` | `--trajectory`、`--policy`：由二进制自己加载并监视的文件（`Watch` 为 false 时不监视） |
 | `Watch` | `*bool`；`fakellm.Ptr(false)` 传 `--no-watch`，不再监视 `Args` 里给的剧本、轨迹、策略和 cassette 文件；nil 为默认（监视） |
 | `Args` | 追加的命令行参数，如 `--ttft`、`--tokens-per-sec` |
 | `Env` | 追加的环境变量，`KEY=value` |

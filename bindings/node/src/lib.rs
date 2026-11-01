@@ -8,7 +8,7 @@
 mod control;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -39,14 +39,36 @@ pub struct StartOptions {
     pub upstream_api_key: Option<String>,
     /// Append every recorded exchange to this JSONL file. Needs `upstream`.
     pub record: Option<String>,
-    /// Re-read these files when they change and replace what they loaded. Default: nothing watched.
-    pub watch: Option<WatchOptions>,
+    /// Regexes: every match in the recorded texts (messages, tool arguments and results, replies) becomes
+    /// `<redacted>`. Needs `upstream`.
+    pub record_redact: Option<Vec<String>>,
+    /// Rules loaded from this JSON / YAML file at start; rules from `scripts` are appended. A reload of the
+    /// watched file replaces all rules with the file's.
+    pub scripts_file: Option<String>,
+    /// Trajectory files (JSON, YAML or JSONL) loaded at start, in order.
+    pub trajectory_files: Option<Vec<String>>,
+    /// Policy modules loaded at start; each is named after its file stem and uses `policyRuntime`.
+    pub policy_files: Option<Vec<String>>,
+    /// Cassette files (JSON, JSONL or YAML) loaded at start, in order.
+    pub cassette_files: Option<Vec<String>>,
+    /// Re-read files when they change and replace what they loaded. `true` or unset: every file given as
+    /// `scriptsFile`, `trajectoryFiles`, `policyFiles` or `cassetteFiles` is watched (as the CLI and the
+    /// JS SDK do); `false`: nothing; an object names the files to watch explicitly.
+    pub watch: Option<Either<bool, WatchOptions>>,
     /// Policies registered at start: an array of `{ name, source, runtime? }`, or a JSON / YAML string.
     /// A module that does not load rejects `start()`.
     pub policies: Option<serde_json::Value>,
     /// Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: whichever of
     /// tjs, node, bun is on PATH first.
     pub policy_runtime: Option<String>,
+    /// How long a policy may take to decide, in milliseconds on the host clock. Default 5000.
+    pub policy_timeout_ms: Option<u32>,
+    /// Most named snapshots held at once; the next `snapshots.create()` throws. Default 100.
+    pub max_snapshots: Option<u32>,
+    /// Also record the upstream's 401, 403, 408, 409, 429 and 5xx answers. Needs `upstream`.
+    pub record_errors: Option<bool>,
+    /// Seconds the upstream may take to send response headers; 0 waits without limit. Default 600.
+    pub upstream_timeout: Option<u32>,
     /// Also serve the API under this path prefix, e.g. `/anthropic`.
     pub path_prefix: Option<String>,
     /// Delay before the first token: milliseconds, or a string such as `"200ms"`. Default 0.
@@ -227,7 +249,7 @@ impl FakeLlmServer {
     pub fn stop<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
         let slot = self.server.clone();
         env.spawn_future(async move {
-            let server = slot.lock().map_err(poisoned)?.take();
+            let server = slot.write().map_err(poisoned)?.take();
             if let Some(server) = server {
                 server.shutdown().await;
             }
@@ -237,11 +259,14 @@ impl FakeLlmServer {
 }
 
 /// The server shared with the objects handed out by `scripts`, `requests` and so on; `None` once stopped.
-pub(crate) type Slot = Arc<Mutex<Option<fakellm::Server>>>;
+///
+/// A read lock is held while a server method runs; slow work on a worker thread (loading policies) takes a handle first and
+/// releases the lock, so the JS thread is never kept waiting behind a pending `stop()`.
+pub(crate) type Slot = Arc<RwLock<Option<fakellm::Server>>>;
 
 /// Runs `f` on the running server. Fails once the server is stopped.
 pub(crate) fn with_server<T>(slot: &Slot, f: impl FnOnce(&fakellm::Server) -> T) -> Result<T> {
-    let guard = slot.lock().map_err(poisoned)?;
+    let guard = slot.read().map_err(poisoned)?;
     match guard.as_ref() {
         Some(server) => Ok(f(server)),
         None => Err(Error::new(Status::GenericFailure, "server is stopped")),
@@ -278,35 +303,61 @@ pub async fn start(options: Option<StartOptions>) -> Result<FakeLlmServer> {
         config.request_log = o.request_log.unwrap_or(config.request_log);
         config.request_log_capacity = o.request_log_capacity.map_or(config.request_log_capacity, |n| n as usize);
         config.redact_auth = o.redact_auth.unwrap_or(config.redact_auth);
+        let files = control::load_files(
+            o.scripts_file.as_deref(),
+            o.trajectory_files.as_deref().unwrap_or_default(),
+            o.policy_files.as_deref().unwrap_or_default(),
+            o.cassette_files.as_deref().unwrap_or_default(),
+        )?;
+        config.scripts = files.scripts;
+        config.trajectories = files.trajectories;
+        config.policies = files.policies;
+        config.cassettes = files.cassettes;
         if let Some(v) = o.scripts {
-            config.scripts = control::rules(v)?;
+            config.scripts.extend(control::rules(v)?);
         }
         if let Some(v) = o.trajectories {
-            config.trajectories = control::trajectories(v)?;
+            config.trajectories.extend(control::trajectories(v)?);
         }
         if let Some(v) = o.policies {
-            config.policies = control::policies(v)?;
+            config.policies.extend(control::policies(v)?);
         }
         if let Some(r) = o.policy_runtime {
             config.policy_runtime = Some(r.parse().map_err(control_error)?);
         }
         if let Some(v) = o.cassettes {
-            config.cassettes = control::cassettes(v)?;
+            config.cassettes.extend(control::cassettes(v)?);
         }
         if let Some(u) = o.upstream {
             config.upstream = Some(u.parse().map_err(|e| control_error(format!("invalid upstream {u:?}: {e}")))?);
         }
         config.upstream_api_key = o.upstream_api_key.or(config.upstream_api_key);
         config.record = o.record.map(Into::into).or(config.record);
-        if let Some(w) = o.watch {
-            config.watch = Some(fakellm::WatchConfig {
+        config.record_redact = o.record_redact.unwrap_or(config.record_redact);
+        let strings = |v: Option<Vec<String>>| v.unwrap_or_default().into_iter().map(Into::into).collect::<Vec<_>>();
+        config.watch = match o.watch {
+            Some(Either::B(w)) => Some(fakellm::WatchConfig {
                 scripts: w.scripts.map(Into::into),
-                trajectories: w.trajectories.unwrap_or_default().into_iter().map(Into::into).collect(),
-                policies: w.policies.unwrap_or_default().into_iter().map(Into::into).collect(),
-                cassettes: w.cassettes.unwrap_or_default().into_iter().map(Into::into).collect(),
-            });
-        }
+                trajectories: strings(w.trajectories),
+                policies: strings(w.policies),
+                cassettes: strings(w.cassettes),
+            }),
+            Some(Either::A(false)) => None,
+            Some(Either::A(true)) | None => {
+                let w = fakellm::WatchConfig {
+                    scripts: o.scripts_file.map(Into::into),
+                    trajectories: strings(o.trajectory_files),
+                    policies: strings(o.policy_files),
+                    cassettes: strings(o.cassette_files),
+                };
+                (!w.is_empty()).then_some(w)
+            }
+        };
         config.path_prefix = o.path_prefix.or(config.path_prefix);
+        config.policy_timeout_ms = o.policy_timeout_ms.map_or(config.policy_timeout_ms, u64::from);
+        config.max_snapshots = o.max_snapshots.map_or(config.max_snapshots, |n| n as usize);
+        config.record_errors = o.record_errors.unwrap_or(config.record_errors);
+        config.upstream_timeout_secs = o.upstream_timeout.map_or(config.upstream_timeout_secs, u64::from);
         if let Some(t) = o.ttft {
             let n = nanos(t)?;
             if n < 0 {
@@ -346,6 +397,6 @@ pub async fn start(options: Option<StartOptions>) -> Result<FakeLlmServer> {
         base_url: server.base_url(),
         host: config.host,
         addr,
-        server: Arc::new(Mutex::new(Some(server))),
+        server: Arc::new(RwLock::new(Some(server))),
     })
 }

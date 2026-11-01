@@ -19,9 +19,28 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      - uses: astral-sh/setup-uv@v6 # tests/python_sdk.rs fails under CI=true without uv
+      # tests/node_sdk.rs fails (instead of skipping) under CI=true when these are missing
+      - run: npm ci && npm run build
+        working-directory: sdk/js
+      - run: npm ci
+        working-directory: sdk/node
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # The crate has cfg(unix) fallbacks (RST, signals); this only proves it compiles on the other hosts.
+  compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check
 
   node:
     runs-on: ubuntu-24.04
@@ -81,7 +100,7 @@ jobs:
         working-directory: bindings/node
       - run: bun run build:debug
         working-directory: bindings/node
-      - run: bun test __test__/openai.test.mjs
+      - run: bun test
         working-directory: bindings/node
 
   docker:
@@ -89,3 +108,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: ./e2e/docker.sh
+
+  python:
+    runs-on: ubuntu-24.04
+    env:
+      FAKELLM_BIN: ${{ github.workspace }}/target/debug/fakellm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: cargo build
+      - run: uv run --frozen pytest -q
+        working-directory: sdk/python

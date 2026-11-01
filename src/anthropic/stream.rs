@@ -6,11 +6,24 @@
 
 use serde_json::{Value, json};
 
-use crate::anthropic::messages::{Block, MessageMeta, blocks, input_tokens, stop_reason};
-use crate::ir::{ApiError, Reply, Request};
+use crate::anthropic::messages::{
+    Block, INFERENCE_GEO, MessageMeta, SERVICE_TIER, blocks, cache_creation_json, context_management, input_tokens, stop_reason,
+};
+use crate::ir::{ApiError, Delivery, Reply, Request};
 use crate::sse::{Frame, FrameKind};
 
-fn message_start(meta: &MessageMeta, input: u32, cache_creation: u32, cache_read: u32) -> Value {
+/// `usage` of `message_start`; `None` leaves `input_tokens` and the cache counters to `message_delta`.
+fn message_start(meta: &MessageMeta, input: Option<(u32, u32, u32)>) -> Value {
+    let mut usage = serde_json::Map::new();
+    if let Some((input, cache_creation, cache_read)) = input {
+        usage.insert("input_tokens".into(), input.into());
+        usage.insert("cache_creation_input_tokens".into(), cache_creation.into());
+        usage.insert("cache_read_input_tokens".into(), cache_read.into());
+        usage.insert("cache_creation".into(), cache_creation_json(cache_creation));
+    }
+    usage.insert("output_tokens".into(), 1.into());
+    usage.insert("service_tier".into(), SERVICE_TIER.into());
+    usage.insert("inference_geo".into(), INFERENCE_GEO.into());
     json!({"type": "message_start", "message": {
         "id": meta.id,
         "type": "message",
@@ -19,12 +32,7 @@ fn message_start(meta: &MessageMeta, input: u32, cache_creation: u32, cache_read
         "content": [],
         "stop_reason": null,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": input,
-            "cache_creation_input_tokens": cache_creation,
-            "cache_read_input_tokens": cache_read,
-            "output_tokens": 1,
-        },
+        "usage": usage,
     }})
 }
 
@@ -35,16 +43,14 @@ fn message_start(meta: &MessageMeta, input: u32, cache_creation: u32, cache_read
 /// Frame kinds: everything before the first delta is `Head`, deltas are `Content`, the rest is
 /// `Trailer`. Text and reasoning deltas hold `chunk_tokens` tokens each; tool-argument
 /// `input_json_delta` fragments hold `args_chunk_bytes` bytes each.
-pub fn frames(req: &Request, reply: &Reply, meta: &MessageMeta, chunk_tokens: usize, args_chunk_bytes: usize) -> Vec<Frame> {
-    let chunk_tokens = chunk_tokens.max(1);
-    let args_chunk_bytes = args_chunk_bytes.max(1);
+pub fn frames(req: &Request, reply: &Reply, meta: &MessageMeta, delivery: &Delivery) -> Vec<Frame> {
+    let chunk_tokens = delivery.chunk_tokens.max(1);
+    let args_chunk_bytes = delivery.args_chunk_bytes.max(1);
     let usage = &reply.usage;
+    let input = (input_tokens(usage), usage.cache_creation_tokens, usage.cached_tokens);
 
     // (event body, is a token-carrying delta)
-    let mut events: Vec<(Value, bool)> = vec![(
-        message_start(meta, input_tokens(usage), usage.cache_creation_tokens, usage.cached_tokens),
-        false,
-    )];
+    let mut events: Vec<(Value, bool)> = vec![(message_start(meta, (!delivery.input_tokens_in_delta).then_some(input)), false)];
     let delta = |index: usize, delta: Value| (json!({"type": "content_block_delta", "index": index, "delta": delta}), true);
 
     for (index, block) in blocks(req, reply).into_iter().enumerate() {
@@ -74,7 +80,12 @@ pub fn frames(req: &Request, reply: &Reply, meta: &MessageMeta, chunk_tokens: us
                         "type": "tool_use", "id": call.id, "name": call.name, "input": {}}}),
                     false,
                 ));
-                let frags = split_bytes(&call.arguments, args_chunk_bytes);
+                // A tool without arguments streams one empty fragment, as the real API does, not `{}`.
+                let frags = if call.arguments.trim() == "{}" {
+                    Vec::new()
+                } else {
+                    split_bytes(&call.arguments, args_chunk_bytes)
+                };
                 if frags.is_empty() {
                     events.push(delta(index, json!({"type": "input_json_delta", "partial_json": ""})));
                 }
@@ -86,15 +97,18 @@ pub fn frames(req: &Request, reply: &Reply, meta: &MessageMeta, chunk_tokens: us
         events.push((json!({"type": "content_block_stop", "index": index}), false));
     }
 
+    let mut delta_usage = serde_json::Map::new();
+    if delivery.input_tokens_in_delta {
+        delta_usage.insert("input_tokens".into(), input.0.into());
+        delta_usage.insert("cache_creation_input_tokens".into(), input.1.into());
+        delta_usage.insert("cache_read_input_tokens".into(), input.2.into());
+    }
+    delta_usage.insert("output_tokens".into(), usage.completion_tokens.into());
     events.push((
         json!({"type": "message_delta",
         "delta": {"stop_reason": stop_reason(reply.finish), "stop_sequence": null},
-        "usage": {
-            "input_tokens": input_tokens(usage),
-            "cache_creation_input_tokens": usage.cache_creation_tokens,
-            "cache_read_input_tokens": usage.cached_tokens,
-            "output_tokens": usage.completion_tokens,
-        }}),
+        "context_management": context_management(req),
+        "usage": delta_usage}),
         false,
     ));
     events.push((json!({"type": "message_stop"}), false));
@@ -121,7 +135,11 @@ pub fn frames(req: &Request, reply: &Reply, meta: &MessageMeta, chunk_tokens: us
 /// `event: error` with `data: {"type": "error", "error": {"type", "message"}}`. All `Head`.
 pub fn error_frames(err: &ApiError, meta: &MessageMeta, input_tokens: u32) -> Vec<Frame> {
     vec![
-        Frame::json(FrameKind::Head, Some("message_start"), &message_start(meta, input_tokens, 0, 0)),
+        Frame::json(
+            FrameKind::Head,
+            Some("message_start"),
+            &message_start(meta, Some((input_tokens, 0, 0))),
+        ),
         Frame::json(FrameKind::Head, Some("ping"), &json!({"type": "ping"})),
         Frame::json(FrameKind::Head, Some("error"), &super::error::body(err)),
     ]
@@ -181,7 +199,7 @@ mod tests {
             },
             ..Reply::default()
         };
-        let fs = frames(&req(), &reply, &meta(), 1, 16);
+        let fs = frames(&req(), &reply, &meta(), &Delivery::default());
         assert_eq!(
             shape(&fs),
             [
@@ -213,7 +231,31 @@ mod tests {
         let md = data(&fs[6]);
         assert_eq!(md["delta"], json!({"stop_reason": "end_turn", "stop_sequence": null}));
         assert_eq!(md["usage"]["output_tokens"], 2);
+        assert!(md["usage"].get("input_tokens").is_none());
+    }
+
+    #[test]
+    fn input_tokens_in_delta() {
+        let reply = Reply {
+            text: Some("one two".into()),
+            usage: Usage {
+                prompt_tokens: 9,
+                completion_tokens: 2,
+                ..Usage::default()
+            },
+            ..Reply::default()
+        };
+        let d = Delivery {
+            input_tokens_in_delta: true,
+            ..Delivery::default()
+        };
+        let fs = frames(&req(), &reply, &meta(), &d);
+        let start = data(&fs[0]);
+        assert!(start["message"]["usage"].get("input_tokens").is_none());
+        assert_eq!(start["message"]["usage"]["output_tokens"], 1);
+        let md = data(&fs[6]);
         assert_eq!(md["usage"]["input_tokens"], 9);
+        assert_eq!(md["usage"]["output_tokens"], 2);
     }
 
     #[test]
@@ -234,7 +276,15 @@ mod tests {
             finish: FinishReason::ToolCalls,
             ..Reply::default()
         };
-        let fs = frames(&req(), &reply, &meta(), 1, 8);
+        let fs = frames(
+            &req(),
+            &reply,
+            &meta(),
+            &Delivery {
+                args_chunk_bytes: 8,
+                ..Delivery::default()
+            },
+        );
         assert_eq!(
             names(&fs),
             [
@@ -276,7 +326,15 @@ mod tests {
             text: Some("hi".into()),
             ..Reply::default()
         };
-        let fs = frames(&req(), &reply, &meta(), 100, 16);
+        let fs = frames(
+            &req(),
+            &reply,
+            &meta(),
+            &Delivery {
+                chunk_tokens: 100,
+                ..Delivery::default()
+            },
+        );
         assert_eq!(
             names(&fs),
             [
@@ -312,7 +370,7 @@ mod tests {
                 finish,
                 ..Reply::default()
             };
-            let fs = frames(&req(), &reply, &meta(), 1, 16);
+            let fs = frames(&req(), &reply, &meta(), &Delivery::default());
             assert_eq!(data(&fs[fs.len() - 2])["delta"]["stop_reason"], want);
         }
     }

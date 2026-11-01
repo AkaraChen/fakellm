@@ -244,3 +244,58 @@ async fn scripts_keep_hits() {
     put("").await;
     assert_eq!(hits(get(&s, "/_fakellm/scripts").await.json()), 0);
 }
+
+#[tokio::test]
+async fn after_gates_a_rule_on_another_rules_hits() {
+    let s = start().await;
+    put_rules(
+        &s,
+        json!([
+            {"name": "guardian", "match": {"last_user": "guard"}, "reply": {"text": "guarded"}, "times": 2},
+            {"name": "main", "match": {"after": "guardian", "after_count": 2, "last_user": "work"}, "reply": {"text": "main work"}},
+            {"name": "fallback", "reply": {"text": "other"}}
+        ]),
+    )
+    .await;
+    let ask = |q: &'static str| {
+        let s = &s;
+        async move { text_of(&chat(s, &chat_body("gpt-4o", q)).await) }
+    };
+    // Guardian has not answered yet: `main` stays closed.
+    assert_eq!(ask("work").await, "other");
+    assert_eq!(ask("guard").await, "guarded");
+    // One hit is not enough for after_count 2.
+    assert_eq!(ask("work").await, "other");
+    assert_eq!(ask("guard").await, "guarded");
+    assert_eq!(ask("work").await, "main work");
+    assert_eq!(ask("work").await, "main work");
+
+    // The default is one hit.
+    put_rules(
+        &s,
+        json!([
+            {"name": "a", "match": {"last_user": "a"}, "reply": {"text": "A"}},
+            {"match": {"after": "a", "last_user": "b"}, "reply": {"text": "B"}}
+        ]),
+    )
+    .await;
+    assert_ne!(ask("b").await, "B");
+    ask("a").await;
+    assert_eq!(ask("b").await, "B");
+
+    for bad in [
+        json!([{"match": {"after_count": 2}, "reply": {"text": "x"}}]),
+        json!([{"name": "x", "match": {"after": "x"}, "reply": {"text": "x"}}]),
+        json!([{"match": {"after": "x", "after_count": 0}, "reply": {"text": "x"}}]),
+    ] {
+        let r = send(
+            &s,
+            "PUT",
+            "/_fakellm/scripts",
+            &[("content-type", "application/json")],
+            &bad.to_string(),
+        )
+        .await;
+        assert_eq!(r.status, 400, "{bad}");
+    }
+}

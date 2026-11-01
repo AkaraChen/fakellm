@@ -108,6 +108,63 @@ pub(crate) fn policies(input: Value) -> Result<Vec<fakellm::PolicySpec>> {
     fakellm::PolicySpec::parse_many(&text, format).map_err(control_error)
 }
 
+/// What the `*File` start options loaded.
+#[derive(Default)]
+pub(crate) struct Files {
+    pub scripts: Vec<fakellm::Rule>,
+    pub trajectories: Vec<fakellm::Trajectory>,
+    pub policies: Vec<fakellm::PolicySpec>,
+    pub cassettes: Vec<fakellm::Cassette>,
+}
+
+fn read(path: &str) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| control_error(format!("{path}: {e}")))
+}
+
+fn ext(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+}
+
+/// Reads the files the way the CLI does: the format follows the extension.
+pub(crate) fn load_files(scripts: Option<&str>, trajectories: &[String], policies: &[String], cassettes: &[String]) -> Result<Files> {
+    let mut files = Files::default();
+    if let Some(path) = scripts {
+        let format = match ext(path).as_deref() {
+            Some("yaml" | "yml") => fakellm::ScriptFormat::Yaml,
+            _ => fakellm::ScriptFormat::Auto,
+        };
+        files.scripts = parse_rules(&read(path)?, format).map_err(|e| control_error(format!("{path}: {e}")))?;
+    }
+    for path in trajectories {
+        let format = match ext(path).as_deref() {
+            Some("jsonl" | "ndjson") => fakellm::TrajectoryFormat::Jsonl,
+            Some("yaml" | "yml") => fakellm::TrajectoryFormat::Yaml,
+            _ => fakellm::TrajectoryFormat::Auto,
+        };
+        let items = fakellm::Trajectory::parse_many(&read(path)?, format).map_err(|e| control_error(format!("{path}: {e}")))?;
+        files.trajectories.extend(items);
+    }
+    for path in policies {
+        files
+            .policies
+            .push(fakellm::PolicySpec::from_path(path.as_ref()).map_err(|e| control_error(format!("{path}: {e}")))?);
+    }
+    for path in cassettes {
+        let format = match ext(path).as_deref() {
+            Some("json") => fakellm::CassetteFormat::Json,
+            Some("jsonl" | "ndjson") => fakellm::CassetteFormat::Jsonl,
+            Some("yaml" | "yml") => fakellm::CassetteFormat::Yaml,
+            _ => fakellm::CassetteFormat::Auto,
+        };
+        let items = fakellm::Cassette::parse_many(&read(path)?, format).map_err(|e| control_error(format!("{path}: {e}")))?;
+        files.cassettes.extend(items);
+    }
+    Ok(files)
+}
+
 /// The registered trajectories. Obtained from `server.trajectories`.
 #[napi(js_name = "TrajectoriesControl")]
 pub struct TrajectoriesControl {
@@ -309,36 +366,67 @@ impl PoliciesControl {
     }
 }
 
+/// Registers policies on a worker thread: each module is loaded in a subprocess, which takes about 100 ms.
+pub struct LoadPolicies {
+    server: Slot,
+    input: Option<Value>,
+    replace: bool,
+}
+
+impl Task for LoadPolicies {
+    type Output = ScriptsLoaded;
+    type JsValue = ScriptsLoaded;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let specs = policies(self.input.take().unwrap_or(Value::Null))?;
+        let added = specs.len() as u32;
+        let replace = self.replace;
+        // Only a handle is taken under the lock: the load takes up to the policy timeout per module, and a
+        // read guard held that long would, with a `stop()` waiting for the write lock, block every other
+        // synchronous call on the JS thread.
+        let control = with_server(&self.server, |s| s.shared_control())?;
+        let policies = control.policies();
+        let loaded = if replace {
+            block_on(policies.replace(specs))
+        } else {
+            block_on(policies.upsert(specs))
+        };
+        loaded
+            .map(|()| ScriptsLoaded {
+                added,
+                count: policies.len() as u32,
+            })
+            .map_err(control_error)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
 #[napi]
 impl PoliciesControl {
-    /// Replaces all policies. Each module is loaded first (a subprocess starts and imports it), so
-    /// this blocks the calling thread for that long and throws with the module's own error when one
-    /// does not load. Returns `{ added, count }`.
-    #[napi]
-    pub fn put(&self, input: Value) -> Result<ScriptsLoaded> {
-        let specs = policies(input)?;
-        let added = specs.len() as u32;
-        with_server(&self.server, |s| {
-            napi::bindgen_prelude::block_on(s.policies().replace(specs)).map(|()| ScriptsLoaded {
-                added,
-                count: s.policies().len() as u32,
-            })
-        })?
-        .map_err(control_error)
+    /// Replaces all policies. Each module is loaded first (a subprocess starts and imports it); the
+    /// returned promise resolves with `{ added, count }` once they all are, and rejects with the
+    /// module's own error when one does not load, leaving the registered policies as they were. The
+    /// JS thread is not blocked meanwhile.
+    #[napi(ts_return_type = "Promise<ScriptsLoaded>")]
+    pub fn put(&self, input: Value) -> AsyncTask<LoadPolicies> {
+        AsyncTask::new(LoadPolicies {
+            server: self.server.clone(),
+            input: Some(input),
+            replace: true,
+        })
     }
 
     /// Adds policies, same input as `put`; one with a registered name replaces it (its state restarts).
-    #[napi]
-    pub fn add(&self, input: Value) -> Result<ScriptsLoaded> {
-        let specs = policies(input)?;
-        let added = specs.len() as u32;
-        with_server(&self.server, |s| {
-            napi::bindgen_prelude::block_on(s.policies().upsert(specs)).map(|()| ScriptsLoaded {
-                added,
-                count: s.policies().len() as u32,
-            })
-        })?
-        .map_err(control_error)
+    #[napi(ts_return_type = "Promise<ScriptsLoaded>")]
+    pub fn add(&self, input: Value) -> AsyncTask<LoadPolicies> {
+        AsyncTask::new(LoadPolicies {
+            server: self.server.clone(),
+            input: Some(input),
+            replace: false,
+        })
     }
 
     /// `{ name, runtime, running, hits, restarts, state, log }` per policy.

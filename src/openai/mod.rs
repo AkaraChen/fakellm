@@ -622,7 +622,7 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
                         model: req.model.clone(),
                     };
                     if req.stream {
-                        let frames = anthropic::stream::frames(&req, &reply, &meta, delivery.chunk_tokens, delivery.args_chunk_bytes);
+                        let frames = anthropic::stream::frames(&req, &reply, &meta, &delivery);
                         sse::respond(
                             control.clock.clone(),
                             delivery,

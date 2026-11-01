@@ -448,8 +448,29 @@ pub fn usage_json(usage: &Usage) -> Value {
         "input_tokens": input_tokens(usage),
         "cache_creation_input_tokens": usage.cache_creation_tokens,
         "cache_read_input_tokens": usage.cached_tokens,
+        "cache_creation": cache_creation_json(usage.cache_creation_tokens),
         "output_tokens": usage.completion_tokens,
+        "service_tier": SERVICE_TIER,
+        "inference_geo": INFERENCE_GEO,
     })
+}
+
+pub(crate) const SERVICE_TIER: &str = "standard";
+pub(crate) const INFERENCE_GEO: &str = "not_available";
+
+/// `usage.cache_creation`: the written tokens split by lifetime; all of them count as the 5 minute kind.
+pub(crate) fn cache_creation_json(tokens: u32) -> Value {
+    json!({"ephemeral_5m_input_tokens": tokens, "ephemeral_1h_input_tokens": 0})
+}
+
+/// `message_delta.context_management`: `{"applied_edits": []}` when the request asked for context management,
+/// else `null`.
+pub(crate) fn context_management(req: &Request) -> Value {
+    if req.extra.contains_key("context_management") {
+        json!({"applied_edits": []})
+    } else {
+        Value::Null
+    }
 }
 
 /// Prompt tokens that were neither read from nor written to the cache.
@@ -717,7 +738,9 @@ mod tests {
             v,
             json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-4-5",
                 "content": [{"type": "text", "text": "hello"}], "stop_reason": "end_turn", "stop_sequence": null,
-                "usage": {"input_tokens": 15, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 10, "output_tokens": 2}})
+                "usage": {"input_tokens": 15, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 10,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 5, "ephemeral_1h_input_tokens": 0},
+                    "output_tokens": 2, "service_tier": "standard", "inference_geo": "not_available"}})
         );
     }
 

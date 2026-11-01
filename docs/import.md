@@ -30,14 +30,14 @@ fakellm --trajectory fixtures/swe.jsonl --scripts agent.yaml    # agent.yaml 里
 | `--split` | `train` | |
 | `--limit` | `100` | 取多少行（每页最多 100 行，自动翻页） |
 | `--offset` | `0` | 从第几行开始 |
-| `--format` | `auto` | `auto`、`sharegpt`、`wildchat`、`hermes-fc`、`swe-agent`、`openhands`；`auto` 逐行看字段猜 |
+| `--format` | `auto` | `auto`、`sharegpt`、`wildchat`、`hermes-fc`、`swe-agent`、`openhands`、`xlam`；`auto` 逐行看字段猜 |
 | `--as` | 见下 | `cassette` 或 `trajectory` |
 | `--name` | 数据集名（`/` 换成 `-`）或文件名 | cassette 的名字，或轨迹名的前缀 |
 | `--model` | `imported` | 行里没有模型名时，exchange 里记的模型 |
 | `-o, --output-file` | 必填 | 输出文件（JSONL），`-` 写到 stdout |
 
 `import file PATH` 除了没有 `--config`、`--split`、`--limit`、`--offset` 之外，选项相同。
-`--as` 缺省时：`sharegpt` 和 `wildchat` 导成 cassette，`hermes-fc`、`swe-agent`、`openhands` 导成轨迹；可以用 `--as` 反过来，但 cassette 里只有请求和助手回复，轨迹则带着工具映射。
+`--as` 缺省时：`sharegpt` 和 `wildchat` 导成 cassette，`hermes-fc`、`swe-agent`、`openhands`、`xlam` 导成轨迹；可以用 `--as` 反过来，但 cassette 里只有请求和助手回复，轨迹则带着工具映射。
 
 导完 stderr 有一行统计：`fetched N rows (T truncated), converted C conversations -> E exchanges|S steps, skipped K (原因: n, ...)`。看不懂的行（没有助手回复、字段不对）被跳过并计数，不算失败；什么都没转出来才是错误。datasets-server 把某个单元格截断过的行（`truncated_cells`）会被丢掉，因为内容不完整。
 
@@ -52,14 +52,31 @@ fakellm --trajectory fixtures/swe.jsonl --scripts agent.yaml    # agent.yaml 里
 | `sharegpt` | `conversations: [{from, value}]`，`id` | `human`/`user`、`gpt`/`assistant`、开头的 `system` 对应角色；`tool`/`observation` 作为上一个工具调用的结果 |
 | `wildchat` | `conversation: [{role, content, ...}]`，`conversation_hash`，`model` | 角色照搬；`model` 是 exchange 的模型；`language`、`toxic`、`redacted`、`timestamp` 放进 `meta` |
 | `hermes-fc` | `conversations: [{from, value}]` + `tools` 列 | `gpt` 轮里的 `<tool_call>{json}</tool_call>` 变成工具调用，`tool` 轮里的 `<tool_response>` 变成结果，`<think>` 变成 `reasoning`；`tools` 列成为工具定义；系统提示里的 `<tools>` 块去掉 |
-| `swe-agent` | nebius：`trajectory: [{role: system\|user\|ai, text}]`；SWE-smith：`messages`（带结构化 `tool_calls`） | nebius 的 `ai` 文本里围栏代码块是动作（`bash {command}`，或 `str_replace_editor`），其余是说明文字，下一条 `user` 是观察结果；SWE-smith 的调用原样保留。轨迹带默认工具映射 |
-| `openhands` | `events: [{source, action\|observation, args, content, cause}]` | `run` 变 `execute_bash {command}`，`edit`/`read` 变 `str_replace_editor`，`finish` 是最终回答，`think` 变下一条的 `reasoning`；每个 observation 是对应调用的结果 |
+| `xlam` | `id`、`query`、`answers`（JSON 字符串，`[{name, arguments}]`）、`tools`（JSON 字符串，`parameters` 是 `{参数名: {type, description, default}}`） | 一条 user 消息加一条带全部调用的助手消息；`tools` 的参数表转成 JSON schema（类型 `str`/`int`/`List[..]` 映射，`optional` 或有 `default` 的不算必填）；`answers` 为空的行因没有助手回复被跳过。**数据集受限，转换器按数据集卡片上的 schema 写，没有见过真实的行**，夹具是合成的 |
+| `swe-agent` | nebius：`trajectory: [{role: system\|user\|ai, text}]`；SWE-smith：`messages`（`tool` split 带结构化 `tool_calls`；`xml` split 的动作是文本里的 `<function=名字><parameter=键>值</parameter></function>`；`ticks` split 是围栏代码块；后两者的观察结果是以 `OBSERVATION:` 开头的 `user` 消息）；SWE-Gym/OpenHands-Sampled-Trajectories 也是这种 `messages` + `tools` 列 | nebius 的 `ai` 文本里围栏代码块是动作（`bash {command}`，或 `str_replace_editor`），其余是说明文字，下一条 `user` 是观察结果；带结构化调用的原样保留；`tools` 列成为工具定义。轨迹带默认工具映射（`bash`、`str_replace_editor`，以及 OpenHands 的 `execute_bash`、`think`、`finish`） |
+| `openhands`（事件流） | `events: [{source, action\|observation, args, content, cause}]` | `run` 变 `execute_bash {command}`，`edit`/`read` 变 `str_replace_editor`，`finish` 是最终回答，`think` 变下一条的 `reasoning`；每个 observation 是对应调用的结果 |
 
 通用规则：没有助手回复的行被跳过；工具调用没有 id 时按 `call_1`、`call_2` 编号，对应的工具结果带同一个 id。
 **cassette 产物**：每条助手消息一个 exchange，请求是它之前的全部消息（工具定义取自行里的 `tools`，没有就按用过的工具名生成只有名字的定义），所以多轮对话的每一轮都能被命中；回复里的 `usage` 全是 0。
 **轨迹产物**：每行一条轨迹，名字是 `前缀-行 id`（重名加 `-2`、`-3`），每条助手消息一步，不带 `expect`；`swe-agent` 的 `tool_map` 把 `bash` 和 `str_replace_editor` 的每个参数都写了出来，要接到自己的工具上就改这份映射（见 [agent.md](agent.md)）。多条轨迹在同一个 JSONL 里。
 
 行是什么形状取决于数据集当时的版本，转换器按已知的列名写，数据集改版后可能出现 `unrecognized row shape`，这时用 `import file` 加 `--format` 手工试，或者改写成上面的形状。
+
+## 真实数据集的导入结果
+
+2026-11-01 用 `fakellm import hf`（没有 `HF_TOKEN`）对着真实的 datasets-server 跑的结果：
+
+| 数据集 | 命令（`--limit`） | 结果 | 说明 |
+|---|---|---|---|
+| `allenai/WildChat-1M` | 50 | 50 行 -> 93 个 exchange，skipped 0 | 格式自动识别为 `wildchat` |
+| `NousResearch/hermes-function-calling-v1` | 默认 config `func_calling_singleturn`，50 | 50 -> 50 步，skipped 0 | 这个数据集有 5 个 config，**默认取的第一个是单轮**；多轮用 `--config func_calling`（50 -> 96 步）或 `glaive_func_calling`（50 -> 216 步）；`json_mode_agentic` / `json_mode_singleturn` 没有工具调用，是 JSON 输出的问答，自动导成 cassette（各 50 个 exchange） |
+| `nebius/SWE-agent-trajectories` | 10 | 10 -> 341 步，skipped 0 | 原有转换器可用 |
+| `SWE-bench/SWE-smith-trajectories` | 要写 `--split tool`（没有 `train`），10 | tool：10 -> 221 步；xml：10 -> 389 步；ticks：10 -> 380 步，skipped 0 | 初版转换器对 `xml`、`ticks` 两个 split 全部 `unrecognized row shape`（动作在文本里，没有 `tool_calls`），现已支持 |
+| `SWE-Gym/OpenHands-Sampled-Trajectories` | 要写 `--split train.raw`，10 | 10 -> 42 步，skipped 0 | 真实形状是 `messages`（OpenAI 风格 `tool_calls`）加 `tools` 列，不是 `events`；由 `swe-agent` 转换器处理（`auto` 识别为它）。`events` 形式的 `openhands` 转换器只剩给老格式的导出用 |
+| `anon8231489123/ShareGPT_Vicuna_unfiltered` | datasets-server 报 500 `No (supported) data files found`，所以走 `import file` | 下载 `ShareGPT_V3_unfiltered_cleaned_split.json` 的开头 20 条：20 -> 89 个 exchange，skipped 0 | `from` 只有 `human` 和 `gpt`（20 条里 82 / 89 次），与转换器一致；整个文件是一个大 JSON 数组，要先下载到本地再 `import file` |
+| `Salesforce/xlam-function-calling-60k` | 5 | 无 `HF_TOKEN`：`dataset ... is gated or private; set HF_TOKEN ...`，退出码 1 | 受限数据集，401/403 的提示正确。转换器按文档 schema 写，没有真实行验证 |
+
+默认只取第一个 config 和 `train` split；上面写了 `--split` / `--config` 的数据集要手工指定。`tests/fixtures/hf/real_*.jsonl` 是从这些结果里截出来的真实行（文本截断到 300 到 1500 个字符，WildChat 去掉了 IP、国家、州和请求头），`tests/import.rs` 的 `real_dataset_rows_*` 用它们测自动识别和转换；`FAKELLM_HF_TEST=1` 的联网测试仍然是手动的。
 
 ## 数据集与许可证
 
@@ -71,7 +88,7 @@ fakellm --trajectory fixtures/swe.jsonl --scripts agent.yaml    # agent.yaml 里
 | `anon8231489123/ShareGPT_Vicuna_unfiltered` | ShareGPT 对话 | 标的是 apache-2.0 | 数据来源有争议，只建议本地使用 |
 | `lmsys/lmsys-chat-1m` | 真实对话 | 自定义协议，需申请访问 | 不能再分发，只能用户自己导入（要 `HF_TOKEN`） |
 | `NousResearch/hermes-function-calling-v1` | 函数调用多轮对话 | apache-2.0 | 适合测 tool call |
-| `Salesforce/xlam-function-calling-60k` | 函数调用 | CC-BY-4.0，需申请访问 | 单轮为主；没有专门的转换器，格式不同时需要先整理成上面的形状 |
+| `Salesforce/xlam-function-calling-60k` | 函数调用 | CC-BY-4.0，需申请访问 | 单轮为主；有 `xlam` 转换器（按文档 schema 写，未对真实行验证） |
 | `nebius/SWE-agent-trajectories` | SWE-agent 完整轨迹 | CC-BY-4.0 | fake agent 的主力素材 |
 | `SWE-bench/SWE-smith-trajectories` | SWE-agent 轨迹 | MIT | 同上 |
 | `SWE-Gym/OpenHands-Sampled-Trajectories` | OpenHands 轨迹 | 页面上没标许可证 | 用之前要确认许可证 |

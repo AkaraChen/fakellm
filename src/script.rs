@@ -100,6 +100,14 @@ pub struct Match {
     /// or not, needs `reply.body`, and only ever sees requests the standard routes do not serve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Sequence matcher: only once the rule with this `name` has answered at least `after_count` times
+    /// (default 1) in this server. Lets a later rule take over from an earlier one without relying on rule
+    /// order and `times`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Minimum hits of the `after` rule, at least 1. Needs `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -176,6 +184,17 @@ pub struct UsageSpec {
     pub reasoning_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "cache_creation_input_tokens")]
     pub cache_creation_tokens: Option<u32>,
+    /// Anthropic streams: which event carries `input_tokens` (default `start`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens_in: Option<InputTokensIn>,
+}
+
+/// Where an Anthropic stream reports `input_tokens`: `message_start` or `message_delta`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputTokensIn {
+    Start,
+    Delta,
 }
 
 /// What to answer. Exactly one of `text`/`tool_calls` (together is fine), `error`, `trajectory` or
@@ -330,8 +349,71 @@ impl Rule {
     }
 }
 
+/// A compiled [`Pattern`]: the fast `regex` engine when it can take the pattern, `fancy-regex`
+/// (lookahead, lookbehind, backreferences) when only that can.
+#[derive(Clone, Debug)]
+pub(crate) enum Re {
+    Plain(Regex),
+    Fancy(Box<fancy_regex::Regex>),
+}
+
+/// Why a pattern did not compile.
+#[derive(Clone, Debug)]
+pub(crate) struct ReError(String);
+
+impl std::fmt::Display for ReError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Re {
+    pub(crate) fn new(src: &str) -> Result<Self, ReError> {
+        match Regex::new(src) {
+            Ok(re) => Ok(Self::Plain(re)),
+            Err(plain) => match fancy_regex::Regex::new(src) {
+                Ok(re) => Ok(Self::Fancy(Box::new(re))),
+                // Report the engine that knows the most syntax.
+                Err(fancy) => Err(ReError(if matches!(plain, regex::Error::Syntax(_)) {
+                    fancy.to_string()
+                } else {
+                    plain.to_string()
+                })),
+            },
+        }
+    }
+
+    /// A match error at run time (fancy-regex's backtrack limit) counts as no match.
+    pub(crate) fn is_match(&self, text: &str) -> bool {
+        match self {
+            Self::Plain(re) => re.is_match(text),
+            Self::Fancy(re) => re.is_match(text).unwrap_or(false),
+        }
+    }
+
+    /// Every match replaced by `replacement` (literal text, no `$` groups); `None` when the engine
+    /// failed at run time (fancy-regex's backtrack limit), so the caller can fail closed.
+    pub(crate) fn try_replace_all_literal(&self, text: &str, replacement: &str) -> Option<String> {
+        match self {
+            Self::Plain(re) => Some(re.replace_all(text, regex::NoExpand(replacement)).into_owned()),
+            Self::Fancy(re) => {
+                let mut out = String::with_capacity(text.len());
+                let mut last = 0;
+                for m in re.find_iter(text) {
+                    let m = m.ok()?;
+                    out.push_str(&text[last..m.start()]);
+                    out.push_str(replacement);
+                    last = m.end();
+                }
+                out.push_str(&text[last..]);
+                Some(out)
+            }
+        }
+    }
+}
+
 impl Pattern {
-    pub(crate) fn compile(&self) -> Result<Regex, regex::Error> {
+    pub(crate) fn compile(&self) -> Result<Re, ReError> {
         let s = self.0.as_str();
         let (body, ci) = if s.len() >= 2 && s.starts_with('/') && s.ends_with('/') {
             (&s[1..s.len() - 1], false)
@@ -340,23 +422,23 @@ impl Pattern {
         } else {
             (s, false)
         };
-        if ci { Regex::new(&format!("(?i){body}")) } else { Regex::new(body) }
+        if ci { Re::new(&format!("(?i){body}")) } else { Re::new(body) }
     }
 }
 
 #[derive(Default)]
 struct Matchers {
-    last_user: Option<Regex>,
-    last_user_raw: Option<Regex>,
-    system: Option<Regex>,
-    any_message: Option<Regex>,
-    body: Option<Regex>,
-    tool_result_contains: Option<Regex>,
+    last_user: Option<Re>,
+    last_user_raw: Option<Re>,
+    system: Option<Re>,
+    any_message: Option<Re>,
+    body: Option<Re>,
+    tool_result_contains: Option<Re>,
 }
 
 impl Matchers {
     fn compile(m: &Match) -> Result<Self, String> {
-        let one = |name: &str, p: &Option<Pattern>| -> Result<Option<Regex>, String> {
+        let one = |name: &str, p: &Option<Pattern>| -> Result<Option<Re>, String> {
             p.as_ref()
                 .map(|p| p.compile().map_err(|e| format!("match.{name}: invalid regex {:?}: {e}", p.0)))
                 .transpose()
@@ -377,6 +459,15 @@ fn validate(rule: &Rule) -> Result<(), String> {
         && !(0.0..=1.0).contains(&p)
     {
         return Err("match.probability must be between 0 and 1".into());
+    }
+    if rule.matcher.after_count.is_some() && rule.matcher.after.is_none() {
+        return Err("match.after_count needs match.after".into());
+    }
+    if rule.matcher.after_count == Some(0) {
+        return Err("match.after_count must be at least 1".into());
+    }
+    if rule.matcher.after.is_some() && rule.matcher.after == rule.name {
+        return Err("match.after names the rule itself, which could never start".into());
     }
     if rule.matcher.every_nth == Some(0) {
         return Err("match.every_nth must be at least 1".into());
@@ -421,6 +512,13 @@ pub(crate) fn validate_reply(r: &ReplySpec) -> Result<(), String> {
     let has_content = r.text.is_some() || r.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
     let delegated = r.trajectory.is_some() || r.policy.is_some();
     let hangs = r.hang == Some(true) || r.hang_ms.is_some();
+    if r.hang_ms.is_some() && (r.delay_ms.is_some() || r.stream.as_ref().is_some_and(|s| s.ttft_ms.is_some())) {
+        return Err(
+            "reply `hang_ms` and `delay_ms` / `stream.ttft_ms` do not combine: `hang_ms` sends no response headers for that long, \
+             `delay_ms` / `ttft_ms` delay the first byte after the headers; use one of them"
+                .into(),
+        );
+    }
     if r.trajectory.is_some() && r.policy.is_some() {
         return Err("reply `trajectory` and `policy` exclude each other".into());
     }
@@ -622,6 +720,62 @@ fn draw(seed: u64, reached: u64) -> f64 {
     (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// Every `match.after` must name a rule of the set, and the names must not form a cycle (none of the
+/// rules in it could ever start).
+fn check_after<'a>(rules: impl Iterator<Item = &'a Rule>) -> Result<(), ScriptError> {
+    use std::collections::{HashMap, HashSet};
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut gated = Vec::new();
+    for r in rules {
+        if let Some(n) = &r.name {
+            edges.entry(n).or_default();
+        }
+        if let Some(a) = &r.matcher.after {
+            gated.push((r.name.as_deref(), a.as_str()));
+        }
+    }
+    for (name, after) in &gated {
+        if !edges.contains_key(after) {
+            return Err(ScriptError(format!("match.after names no rule: {after:?}")));
+        }
+        if let Some(n) = name {
+            edges.entry(n).or_default().push(after);
+        }
+    }
+    // Depth-first search for a cycle among named rules.
+    fn visit<'a>(
+        n: &'a str,
+        edges: &HashMap<&'a str, Vec<&'a str>>,
+        done: &mut HashSet<&'a str>,
+        path: &mut Vec<&'a str>,
+    ) -> Option<&'a str> {
+        if path.contains(&n) {
+            return Some(n);
+        }
+        if !done.insert(n) {
+            return None;
+        }
+        path.push(n);
+        for next in edges.get(n).into_iter().flatten() {
+            if let Some(c) = visit(next, edges, done, path) {
+                return Some(c);
+            }
+        }
+        path.pop();
+        None
+    }
+    let mut done = HashSet::new();
+    let names: Vec<&str> = edges.keys().copied().collect();
+    for n in names {
+        if let Some(c) = visit(n, &edges, &mut done, &mut Vec::new()) {
+            return Err(ScriptError(format!(
+                "match.after forms a cycle through rule {c:?}, none of them could ever start"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn compile_all(rules: Vec<Rule>, offset: usize) -> Result<Vec<Compiled>, ScriptError> {
     rules.into_iter().enumerate().map(|(i, r)| Compiled::new(r, offset + i)).collect()
 }
@@ -629,20 +783,28 @@ fn compile_all(rules: Vec<Rule>, offset: usize) -> Result<Vec<Compiled>, ScriptE
 impl Scripts {
     /// Replaces all rules. Fails without changing anything if any rule is invalid.
     pub fn replace(&self, rules: Vec<Rule>) -> Result<(), ScriptError> {
+        check_after(rules.iter())?;
         let compiled = compile_all(rules, 0)?;
         *self.inner.lock() = compiled;
         Ok(())
     }
 
-    /// Like [`Scripts::replace`], but the rule at each index keeps the hit count of the rule
-    /// that was there before (`PUT /_fakellm/scripts?keep_hits=true`). Rules past the old length
-    /// start at zero.
+    /// Like [`Scripts::replace`], but a rule keeps the counters of the old rule with the same
+    /// name (`PUT /_fakellm/scripts?keep_hits=true`); an unnamed rule keeps those of the old
+    /// unnamed rule at the same index. Others start at zero.
     pub fn replace_keep_hits(&self, rules: Vec<Rule>) -> Result<(), ScriptError> {
+        check_after(rules.iter())?;
         let mut compiled = compile_all(rules, 0)?;
         let mut inner = self.inner.lock();
-        for (new, old) in compiled.iter_mut().zip(inner.iter()) {
-            new.hits = old.hits;
-            new.reached = old.reached;
+        for (i, new) in compiled.iter_mut().enumerate() {
+            let old = match &new.rule.name {
+                Some(n) => inner.iter().find(|o| o.rule.name.as_ref() == Some(n)),
+                None => inner.get(i).filter(|o| o.rule.name.is_none()),
+            };
+            if let Some(old) = old {
+                new.hits = old.hits;
+                new.reached = old.reached;
+            }
         }
         *inner = compiled;
         Ok(())
@@ -651,6 +813,7 @@ impl Scripts {
     /// Appends rules after the existing ones.
     pub fn append(&self, rules: Vec<Rule>) -> Result<(), ScriptError> {
         let mut inner = self.inner.lock();
+        check_after(inner.iter().map(|c| &c.rule).chain(rules.iter()))?;
         let compiled = compile_all(rules, inner.len())?;
         inner.extend(compiled);
         Ok(())
@@ -690,6 +853,7 @@ impl Scripts {
 
     /// For snapshots: replaces all rules and counters with `state`. Fails without changing anything if a rule is invalid.
     pub fn import_state(&self, state: Vec<ScriptState>) -> Result<(), ScriptError> {
+        check_after(state.iter().map(|s| &s.rule))?;
         let mut compiled = Vec::with_capacity(state.len());
         for (i, s) in state.into_iter().enumerate() {
             let mut c = Compiled::new(s.rule, i)?;
@@ -734,22 +898,65 @@ impl Scripts {
         self.resolve_where_from(req, 0, accept)
     }
 
+    /// Like [`Scripts::resolve_where`], but only looks: no hit and no reached counter changes, so a
+    /// `times` / `every_nth` / `probability` budget stays for the request meant to use it.
+    pub fn peek_where(&self, req: &Request, accept: impl Fn(&ReplySpec) -> bool) -> Option<(usize, Option<String>, ReplySpec)> {
+        self.resolve_inner(req, 0, accept, false)
+    }
+
     fn resolve_where_from(
         &self,
         req: &Request,
         start: usize,
         accept: impl Fn(&ReplySpec) -> bool,
     ) -> Option<(usize, Option<String>, ReplySpec)> {
+        self.resolve_inner(req, start, accept, true)
+    }
+
+    fn resolve_inner(
+        &self,
+        req: &Request,
+        start: usize,
+        accept: impl Fn(&ReplySpec) -> bool,
+        count: bool,
+    ) -> Option<(usize, Option<String>, ReplySpec)> {
         let mut inner = self.inner.lock();
+        // Hits per rule name, only when some rule is gated on another (`match.after`).
+        let named_hits: std::collections::HashMap<String, u64> = if inner.iter().any(|c| c.rule.matcher.after.is_some()) {
+            let mut map = std::collections::HashMap::new();
+            for c in inner.iter() {
+                if let Some(n) = &c.rule.name {
+                    *map.entry(n.clone()).or_insert(0) += c.hits;
+                }
+            }
+            map
+        } else {
+            Default::default()
+        };
         let mut found = None;
         for (index, c) in inner.iter_mut().enumerate().skip(start) {
-            if !c.exhausted() && accept(&c.rule.reply) && c.matches(req) {
+            if let Some(after) = &c.rule.matcher.after
+                && named_hits.get(after).copied().unwrap_or(0) < u64::from(c.rule.matcher.after_count.unwrap_or(1))
+            {
+                continue;
+            }
+            if c.exhausted() || !accept(&c.rule.reply) {
+                continue;
+            }
+            let reached = c.reached;
+            let hit = c.matches(req);
+            if !count {
+                c.reached = reached;
+            }
+            if hit {
                 found = Some((index, c));
                 break;
             }
         }
         let (index, c) = found?;
-        c.hits += 1;
+        if count {
+            c.hits += 1;
+        }
         Some((index, c.rule.name.clone(), c.rule.reply.clone()))
     }
 }
@@ -938,9 +1145,9 @@ impl Engine {
     }
 
     /// The `input_tokens` of `POST /v1/messages/count_tokens`: the first rule that matches and
-    /// sets `usage.prompt_tokens` (counting its hit), else the tokenizer's count. Rules without
-    /// that field are skipped so a count call never eats the budget of the rule meant for the
-    /// real request.
+    /// sets `usage.prompt_tokens` (without counting a hit or a reach), else the tokenizer's count.
+    /// Rules without that field are skipped and the chosen rule keeps its budget, so a count call
+    /// never eats what the real request was meant to use.
     ///
     /// Real Anthropic semantics: `usage.input_tokens` of a message excludes cache reads and writes
     /// (`total = input + cache_read + cache_creation`) while `count_tokens` counts the whole input.
@@ -948,7 +1155,7 @@ impl Engine {
     /// `count_tokens` is the tokenizer total and a message derives `input_tokens` from the same total.
     pub fn count_input_tokens(&self, req: &Request) -> u32 {
         self.scripts
-            .resolve_where(req, |r| r.usage.as_ref().is_some_and(|u| u.prompt_tokens.is_some()))
+            .peek_where(req, |r| r.usage.as_ref().is_some_and(|u| u.prompt_tokens.is_some()))
             .and_then(|(_, _, spec)| spec.usage?.prompt_tokens)
             .unwrap_or_else(|| tokenizer::count_request(req))
     }
@@ -1025,6 +1232,7 @@ impl Engine {
             FinishReason::Stop
         });
         let over = spec.usage.unwrap_or_default();
+        delivery.input_tokens_in_delta = over.input_tokens_in == Some(InputTokensIn::Delta);
         let reasoning_tokens = over
             .reasoning_tokens
             .unwrap_or_else(|| spec.reasoning.as_deref().map_or(0, tokenizer::count));
@@ -1229,6 +1437,15 @@ mod tests {
         assert!(ci.is_match("say hello"));
         assert!(!Pattern("/HELLO/".into()).compile().unwrap().is_match("hello"));
         assert!(Pattern("a/b".into()).compile().unwrap().is_match("a/b"));
+        // Lookaround and backreferences need the fancy engine; plain patterns stay on `regex`.
+        assert!(matches!(Pattern("/ab+c/".into()).compile().unwrap(), Re::Plain(_)));
+        let look = Pattern("/foo(?!bar)/".into()).compile().unwrap();
+        assert!(matches!(look, Re::Fancy(_)));
+        assert!(look.is_match("foobaz") && !look.is_match("foobar"));
+        let behind = Pattern(r"/(?<=\$)\d+/".into()).compile().unwrap();
+        assert!(behind.is_match("cost $42") && !behind.is_match("cost 42"));
+        assert_eq!(look.try_replace_all_literal("foobar foobaz", "X").as_deref(), Some("foobar Xbaz"));
+        assert!(Pattern("/(unclosed/".into()).compile().is_err());
     }
 
     #[test]
@@ -1362,6 +1579,60 @@ mod tests {
         assert_eq!((delivery.chunk_tokens, delivery.cut_after_chunks), (3, Some(2)));
         assert_eq!(source, Source::Script { index: 0, name: None });
         assert!(reply.usage.completion_tokens > 0);
+    }
+
+    #[test]
+    fn keep_hits_follows_names_and_after_is_checked() {
+        let e = engine(false);
+        let parse = |j: &str| Rule::parse_many(j, ScriptFormat::Json).unwrap();
+        e.scripts
+            .replace(parse(
+                r#"[{"name":"a","reply":{"text":"A"}},{"name":"b","reply":{"text":"B"},"match":{"after":"a"}}]"#,
+            ))
+            .unwrap();
+        e.resolve(&user("x"));
+        // Reordered: "a" moves to index 1 and keeps its hit.
+        e.scripts
+            .replace_keep_hits(parse(r#"[{"name":"c","reply":{"text":"C"}},{"name":"a","reply":{"text":"A"}}]"#))
+            .unwrap();
+        let list = e.scripts.list();
+        assert_eq!((list[0].hits, list[1].hits), (0, 1));
+        // Unknown and cyclic gates are rejected, nothing changes.
+        let err = e
+            .scripts
+            .replace(parse(r#"[{"name":"a","reply":{"text":"A"},"match":{"after":"nope"}}]"#))
+            .unwrap_err();
+        assert!(err.to_string().contains("names no rule"), "{err}");
+        let err = e
+            .scripts
+            .replace(parse(
+                r#"[{"name":"a","reply":{"text":"A"},"match":{"after":"b"}},{"name":"b","reply":{"text":"B"},"match":{"after":"a"}}]"#,
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("cycle"), "{err}");
+        assert_eq!(e.scripts.len(), 2);
+    }
+
+    #[test]
+    fn count_tokens_does_not_spend_a_rules_budget() {
+        let e = engine(false);
+        e.scripts
+            .replace(
+                Rule::parse_many(
+                    r#"[{"times":1,"reply":{"text":"hi","usage":{"prompt_tokens":77}}}]"#,
+                    ScriptFormat::Json,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(e.count_input_tokens(&user("x")), 77);
+        assert_eq!(e.count_input_tokens(&user("x")), 77);
+        let info = &e.scripts.list()[0];
+        assert_eq!((info.hits, info.reached), (0, 0));
+        let Outcome::Reply { reply, .. } = e.resolve(&user("x")) else {
+            panic!()
+        };
+        assert_eq!(reply.usage.prompt_tokens, 77);
     }
 
     #[test]
@@ -1583,6 +1854,14 @@ mod tests {
         let rule = |reply: serde_json::Value| Rule::parse_many(&json!([{ "reply": reply }]).to_string(), ScriptFormat::Json);
         let ok = |reply: serde_json::Value| Scripts::default().replace(rule(reply).unwrap()).is_ok();
         assert!(ok(json!({"trajectory": "t"})));
+        // hang_ms and delay_ms / ttft_ms mean different things; combining them is refused.
+        assert!(ok(json!({"text": "x", "hang_ms": 50})));
+        assert!(!ok(json!({"text": "x", "hang_ms": 50, "delay_ms": 5})));
+        assert!(!ok(json!({"text": "x", "hang_ms": 50, "stream": {"ttft_ms": 5}})));
+        let err = Scripts::default()
+            .replace(rule(json!({"text": "x", "hang_ms": 50, "delay_ms": 5})).unwrap())
+            .unwrap_err();
+        assert!(err.0.contains("hang_ms") && err.0.contains("delay_ms"), "{}", err.0);
         assert!(ok(json!({"policy": "p", "stream": {"tokens_per_sec": 10}, "delay_ms": 5})));
         assert!(!ok(json!({"trajectory": "t", "text": "x"})));
         assert!(!ok(json!({"policy": "p", "error": {"status": 500}})));

@@ -14,6 +14,7 @@ use crate::control::Control;
 use crate::ir::{ApiError, Delivery, Outcome, Protocol, Request, Source};
 use crate::openai::responses::{ResponseMeta, to_stored};
 use crate::reqlog::RequestRecord;
+use crate::script::Re;
 use crate::upstream::Completed;
 
 /// The `--record` file: a cassette in JSONL form that exchanges are appended to as they complete.
@@ -97,6 +98,44 @@ fn redacted(mut request: Request) -> Request {
     request
 }
 
+/// Replaces every match of `patterns` in every string of the exchange's request and outcome (message and
+/// reasoning text, tool definitions, tool-call arguments and results, `extra`) with `<redacted>`. Keys and the
+/// exchange's own bookkeeping (protocol, meta) are left alone.
+///
+/// Fails closed: a string a pattern cannot be run on (a fancy-regex backtrack limit) is replaced as a whole, and
+/// `None` (nothing may be recorded) comes back when the exchange cannot be round-tripped through JSON.
+pub(crate) fn redact_exchange(exchange: Exchange, patterns: &[Re]) -> Option<Exchange> {
+    if patterns.is_empty() {
+        return Some(exchange);
+    }
+    fn walk(v: &mut serde_json::Value, patterns: &[Re]) {
+        match v {
+            serde_json::Value::String(s) => {
+                for re in patterns {
+                    match re.try_replace_all_literal(s, "<redacted>") {
+                        Some(r) => *s = r,
+                        None => {
+                            tracing::warn!(target: "fakellm::upstream", "a --record-redact pattern failed at run time; the whole text is redacted");
+                            *s = "<redacted>".into();
+                            break;
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| walk(x, patterns)),
+            serde_json::Value::Object(o) => o.values_mut().for_each(|x| walk(x, patterns)),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(&exchange).ok()?;
+    for key in ["request", "outcome"] {
+        if let Some(part) = value.get_mut(key) {
+            walk(part, patterns);
+        }
+    }
+    serde_json::from_value(value).ok()
+}
+
 fn ends_with_newline(path: &Path) -> std::io::Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
@@ -150,11 +189,19 @@ pub fn finish(f: Finish, completed: Completed) {
             },
             ignore: Vec::new(),
         };
-        control.engine.cassettes.record(exchange.clone());
-        if let Some(recorder) = control.upstream.as_ref().and_then(|u| u.recorder())
-            && let Err(e) = recorder.append(&exchange)
-        {
-            tracing::warn!(target: "fakellm::upstream", "cannot write {}: {e}", recorder.path().display());
+        let exchange = match control.upstream.as_ref() {
+            Some(u) => u.redact(exchange),
+            None => Some(exchange),
+        };
+        if let Some(exchange) = exchange {
+            control.engine.cassettes.record(exchange.clone());
+            if let Some(recorder) = control.upstream.as_ref().and_then(|u| u.recorder())
+                && let Err(e) = recorder.append(&exchange)
+            {
+                tracing::warn!(target: "fakellm::upstream", "cannot write {}: {e}", recorder.path().display());
+            }
+        } else {
+            tracing::warn!(target: "fakellm::upstream", "cannot redact an exchange; it is not recorded");
         }
     }
     if request.protocol == Protocol::OpenaiResponses
@@ -197,6 +244,33 @@ pub fn finish(f: Finish, completed: Completed) {
 mod tests {
     use super::*;
     use crate::ir::{Message, Reply, Role};
+
+    #[test]
+    fn redaction_fails_closed_on_a_regex_that_errors_at_run_time() {
+        let ex = |text: &str| Exchange {
+            request: Request::new("gpt-4o", vec![Message::text(Role::User, text)]),
+            outcome: CassetteOutcome::Reply { reply: Reply::default() },
+            protocol: Protocol::OpenaiChat,
+            meta: ExchangeMeta::default(),
+            ignore: vec![],
+        };
+        let catastrophic = Re::new(r"(a+)+\1b").unwrap();
+        let long = "a".repeat(5000);
+        let out = redact_exchange(ex(&format!("key {long}")), &[catastrophic]).unwrap();
+        assert!(
+            serde_json::to_string(&out.request.messages[0].content)
+                .unwrap()
+                .contains("<redacted>\"")
+                && !serde_json::to_string(&out.request.messages[0].content).unwrap().contains("key")
+        );
+        let plain = Re::new("sk-[a-z]+").unwrap();
+        let out = redact_exchange(ex("my sk-abc here"), &[plain]).unwrap();
+        assert!(
+            serde_json::to_string(&out.request.messages[0].content)
+                .unwrap()
+                .contains("my <redacted> here")
+        );
+    }
 
     #[test]
     fn record_file_gets_a_header_once_and_one_line_per_exchange() {

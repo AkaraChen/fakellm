@@ -95,7 +95,7 @@ curl -X POST $E/_fakellm/trajectories -d @extra.json            # 追加，同�
 - 两个并行的对话互不干扰；
 - Responses 请求用 `previous_response_id` 也行（fakellm 先把保存的历史接上）。
 
-`cursor: by_hits` 用这条轨迹被请求的次数，给**不带历史**的客户端用；重试（包括 5xx 之后的 SDK 自动重试）也会推进它，所以别和故障注入混用。每条轨迹的计数独立，重新注册或 `reset` 时清零。
+`cursor: by_hits` 用这条轨迹已经答过多少个**不同的**请求当步骤号，给**不带历史**的客户端用。请求与上一个请求完全相同（解析后的消息一样）时重放上一步而不前进，所以 SDK 的自动重试（5xx、网络错误之后）不会吃掉步骤，也可以和故障注入混用。注意：一个每轮都发完全相同请求的客户端因此永远停在第 0 步；这种客户端写 `dedupe: false` 恢复旧行为（每个请求都前进）。每条轨迹的计数独立，重新注册或 `reset` 时清零，快照会保存它。
 
 步骤号超过 `steps` 的长度：`strict` 返回 400 `fakellm_trajectory_exhausted`，`lenient` 和 `stop` 回复 `stop_text` 并结束。
 
@@ -108,7 +108,7 @@ curl -X POST $E/_fakellm/trajectories -d @extra.json            # 追加，同�
 | `tool_results` | 一个列表，每一项要对应请求末尾的一个工具结果，**各自独立**（写两项就需要两个结果）；没被任何一项提到的结果忽略 |
 | `tool_results[].name` | 这个结果回答的工具名。写轨迹里的名字或经 `tool_map` 改写后的客户端名字都行；结果消息自己没有名字的协议（Chat），按 `tool_call_id` 到历史里的 assistant 调用去反查 |
 | `tool_results[].id` | 精确的 `tool_call_id` |
-| `tool_results[].contains` | 对结果文本的正则（`re`、`/re/`、`/re/i`；Rust regex，不支持环视） |
+| `tool_results[].contains` | 对结果文本的正则（`re`、`/re/`、`/re/i`；Rust regex，遇到环视和反向引用时自动改用 fancy-regex） |
 | `tool_results[].equals` | 结果文本完全相等 |
 | `tool_results[].is_error` | 是否是错误结果（Anthropic 的 `is_error`） |
 | `any_user` | 对任意一条 user 消息的正则，匹配前会去掉 `<system-reminder>` 块 |
@@ -159,7 +159,7 @@ tool_map:
 | `GET /_fakellm/trajectories/{name}[?format=jsonl]` | 导出一条（404：不存在） |
 | `DELETE /_fakellm/trajectories/{name}` | 删除一条 |
 
-`hits` 每次请求都算（包括出错的），`last_step` 是最近一次尝试的步骤号。SDK：`llm.trajectories`（`sdk/js`、`bindings/node`）和 Go 的 `s.Trajectories()`。`fakellm ctl` 没有这两组子命令，用 curl 或 SDK。
+`hits` 每次请求都算（包括出错的），`last_step` 是最近一次尝试的步骤号。SDK：`llm.trajectories`（`sdk/js`、`bindings/node`）和 Go 的 `s.Trajectories()`。CLI：`fakellm ctl trajectories {list,put,add,get,delete,clear}`（见[控制面](control-plane.md#cli)）。
 
 ## 策略脚本
 
@@ -187,7 +187,7 @@ export default function decide(request, context) {
 }
 ```
 
-- **默认导出**一个函数（同步或 async），只支持 ES 模块语法；源码被写成临时目录里的单个 `policy.mjs`，不支持相对 import，可以用运行时自带的内置模块（`node:fs` 之类）。
+- **默认导出**一个函数（同步或 async），只支持 ES 模块语法；源码被写成临时目录里的 `policy.mjs`，可以用运行时自带的内置模块（`node:fs` 之类）。需要多个文件时用注册对象的 `files`：相对路径到源码的映射（`{"helper.js": "export const f = ...", "lib/x.mjs": "..."}`），连同 `policy.mjs` 一起写进临时目录，入口里就能 `import { f } from "./helper.js"`。路径必须是相对路径、不含 `..`、不能叫 `policy.mjs`，否则 400；临时目录里默认有 `{"type":"module"}` 的 `package.json`（`files` 里自己给一个则以它为准）。`--policy FILE` 仍然只读单个文件。
 - `request` 是解析后的请求，和 `GET /_fakellm/requests?full=true` 里的 `request` 完全一样：`messages`（`role`、`content` 是 `{type, text}` 的数组、`tool_calls`、`tool_call_id`）、`tools`、`model`、`stream` 等，文本都是原文，没有去掉 `<system-reminder>`。
 - `context` 有三样：`state`（上一次返回的状态，初始 `{}`）、`hits`（这个策略之前已经做过几次决定，第一次是 0）、`log(...)`（写一行日志）。
 - 返回值是一个回复对象，字段同剧本的 `reply`（`text`、`tool_calls`、`error`、`usage`、`stream` 等），**可以**写 `trajectory` 让某条轨迹来回答这个请求，**不能**写 `policy`；加一个可选的 `state`。规则上的 `stream`、`delay_ms`、`hang*`、`reset`、`usage` 是策略回复的默认值。回复既没有内容、也没有 `error`、`hang` 或 `trajectory` 是 400 `fakellm_policy_error`。
@@ -218,12 +218,18 @@ shim -> fakellm   {"id":7,"reply":{...},"state":{...}}                   返回�
 
 | 运行时 | 说明 |
 |---|---|
-| `tjs`（[txiki.js](https://github.com/saghul/txiki.js)） | 默认，体积小、启动快；`PATH` 里有它才会选。**shim 是按 txiki.js 的 API 写的，没有在真实的 `tjs` 上跑过** |
+| `tjs`（[txiki.js](https://github.com/saghul/txiki.js)） | 默认，体积小、启动快；`PATH` 里有它才会选。在 v26.6.0 上测过（见下）。官方没有 Linux 预编译包（release 只有 macOS / Windows），Linux 要自己编译 |
 | `node` | 测试过 |
 | `bun` | 测试过（`bun run`） |
 | 其他路径 | 任意可执行文件；shim 按文件名选（`tjs`、`bun`，其余当 Node） |
 
 选择顺序：注册时的 `runtime` 字段 > `--policy-runtime`（`FAKELLM_POLICY_RUNTIME`）> 在 `PATH` 里依次找 `tjs`、`node`、`bun`。一个都没有时注册返回 400（"no JavaScript runtime found: install node, bun or txiki.js (tjs), or pass runtime"）。
+
+#### txiki.js 说明
+
+- 编译：`git clone --recursive https://github.com/saghul/txiki.js && cd txiki.js && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8`，产物 `build/tjs`（只需要 cmake、gcc、make，不需要 ninja；约 5 分钟）。
+- shim 用到的 API：`tjs.stdin.getReader()` / `tjs.stdout.getWriter()`（stdio 是 Web Streams，没有 `tjs.stdin.read(buffer)` 这种方法，早先按文档推测写的版本在第一次 `send` 就抛 `not a function`）、`tjs.env`、`tjs.exit`、顶层 `await import()`、`TextEncoder` / `TextDecoder`。策略里要立刻退出用 `tjs.exit(n)`，不是 `process.exit`。
+- 测试：`FAKELLM_TJS=/path/to/tjs cargo test --test policy_tjs`（状态、命中数、日志、崩溃恢复、抛错、decline、坏模块、超时、30 万字节的请求体）。另外把 `tests/policy.rs` 的 23 个场景整体换成 tjs 运行时跑过一遍，22 个通过，剩下一个只是断言运行时名字是 `node`。
 
 ### 注册
 
@@ -233,7 +239,7 @@ curl -X PUT $E/_fakellm/policies -H 'content-type: application/json' \
   -d '{"name": "reader", "runtime": "node", "source": "export default () => ({ text: \"hi\" })"}'
 ```
 
-`PUT|POST /_fakellm/policies` 收一个 `{name, source, runtime?}`、一个数组或 `{"policies": [...]}`（JSON 或 YAML）。名字只能用字母、数字、`.`、`_`、`-`。注册时会先加载一次模块：语法错误、没有默认导出函数、运行时起不来都是 400，信息里带模块自己的错误，已有的策略不会被改动。`PUT` 是全量替换（被换掉的策略的进程和状态都清掉），`POST` 同名替换。`--policy` 加载失败时 fakellm 启动失败。
+`PUT|POST /_fakellm/policies` 收一个 `{name, source, runtime?, files?}`、一个数组或 `{"policies": [...]}`（JSON 或 YAML）。名字只能用字母、数字、`.`、`_`、`-`。注册时会先加载一次模块：语法错误、没有默认导出函数、运行时起不来都是 400，信息里带模块自己的错误，已有的策略不会被改动。`PUT` 是全量替换（被换掉的策略的进程和状态都清掉），`POST` 同名替换。`--policy` 加载失败时 fakellm 启动失败。
 
 ### 超时与错误
 
@@ -339,8 +345,8 @@ agent 的每个请求会得到：`read_file` → `edit_file` →（结果带 err
 
 ## 已知限制
 
-- `tjs` 的 shim 没有实测过（环境里没有 txiki.js）；`node`、`bun` 测过。
+- `tjs`、`node`、`bun` 的 shim 都在真实运行时上测过；`tjs` 的测试需要 `FAKELLM_TJS` 指向二进制，否则跳过。
 - `fakellm ctl` 没有 trajectories / policies 子命令，用 curl、`sdk/js`、`bindings/node` 或 Go helper。
 - 策略不能 import 相对路径的其他文件。
-- `bindings/node` 的策略注册是同步方法，决策子进程启动和加载时会阻塞 JS 线程（约 100 ms）。
+- `bindings/node` 的 `policies.put` / `add` 返回 Promise，子进程在工作线程里加载，不阻塞 JS 线程；`snapshots.restore` 还原策略时仍是同步的（要重启子进程，会阻塞）。
 - `bindings/node` 的 `npm test` 只覆盖到 OpenAI 路径上的轨迹和策略；Responses 与 Anthropic 路径由 `tests/agent.rs`、`tests/policy.rs` 和 `sdk/node` 覆盖。

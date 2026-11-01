@@ -123,6 +123,10 @@ pub struct Trajectory {
     pub stop_text: Option<String>,
     #[serde(default)]
     pub cursor: Cursor,
+    /// `by_hits` only: a request identical to the previous one (same IR messages) replays the previous
+    /// step instead of advancing, so SDK retries do not eat steps. `false` counts every request.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub dedupe: bool,
     #[serde(default, skip_serializing_if = "ToolMap::is_empty")]
     pub tool_map: ToolMap,
     #[serde(default)]
@@ -439,6 +443,14 @@ fn unpaired_calls(req: &Request) -> Vec<String> {
     missing
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 /// What the registry says about one trajectory.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrajectoryInfo {
@@ -459,6 +471,9 @@ pub struct TrajectoryState {
     pub trajectory: Trajectory,
     pub hits: u64,
     pub last_step: Option<usize>,
+    /// The `by_hits` cursor and the hash of the request that moved it last.
+    pub(crate) pos: usize,
+    pub(crate) last_request: Option<u64>,
 }
 
 /// The step chosen for a request.
@@ -480,6 +495,16 @@ struct Compiled {
     trajectory: Trajectory,
     hits: u64,
     last_step: Option<usize>,
+    /// `by_hits`: number of distinct steps handed out so far.
+    pos: usize,
+    last_request: Option<u64>,
+}
+
+fn request_hash(req: &Request) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(&req.messages).unwrap_or_default().hash(&mut h);
+    h.finish()
 }
 
 impl Trajectories {
@@ -518,6 +543,8 @@ impl Trajectories {
                 trajectory,
                 hits: 0,
                 last_step: None,
+                pos: 0,
+                last_request: None,
             })
             .collect())
     }
@@ -559,6 +586,8 @@ impl Trajectories {
                 trajectory: c.trajectory.clone(),
                 hits: c.hits,
                 last_step: c.last_step,
+                pos: c.pos,
+                last_request: c.last_request,
             })
             .collect()
     }
@@ -569,6 +598,8 @@ impl Trajectories {
         for (c, s) in compiled.iter_mut().zip(&state) {
             c.hits = s.hits;
             c.last_step = s.last_step;
+            c.pos = s.pos;
+            c.last_request = s.last_request;
         }
         *self.inner.lock() = compiled;
         Ok(())
@@ -594,7 +625,8 @@ impl Trajectories {
     ///
     /// 1. Unknown name: `ApiError::trajectory_not_found`.
     /// 2. The step index: `req.assistant_turns()` for `by_turn`; for `by_hits` the number of earlier
-    ///    calls (the counter then increments). Every call counts in `hits`.
+    ///    distinct requests (a request equal to the previous one replays its step unless `dedupe` is
+    ///    off). Every call counts in `hits`.
     /// 3. `check_pairing` and the step's `expect` are checked; a mismatch is handled per
     ///    `on_divergence` (strict: `ApiError::trajectory_diverged` with expected against got).
     /// 4. Past the last step: strict gives `ApiError::trajectory_exhausted`, the others a reply
@@ -609,7 +641,16 @@ impl Trajectories {
             .ok_or_else(|| (ApiError::trajectory_not_found(name), req.assistant_turns()))?;
         let index = match c.trajectory.cursor {
             Cursor::ByTurn => req.assistant_turns(),
-            Cursor::ByHits => c.hits as usize,
+            Cursor::ByHits => {
+                let hash = request_hash(req);
+                if c.trajectory.dedupe && c.pos > 0 && c.last_request == Some(hash) {
+                    c.pos - 1
+                } else {
+                    c.last_request = Some(hash);
+                    c.pos += 1;
+                    c.pos - 1
+                }
+            }
         };
         c.hits += 1;
         let result = select(&c.trajectory, index, req).map_err(|e| (e, index));
@@ -787,15 +828,31 @@ mod tests {
     }
 
     #[test]
-    fn by_hits_counts_calls() {
+    fn by_hits_counts_distinct_requests() {
         let r = registry(base(json!({"cursor": "by_hits", "on_divergence": "lenient"})));
+        let req = first(&["run_shell"]);
+        assert_eq!(r.step("t", &req).unwrap().step, 0);
+        // An SDK retry sends the same request: same step.
+        assert_eq!(r.step("t", &req).unwrap().step, 0);
+        assert_eq!(r.step("t", &req).unwrap().step, 0);
+        let next = second(&["run_shell"], "Cargo.toml");
+        assert_eq!(r.step("t", &next).unwrap().step, 1);
+        assert_eq!(r.step("t", &next).unwrap().step, 1);
+        let past = r.step("t", &req).unwrap();
+        assert_eq!((past.step, past.reply.text.as_deref()), (2, Some(DEFAULT_STOP_TEXT)));
+        assert_eq!(r.list()[0].hits, 6);
+        r.upsert(vec![base(json!({"cursor": "by_hits"}))]).unwrap();
+        assert_eq!(r.list()[0].hits, 0);
+    }
+
+    #[test]
+    fn by_hits_without_dedupe_counts_every_call() {
+        let r = registry(base(json!({"cursor": "by_hits", "dedupe": false, "on_divergence": "lenient"})));
         let req = first(&["run_shell"]);
         assert_eq!(r.step("t", &req).unwrap().step, 0);
         assert_eq!(r.step("t", &req).unwrap().step, 1);
         let past = r.step("t", &req).unwrap();
         assert_eq!((past.step, past.reply.text.as_deref()), (2, Some(DEFAULT_STOP_TEXT)));
-        r.upsert(vec![base(json!({"cursor": "by_hits"}))]).unwrap();
-        assert_eq!(r.list()[0].hits, 0);
     }
 
     #[test]

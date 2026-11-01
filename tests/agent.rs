@@ -222,10 +222,29 @@ async fn parallel_conversations_and_retries_do_not_interfere() {
 }
 
 #[tokio::test]
-async fn by_hits_cursor_counts_requests() {
+async fn by_hits_cursor_replays_retries_and_advances_on_new_requests() {
     let s = start().await;
     let mut t = tool_text();
     t["cursor"] = json!("by_hits");
+    put_json(&s, t).await;
+    attach(&s, "fix").await;
+    let body = chat_history("same history every time", &[], &["read_file", "edit_file"]);
+    // A retry of the same request replays the step.
+    assert_eq!(first_call(&chat(&s, &body).await).0, "read_file");
+    assert_eq!(first_call(&chat(&s, &body).await).0, "read_file");
+    let next = chat_history("another request", &[], &["read_file", "edit_file"]);
+    assert_eq!(first_call(&chat(&s, &next).await).0, "edit_file");
+    assert_eq!(first_call(&chat(&s, &next).await).0, "edit_file");
+    let last = chat_history("a third request", &[], &["read_file", "edit_file"]);
+    assert_eq!(content(&chat(&s, &last).await), "All fixed.");
+}
+
+#[tokio::test]
+async fn by_hits_cursor_without_dedupe_counts_requests() {
+    let s = start().await;
+    let mut t = tool_text();
+    t["cursor"] = json!("by_hits");
+    t["dedupe"] = json!(false);
     put_json(&s, t).await;
     attach(&s, "fix").await;
     let body = chat_history("same history every time", &[], &["read_file", "edit_file"]);

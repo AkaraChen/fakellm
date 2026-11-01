@@ -373,32 +373,40 @@ async fn model_glob_pins_the_cassette() {
 
 #[tokio::test]
 async fn fuzzy_matches_nearest_and_strict_does_not() {
-    let two = |first: &str, last: &str, text: &str| {
-        let mut e = exchange(last, text);
-        e["request"]["messages"] =
-            json!([user_msg(first), {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}, user_msg(last)]);
-        e
-    };
-    let live = json!({"model": "gpt-4o", "messages": [
-        {"role": "user", "content": "first, changed"},
-        {"role": "assistant", "content": "ok"},
-        {"role": "user", "content": "the question"},
-    ]});
+    let long = "please fix the failing parser test and then run the whole suite again";
     let s = start().await;
-    put_cassettes(&s, &cassette("exact", vec![two("first", "the question", "recorded")])).await;
+    put_cassettes(&s, &cassette("exact", vec![exchange(long, "recorded")])).await;
+    let near = chat_body("gpt-4o", "Please fix the failing parser test, then run the whole suite again!");
     assert!(
-        is_default_reply(&chat_text(&chat(&s, &live).await)),
+        is_default_reply(&chat_text(&chat(&s, &near).await)),
         "no fuzzy: falls to the default reply"
     );
-    let mut c = cassette("fz", vec![two("first", "the question", "recorded")]);
+    let mut c = cassette("fz", vec![exchange(long, "recorded")]);
     c["fuzzy"] = json!(true);
     put_cassettes(&s, &c).await;
-    assert_eq!(chat_text(&chat(&s, &live).await), "recorded");
-    // A different last user text never fuzzy-matches.
-    let other = json!({"model": "gpt-4o", "messages": [
-        {"role": "user", "content": "first"}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "another"},
-    ]});
-    assert!(is_default_reply(&chat_text(&chat(&s, &other).await)));
+    assert_eq!(chat_text(&chat(&s, &near).await), "recorded");
+    // A different conversation never fuzzy-matches.
+    let far = chat_body("gpt-4o", "what is the capital of france and its population");
+    assert!(is_default_reply(&chat_text(&chat(&s, &far).await)));
+}
+
+#[tokio::test]
+async fn sample_cassette_answers_any_prompt_deterministically() {
+    let s = start().await;
+    let mut c = cassette(
+        "corpus",
+        (0..8).map(|i| exchange(&format!("question {i}"), &format!("answer {i}"))).collect(),
+    );
+    c["sample"] = json!(true);
+    put_cassettes(&s, &c).await;
+    let ask = |q: &'static str| {
+        let s = &s;
+        async move { chat_text(&chat(s, &chat_body("gpt-4o", q)).await) }
+    };
+    let first = ask("a prompt nobody recorded").await;
+    assert!(first.starts_with("answer "), "{first}");
+    assert_eq!(ask("a prompt nobody recorded").await, first);
+    assert_eq!(ask("question 5").await, "answer 5", "exact matches still win");
 }
 
 #[tokio::test]

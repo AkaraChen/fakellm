@@ -447,3 +447,43 @@ func TestCustomEndpointRule(t *testing.T) {
 		t.Fatalf("got %d %v %s", res.StatusCode, res.Header, b)
 	}
 }
+
+func TestRuntimeOptionsAndLastUserRaw(t *testing.T) {
+	// MaxSnapshots reaches the binary: the second snapshot is refused.
+	s, ctx := start(t, fakellm.Options{MaxSnapshots: 1, PolicyTimeoutMs: 1000, UpstreamTimeoutSecs: 0})
+	if err := s.Scripts().Clear(ctx); err != nil {
+		t.Fatal(err)
+	}
+	post := func(name string) int {
+		res, err := http.Post(s.URL()+"/_fakellm/snapshots", "application/json", strings.NewReader(`{"name":"`+name+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+	if a, b := post("one"), post("two"); a != 201 || b != 409 {
+		t.Fatalf("snapshots: %d then %d", a, b)
+	}
+	// Match.LastUserRaw sees the reminder block that last_user strips.
+	_, err := s.Scripts().Put(ctx, []fakellm.Rule{
+		{Match: fakellm.Match{LastUserRaw: "^<system-reminder>"}, Reply: fakellm.ReplySpec{Text: fakellm.Ptr("raw")}},
+		{Reply: fakellm.ReplySpec{Text: fakellm.Ptr("cooked")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>x</system-reminder>"},{"type":"text","text":"q"}]}]}`
+	req, _ := http.NewRequest("POST", s.AnthropicBaseURL()+"/v1/messages", strings.NewReader(body))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if !strings.Contains(string(b), `"raw"`) {
+		t.Fatalf("got %s", b)
+	}
+}

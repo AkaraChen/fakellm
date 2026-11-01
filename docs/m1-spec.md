@@ -1,5 +1,7 @@
 # M1 implementation spec (internal)
 
+> Status: delivered. This is the implementation spec the milestone was built from, kept as history; the user docs (`docs/*.md`, Chinese) and the code are authoritative where they differ.
+
 Audience: the agents implementing M1 in parallel. Read this, `docs/research.md` (binding wire
 constraints, especially the codex section) and the stub file you own. Everything marked
 "decided" is settled; do not reopen it. Where this spec is silent, follow the nearest existing

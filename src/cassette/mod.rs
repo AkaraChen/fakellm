@@ -10,7 +10,7 @@ pub mod format;
 pub mod normalize;
 pub mod replay;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -38,12 +38,14 @@ impl std::fmt::Display for CassetteError {
 impl std::error::Error for CassetteError {}
 
 /// What the registry says about one cassette.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CassetteInfo {
     pub name: String,
     pub exchanges: usize,
     pub once: bool,
     pub fuzzy: bool,
+    pub fuzzy_threshold: f64,
+    pub sample: bool,
     /// Requests this cassette answered (exact and fuzzy).
     pub hits: u64,
     /// Exchanges already spent (`once` cassettes only; 0 otherwise).
@@ -86,8 +88,8 @@ struct Prepared {
     index: HashMap<Key, Vec<usize>>,
     /// The exchanges with their own `ignore`: their key depends on the live request, so they are scanned.
     custom: Vec<usize>,
-    /// Exchange indexes (ascending) by normalized last user text, to narrow a fuzzy lookup to its candidates.
-    by_last_user: HashMap<Option<String>, Vec<usize>>,
+    /// The token set of every exchange's conversation, for `fuzzy` lookups (empty for other cassettes).
+    tokens: Vec<HashSet<String>>,
 }
 
 /// Exchanges the in-memory `recording` keeps; older ones are dropped (a `--record` file is not trimmed).
@@ -140,12 +142,11 @@ impl Compiled {
                 custom.push(i);
             }
         }
-        let mut by_last_user: HashMap<Option<String>, Vec<usize>> = HashMap::new();
-        if cassette.fuzzy {
-            for (i, e) in cassette.exchanges.iter().enumerate() {
-                by_last_user.entry(matcher.last_user(&e.request)).or_default().push(i);
-            }
-        }
+        let tokens = if cassette.fuzzy {
+            cassette.exchanges.iter().map(|e| matcher.tokens(&e.request)).collect()
+        } else {
+            Vec::new()
+        };
         let consumed = vec![false; cassette.exchanges.len()];
         Ok(Self {
             prep: Arc::new(Prepared {
@@ -154,7 +155,7 @@ impl Compiled {
                 keys,
                 index,
                 custom,
-                by_last_user,
+                tokens,
             }),
             consumed,
             hits: 0,
@@ -241,6 +242,8 @@ impl Cassettes {
             exchanges: c.cassette.exchanges.len(),
             once: c.cassette.once,
             fuzzy: c.cassette.fuzzy,
+            fuzzy_threshold: c.cassette.fuzzy_threshold,
+            sample: c.cassette.sample,
             hits: c.hits,
             consumed: c.consumed.iter().filter(|&&spent| spent).count(),
             recording: false,
@@ -250,6 +253,8 @@ impl Cassettes {
             exchanges: r.exchanges.len(),
             once: false,
             fuzzy: false,
+            fuzzy_threshold: format::DEFAULT_FUZZY_THRESHOLD,
+            sample: false,
             hits: 0,
             consumed: 0,
             recording: true,
@@ -291,27 +296,44 @@ impl Cassettes {
             }
         }
         if found.is_none() {
-            let mut best: Option<(usize, usize, usize)> = None;
+            let mut best: Option<(f64, usize, usize)> = None;
             for (ci, c) in state.cassettes.iter().enumerate() {
                 if !c.cassette.fuzzy || !c.matcher.accepts_model(&req.model) {
                     continue;
                 }
-                let Some(candidates) = c.by_last_user.get(&c.matcher.last_user(req)) else {
-                    continue;
-                };
-                for &ei in candidates {
+                let live = c.matcher.tokens(req);
+                let threshold = c.cassette.fuzzy_threshold;
+                for (ei, recorded) in c.tokens.iter().enumerate() {
                     if c.consumed[ei] && c.cassette.once {
                         continue;
                     }
-                    let Some(score) = c.matcher.similarity_same_last(req, &c.cassette.exchanges[ei].request) else {
+                    // Jaccard can not exceed the ratio of the set sizes: skip hopeless candidates cheaply.
+                    let (lo, hi) = (live.len().min(recorded.len()), live.len().max(recorded.len()));
+                    if hi == 0 || (lo as f64) < threshold * hi as f64 {
                         continue;
-                    };
-                    if best.is_none_or(|(s, _, _)| score > s) {
+                    }
+                    let score = Matcher::jaccard(&live, recorded);
+                    if score >= threshold && best.is_none_or(|(s, _, _)| score > s) {
                         best = Some((score, ci, ei));
                     }
                 }
             }
             found = best.map(|(_, ci, ei)| (ci, ei));
+        }
+        if found.is_none() {
+            // Corpus sampling: the first `sample` cassette with a free reply answers, picked by the request seed.
+            let seed = crate::fallback::request_seed(req);
+            found = state.cassettes.iter().enumerate().find_map(|(ci, c)| {
+                if !c.cassette.sample || !c.matcher.accepts_model(&req.model) {
+                    return None;
+                }
+                let free: Vec<usize> = (0..c.cassette.exchanges.len())
+                    .filter(|&ei| {
+                        !(c.cassette.once && c.consumed[ei]) && matches!(c.cassette.exchanges[ei].outcome, CassetteOutcome::Reply { .. })
+                    })
+                    .collect();
+                (!free.is_empty()).then(|| (ci, free[(seed % free.len() as u64) as usize]))
+            });
         }
         let (ci, ei) = found?;
         let c = &mut state.cassettes[ci];
@@ -490,19 +512,55 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_picks_the_closest_and_needs_the_flag() {
-        let exchanges = vec![reply_exchange(&["a", "x", "go"], "far"), reply_exchange(&["a", "b", "go"], "near")];
+    fn fuzzy_picks_the_closest_above_the_threshold() {
+        let exchanges = vec![
+            reply_exchange(&["alpha beta gamma delta epsilon zeta eta theta"], "far"),
+            reply_exchange(&["one two three four five six seven eight nine ten"], "near"),
+        ];
         let reg = Cassettes::default();
-        let mut c = cassette("f", exchanges.clone());
+        let mut c = cassette("f", exchanges);
         reg.replace(vec![c.clone()]).unwrap();
-        assert!(reg.lookup(&request(&["a", "b", "go"])).is_some());
-        assert!(reg.lookup(&request(&["a", "b2", "go"])).is_none());
+        let near_miss = request(&["one two three four five six seven eight nine eleven"]);
+        assert!(reg.lookup(&near_miss).is_none(), "needs the flag");
         c.fuzzy = true;
+        reg.replace(vec![c.clone()]).unwrap();
+        // 9 of 11 words shared: 0.82.
+        assert_eq!(text_of(&reg.lookup(&near_miss).unwrap()), "near");
+        // Far miss: nothing reaches 0.6.
+        assert!(reg.lookup(&request(&["what is the weather in paris today"])).is_none());
+        // Half the words changed: 5 shared of 15 = 0.33, below the default but accepted at 0.3.
+        let half = request(&["one two three four five aa bb cc dd ee"]);
+        assert!(reg.lookup(&half).is_none());
+        c.fuzzy_threshold = 0.3;
+        reg.replace(vec![c.clone()]).unwrap();
+        assert_eq!(text_of(&reg.lookup(&half).unwrap()), "near");
+        c.fuzzy_threshold = 1.5;
+        assert!(reg.replace(vec![c]).is_err());
+    }
+
+    #[test]
+    fn sample_picks_a_reply_by_request_seed() {
+        let exchanges: Vec<Exchange> = (0..6)
+            .map(|i| reply_exchange(&[&format!("question {i}")], &format!("answer {i}")))
+            .collect();
+        let reg = Cassettes::default();
+        let mut c = cassette("corpus", exchanges);
+        reg.replace(vec![c.clone()]).unwrap();
+        assert!(reg.lookup(&request(&["something unrelated"])).is_none());
+        c.sample = true;
         reg.replace(vec![c]).unwrap();
-        let hit = reg.lookup(&request(&["z", "b", "go"])).unwrap();
-        assert_eq!(text_of(&hit), "near");
-        assert!(reg.lookup(&request(&["a", "b", "stop"])).is_none());
-        assert!(reg.lookup(&request(&["go"])).is_none());
+        let req = request(&["something unrelated"]);
+        let first = text_of(&reg.lookup(&req).unwrap());
+        assert!(first.starts_with("answer "));
+        for _ in 0..5 {
+            assert_eq!(text_of(&reg.lookup(&req).unwrap()), first, "same request, same pick");
+        }
+        let picks: std::collections::HashSet<String> = (0..40)
+            .map(|i| text_of(&reg.lookup(&request(&[&format!("unrelated {i}")])).unwrap()))
+            .collect();
+        assert!(picks.len() > 2, "different requests spread over the corpus: {picks:?}");
+        // An exact match still wins over sampling.
+        assert_eq!(text_of(&reg.lookup(&request(&["question 3"])).unwrap()), "answer 3");
     }
 
     #[test]

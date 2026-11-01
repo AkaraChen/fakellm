@@ -153,6 +153,8 @@ impl Control {
                         .map_err(ControlError::BadRequest)?
                         .with_local_key(config.api_key.clone())
                         .with_record_errors(config.record_errors)
+                        .with_record_redact(&config.record_redact)
+                        .map_err(ControlError::BadRequest)?
                         .with_header_timeout_secs(config.upstream_timeout_secs),
                 )
             }
@@ -166,7 +168,7 @@ impl Control {
             log,
             engine,
             responses: ResponseStore::default(),
-            snapshots: Snapshots::default(),
+            snapshots: Snapshots::with_limit(config.max_snapshots),
             upstream,
             admin: tokio::sync::Mutex::new(()),
             counter: AtomicU64::new(0),

@@ -65,8 +65,12 @@ fn file_prints_one_generated_file_and_opencode_is_not_duplicated() {
 
     let oc = wire::wire("opencode", E).unwrap();
     let shell = wire::format(&oc, Format::Shell).unwrap();
-    assert_eq!(shell.matches("\"$schema\"").count(), 2, "env value plus the file, not three times");
-    assert_eq!(shell.matches("# opencode.json\n").count(), 1);
+    assert_eq!(
+        shell.matches("\"$schema\"").count(),
+        1,
+        "the config is printed once, as the variable"
+    );
+    assert_eq!(shell.matches("# opencode.json\n").count(), 0);
 }
 
 #[test]

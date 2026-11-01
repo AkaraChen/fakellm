@@ -600,3 +600,53 @@ async fn real_upstream_round_trip_when_configured() {
     let rec = recording(&proxy, 1).await;
     assert!(rec["exchanges"][0]["outcome"]["reply"]["text"].is_string());
 }
+
+#[tokio::test]
+async fn record_redact_scrubs_every_recorded_text() {
+    let up = start().await;
+    put_rules(
+        &up,
+        json!([
+            {"match": {"last_user": "tools"}, "reply": {"text": "done with sk-REPLYSECRET", "tool_calls": [
+                {"name": "run", "arguments": {"cmd": "curl -H sk-ARGSECRET"}}]}},
+            {"reply": {"text": "reply mentions sk-REPLYSECRET"}}
+        ]),
+    )
+    .await;
+    let record_file = temp_path("redact.jsonl");
+    let proxy = start_with(Config {
+        record: Some(record_file.clone()),
+        record_redact: vec!["sk-[A-Z]+".into(), "/token=(?=\\d)\\d+/".into()],
+        ..proxy_config(&up)
+    })
+    .await;
+    let mut body = anthropic_body("claude-x", "my key is sk-USERSECRET token=123");
+    body["metadata"] = json!({"user_id": "sk-METASECRET"});
+    anthropic(&proxy, &body).await;
+    let mut tool_result = anthropic_body("claude-x", "tools");
+    tool_result["messages"] = json!([
+        {"role": "user", "content": "tools"},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "run", "input": {"cmd": "echo sk-TOOLARG"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "out sk-TOOLRESULT"}]}
+    ]);
+    anthropic(&proxy, &tool_result).await;
+    let rec = recording(&proxy, 2).await;
+    let memory = rec.to_string();
+    let file = std::fs::read_to_string(&record_file).unwrap();
+    for text in [&memory, &file] {
+        assert!(
+            !text.contains("SECRET") && !text.contains("TOOLARG") && !text.contains("TOOLRESULT"),
+            "{text}"
+        );
+        assert!(!text.contains("token=123"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+    // The client still got the real reply.
+    let live = anthropic(
+        &proxy,
+        &json!({"model": "claude-x", "max_tokens": 64, "messages": [{"role": "user", "content": "other"}]}),
+    )
+    .await;
+    assert!(live.body.contains("sk-REPLYSECRET"), "{}", live.body);
+    let _ = std::fs::remove_file(record_file);
+}

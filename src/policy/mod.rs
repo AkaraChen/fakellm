@@ -40,6 +40,10 @@ pub struct PolicySpec {
     pub name: String,
     /// The ES module source; its default export is `decide(request, context)`.
     pub source: String,
+    /// Extra files written next to the entry module in the policy's temp dir, by relative path
+    /// (`"helper.js": "..."`), so the entry can `import "./helper.js"`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub files: std::collections::BTreeMap<String, String>,
     /// Overrides `Config::policy_runtime` for this policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Runtime>,
@@ -91,6 +95,7 @@ impl PolicySpec {
         Ok(PolicySpec {
             name,
             source: std::fs::read_to_string(path)?,
+            files: Default::default(),
             runtime: None,
         })
     }
@@ -189,6 +194,12 @@ impl Default for Policies {
     }
 }
 
+fn valid_file_path(path: &str) -> bool {
+    use std::path::Component;
+    let p = std::path::Path::new(path);
+    !path.is_empty() && path != "policy.mjs" && !path.contains('\\') && p.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
@@ -262,6 +273,14 @@ impl Policies {
             if !seen.insert(spec.name.as_str()) {
                 return Err(PolicyError(format!("policy {:?} is registered twice", spec.name)));
             }
+            for path in spec.files.keys() {
+                if !valid_file_path(path) {
+                    return Err(PolicyError(format!(
+                        "policy {:?}: file path {path:?} must be relative, without `..`, and not `policy.mjs`",
+                        spec.name
+                    )));
+                }
+            }
         }
         let mut entries = Vec::with_capacity(specs.len());
         for spec in specs {
@@ -284,7 +303,7 @@ impl Policies {
                 log: Arc::default(),
                 closed: tokio::sync::watch::channel(false).0,
             };
-            let process = runtime::spawn(&entry.runtime, &entry.spec.source, self.timeout, entry.logger())
+            let process = runtime::spawn(&entry.runtime, &entry.spec.source, &entry.spec.files, self.timeout, entry.logger())
                 .await
                 .map_err(|e| PolicyError(format!("policy \"{}\": {e}", entry.spec.name)))?;
             entry.live.get_mut().process = Some(process);
@@ -407,7 +426,7 @@ impl Policies {
             live.process = None;
         }
         if live.process.is_none() {
-            let process = runtime::spawn(&entry.runtime, &entry.spec.source, self.timeout, entry.logger())
+            let process = runtime::spawn(&entry.runtime, &entry.spec.source, &entry.spec.files, self.timeout, entry.logger())
                 .await
                 .map_err(|e| ApiError::policy_error(name, &e.0))?;
             live.process = Some(process);
@@ -530,7 +549,7 @@ mod tests {
         assert_eq!(Runtime::Path("/opt/tjs".into()).shim().1, "shim.js");
         assert!(Runtime::Node.args().is_empty());
         assert_eq!(Runtime::Bun.args(), vec![std::ffi::OsString::from("run")]);
-        assert!(runtime::SHIM_BUN.contains("FAKELLM_POLICY_MODULE") && runtime::SHIM_TJS.contains("UNTESTED"));
+        assert!(runtime::SHIM_BUN.contains("FAKELLM_POLICY_MODULE") && runtime::SHIM_TJS.contains("FAKELLM_POLICY_MODULE"));
     }
 
     fn node() -> bool {
@@ -553,6 +572,7 @@ mod tests {
         PolicySpec {
             name: name.into(),
             source: source.into(),
+            files: Default::default(),
             runtime: Some(runtime),
         }
     }

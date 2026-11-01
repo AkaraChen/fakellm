@@ -543,3 +543,67 @@ async fn real_wildchat_fetch_when_asked() {
     assert!(!conv.conversations.is_empty(), "{:?}", conv.reasons);
     to_cassette(&conv.conversations, &opts("wildchat")).validate().unwrap();
 }
+
+// ---- rows copied (truncated, anonymized) from the real datasets; see docs/import.md ----
+
+fn real_rows(name: &str) -> Vec<Value> {
+    let text = std::fs::read_to_string(fixture(name)).unwrap_or_else(|e| panic!("fixture {name}: {e}"));
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn real_dataset_rows_convert_with_auto_detection() {
+    for (file, format, conversations, units) in [
+        ("real_wildchat.jsonl", Format::WildChat, 3, 4),
+        ("real_sharegpt.jsonl", Format::ShareGpt, 3, 4),
+        ("real_hermes.jsonl", Format::HermesFc, 2, 4),
+        ("real_swe_nebius.jsonl", Format::SweAgent, 1, 3),
+        ("real_swe_smith_tool.jsonl", Format::SweAgent, 1, 3),
+        ("real_swe_smith_xml.jsonl", Format::SweAgent, 1, 3),
+        ("real_swe_smith_ticks.jsonl", Format::SweAgent, 1, 3),
+        ("real_openhands.jsonl", Format::SweAgent, 2, 8),
+        ("xlam.jsonl", Format::Xlam, 2, 2),
+    ] {
+        let rows = real_rows(file);
+        assert!(
+            rows[0]["_comment"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("real") || c.starts_with("synthetic"))
+        );
+        assert_eq!(detect(&rows[0]), Some(format), "{file}");
+        let conv = convert_rows(&rows, Format::Auto);
+        assert_eq!(conv.conversations.len(), conversations, "{file}: {:?}", conv.reasons);
+        let assistant: usize = conv
+            .conversations
+            .iter()
+            .map(|c| c.messages.iter().filter(|m| m.role == Role::Assistant).count())
+            .sum();
+        assert_eq!(assistant, units, "{file}");
+        to_cassette(&conv.conversations, &opts("x")).validate().unwrap();
+        for t in to_trajectories(&conv.conversations, &opts("x")) {
+            t.validate().unwrap();
+        }
+    }
+}
+
+#[test]
+fn smith_xml_and_ticks_splits_become_tool_calls() {
+    for file in ["real_swe_smith_xml.jsonl", "real_swe_smith_ticks.jsonl"] {
+        let conv = convert_rows(&real_rows(file), Format::Auto);
+        let c = &conv.conversations[0];
+        let calls: Vec<_> = c.messages.iter().flat_map(|m| m.tool_calls.iter()).collect();
+        assert!(!calls.is_empty(), "{file}");
+        assert!(calls.iter().all(|t| t.name == "bash" || t.name == "str_replace_editor"), "{file}");
+        let results = c.messages.iter().filter(|m| m.role == Role::Tool).count();
+        assert!(results > 0, "{file}: observations are tool results");
+        assert!(
+            !c.messages
+                .iter()
+                .any(|m| m.role == Role::User && m.text_content().starts_with("OBSERVATION:")),
+            "{file}: observations are not user turns"
+        );
+    }
+}

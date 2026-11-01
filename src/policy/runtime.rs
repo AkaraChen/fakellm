@@ -16,7 +16,7 @@ use crate::policy::protocol::{self, Incoming};
 
 pub const SHIM_NODE: &str = include_str!("shim_node.js");
 pub const SHIM_BUN: &str = include_str!("shim_bun.js");
-/// Untested: written from the txiki.js docs, no `tjs` binary was available.
+/// Tested against txiki.js v26.6.0 (`tests/policy_tjs.rs`, gated by `FAKELLM_TJS`).
 pub const SHIM_TJS: &str = include_str!("shim_tjs.js");
 
 /// A policy runtime, written `"tjs"`, `"node"`, `"bun"` or a path to an executable.
@@ -173,6 +173,7 @@ pub struct Process {
 pub async fn spawn(
     runtime: &Runtime,
     source: &str,
+    files: &std::collections::BTreeMap<String, String>,
     timeout: std::time::Duration,
     on_log: impl Fn(String) + Send + 'static,
 ) -> Result<Process, PolicyError> {
@@ -189,6 +190,17 @@ pub async fn spawn(
     let dir = PolicyDir(dir);
     std::fs::write(dir.0.join(shim_name), shim).map_err(|e| io("cannot write the policy shim", e))?;
     std::fs::write(&module, source).map_err(|e| io("cannot write the policy module", e))?;
+    // `.js` helpers are ES modules too, unless the caller ships its own package.json.
+    if !files.contains_key("package.json") {
+        std::fs::write(dir.0.join("package.json"), r#"{"type":"module"}"#).map_err(|e| io("cannot write package.json", e))?;
+    }
+    for (path, content) in files {
+        let target = dir.0.join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io("cannot create a policy file directory", e))?;
+        }
+        std::fs::write(&target, content).map_err(|e| io(&format!("cannot write policy file {path:?}"), e))?;
+    }
 
     let mut child = tokio::process::Command::new(runtime.program())
         .args(runtime.args())

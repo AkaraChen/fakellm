@@ -188,14 +188,17 @@ agent 框架 ──messages + tools──▶ fakellm（扮演模型）
 |---|---|
 | M0 | Chat Completions（同步 + SSE）、`/v1/models`、剧本、默认兜底、请求日志、虚拟时钟、Rust 库和二进制 |
 | M1 | tool call（含并行和流式分片）、Anthropic Messages、故障注入、napi 绑定（Bun 和 Node） |
-| M2 | Responses API（有状态）、Embeddings、cassette 录制和回放（`--upstream`） |
-| M3 | `fakellm import hf`、fake agent 的轨迹模式和工具映射 |
-| M4 | 策略脚本、按 `json_schema` 生成结构化输出、Go helper、GHCR 镜像 |
+| M2 | Responses API（有状态）、Embeddings、JS SDK、napi 绑定、Docker 镜像和发布流程 |
+| M3 | fake agent（轨迹、工具映射）、策略脚本（JS）、embeddings 与路由整理 |
+| M4 | cassette 录制和回放（`--upstream`）、`fakellm import hf`、结构化输出、快照、热重载 |
+| 收尾 | 策略 `decline`、自定义端点规则、LICENSE、CHANGELOG |
+
+上表是实际交付，每个阶段的细节见 [CHANGELOG.md](../CHANGELOG.md)；最初的计划曾把 cassette 放在 M2、import 放在 M3。
 
 ## 还没想清楚的问题
 
-1. 策略脚本已定为 txiki.js。待定的是集成方式：txiki.js 本身是一个独立的运行时，是作为子进程通过 stdio 协议调用，还是把它的 C 库链接进来走 FFI？
-2. cassette 的语义匹配规则怎么设计：哪些字段默认忽略，怎么归一化 system prompt 里会变的部分（时间、随机 ID）？
-3. Responses API 的服务端状态要不要支持 `store: false` 和过期？过期要不要跟着虚拟时钟？
-4. 和 fakes3 共用的部分（控制面框架、时钟、请求日志、ctl、napi 发布流程）是拆成一个公共 crate，还是两个仓库各自维护一份？
-5. HF 上的各种轨迹格式差别很大：SWE-agent、OpenHands、ShareGPT 风格的多轮对话。是每种格式写一个导入器，还是定义一个中间格式，让社区自己贡献转换脚本？
+1. 策略脚本的集成方式：已解决，作为子进程，通过 JSONL 标准输入输出协议调用，不链接 C 库。txiki.js（`tjs`）、Node、Bun 三个运行时共用协议，各有一个内置 shim；`tjs` 在自编译的 v26.6.0 上验证通过，见 [agent.md](agent.md#策略脚本)。
+2. cassette 的语义匹配规则怎么设计：哪些字段默认忽略，怎么归一化 system prompt 里会变的部分（时间、随机 ID）？已解决，见 [cassette.md](cassette.md)。
+3. Responses API 的服务端状态：已解决。默认保存，`store: false` 不保存，`DELETE` 和控制面可清空，快照可存取；不做过期，也就不涉及虚拟时钟。见 [control-plane.md](control-plane.md) 和 [cassette.md](cassette.md)。
+4. 和 fakes3 共用的部分（控制面框架、时钟、请求日志、ctl、napi 发布流程）是拆成一个公共 crate，还是两个仓库各自维护一份？已决定：各自维护（是否改动留给作者，见 [TODO.md](../TODO.md)）。两边的控制面路由、请求记录字段和 ctl 子命令各不相同（fakellm 有协议、规则、轨迹、cassette，fakes3 有桶和对象），真正相同的只有几十行时钟和日志骨架；抽成公共 crate 要让两个仓库同步发版，成本高于复制，所以不拆，改动时人工对照。
+5. HF 上的轨迹格式：已解决，每种格式一个转换器，统一输出轨迹或 cassette（ShareGPT、WildChat、Hermes、SWE-agent、OpenHands、xlam），不另设中间格式。见 [import.md](import.md)。

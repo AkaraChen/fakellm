@@ -19,10 +19,12 @@ type Rule struct {
 // Match holds the conditions of a rule; all that are set must hold. Pointer fields distinguish
 // "unset" from false and 0.
 type Match struct {
-	Model             string   `json:"model,omitempty"`
-	LastUser          string   `json:"last_user,omitempty"`
-	System            string   `json:"system,omitempty"`
-	AnyMessage        string   `json:"any_message,omitempty"`
+	Model      string `json:"model,omitempty"`
+	LastUser   string `json:"last_user,omitempty"`
+	System     string `json:"system,omitempty"`
+	AnyMessage string `json:"any_message,omitempty"`
+	// LastUserRaw matches the latest user message exactly as sent (reminder blocks included).
+	LastUserRaw       string   `json:"last_user_raw,omitempty"`
 	Body              string   `json:"body,omitempty"`
 	Path              string   `json:"path,omitempty"`
 	HasTool           string   `json:"has_tool,omitempty"`
@@ -37,6 +39,10 @@ type Match struct {
 	Protocol          string   `json:"protocol,omitempty"`
 	Probability       *float64 `json:"probability,omitempty"`
 	EveryNth          *uint32  `json:"every_nth,omitempty"`
+	// After makes the rule a sequence matcher: it only matches once the rule named After has answered
+	// AfterCount times (default 1).
+	After      string  `json:"after,omitempty"`
+	AfterCount *uint32 `json:"after_count,omitempty"`
 }
 
 // ReplySpec is what a rule answers: text and/or tool calls, or an error, plus pacing and faults.
@@ -101,6 +107,8 @@ type UsageSpec struct {
 	CachedTokens        *uint32 `json:"cached_tokens,omitempty"`
 	ReasoningTokens     *uint32 `json:"reasoning_tokens,omitempty"`
 	CacheCreationTokens *uint32 `json:"cache_creation_tokens,omitempty"`
+	// InputTokensIn is where an Anthropic stream reports input_tokens: "start" (message_start, default) or "delta" (message_delta).
+	InputTokensIn string `json:"input_tokens_in,omitempty"`
 }
 
 // RuleInfo is a rule as listed by the server, with its counters.

@@ -28,6 +28,12 @@ export interface Match {
   protocol?: Protocol;
   probability?: number;
   every_nth?: number;
+  /** Latest user message exactly as sent (reminder blocks included); `last_user` sees it processed. */
+  last_user_raw?: Pattern;
+  /** Sequence matcher: only once the rule with this `name` has answered at least `after_count` times. */
+  after?: string;
+  /** Minimum hits of the `after` rule, at least 1 (default 1). Needs `after`. */
+  after_count?: number;
 }
 
 export interface ToolCallSpec {
@@ -66,6 +72,8 @@ export interface UsageSpec {
   output_tokens?: number;
   cache_read_tokens?: number;
   cache_creation_input_tokens?: number;
+  /** Anthropic streams: which event carries `input_tokens`, `message_start` (`'start'`, default) or `message_delta` (`'delta'`). */
+  input_tokens_in?: 'start' | 'delta';
 }
 
 export type FinishReason = 'stop' | 'length' | 'tool_calls' | 'content_filter';
@@ -147,6 +155,8 @@ export interface Trajectory {
   stop_text?: string;
   /** `by_turn` (default) follows the replayed assistant messages; `by_hits` counts requests. */
   cursor?: 'by_turn' | 'by_hits';
+  /** `by_hits` only: a request identical to the previous one replays its step instead of advancing. Default `true`. */
+  dedupe?: boolean;
   tool_map?: ToolMap;
   /** What to do with a step whose tool the client did not offer. Default `error`. */
   unknown_tool?: 'stop' | 'error' | 'pass';
@@ -203,6 +213,10 @@ export interface Cassette {
   model_glob?: string;
   /** Answer with the nearest exchange when none matches exactly. */
   fuzzy?: boolean;
+  /** Minimum Jaccard similarity (0 to 1) for a `fuzzy` hit. Default 0.6. */
+  fuzzy_threshold?: number;
+  /** Corpus sampling: when nothing matches, answer with one of the cassette's replies picked from the request seed. */
+  sample?: boolean;
   /** Each exchange answers once, in order; a spent one is skipped. */
   once?: boolean;
   meta?: Record<string, unknown>;
@@ -215,6 +229,8 @@ export interface CassetteInfo {
   exchanges: number;
   once: boolean;
   fuzzy: boolean;
+  fuzzy_threshold: number;
+  sample: boolean;
   hits: number;
   consumed: number;
   recording: boolean;
@@ -241,6 +257,8 @@ export interface Policy {
   source: string;
   /** Overrides the server's policy runtime for this policy. */
   runtime?: PolicyRuntime;
+  /** Extra files written next to the entry module (relative paths, no `..`), importable from `source`. */
+  files?: Record<string, string>;
 }
 
 /** A policy as returned by `policies.list()`. */
@@ -373,6 +391,10 @@ export interface StartOptions {
   scripts?: Rule[] | string;
   /** Trajectories registered at start. */
   trajectories?: Trajectory[];
+  /** Trajectory files (JSON, YAML or JSONL) the binary loads itself (`--trajectory`); watched unless `watch: false`. */
+  trajectoryFiles?: string[];
+  /** Policy modules the binary loads itself (`--policy`), each named after its file stem; watched unless `watch: false`. */
+  policyFiles?: string[];
   /** Cassettes loaded at start: objects, or the path of a JSON / JSONL / YAML cassette file. */
   cassettes?: Cassette[] | string;
   /** Relay requests no rule and no cassette answers to this OpenAI-compatible or Anthropic server, and record what it says. */
@@ -381,12 +403,22 @@ export interface StartOptions {
   upstreamApiKey?: string;
   /** Append every recorded exchange to this JSONL file. Needs `upstream`. */
   record?: string;
+  /** Regexes (`--record-redact`): every match in the recorded texts becomes `<redacted>`. Needs `upstream`. */
+  recordRedact?: string[];
   /** `false` stops reloading `scripts` / `cassettes` files when they change (default: watched). */
   watch?: boolean;
   /** Policies registered at start; a module that does not load makes `start()` reject. */
   policies?: Policy[];
   /** Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: tjs, node, bun, whichever is on PATH first. */
   policyRuntime?: PolicyRuntime;
+  /** How long a policy may take to decide, in milliseconds on the host clock. Default 5000. */
+  policyTimeoutMs?: number;
+  /** Most named snapshots held at once; the next `snapshots.create()` rejects with 409. */
+  maxSnapshots?: number;
+  /** Also record the upstream's 401, 403, 408, 409, 429 and 5xx answers (by default they are relayed, not recorded). Needs `upstream`. */
+  recordErrors?: boolean;
+  /** Seconds the upstream may take to send response headers; 0 waits without limit. Default 600. */
+  upstreamTimeout?: number;
   /** Also serve the API under this prefix, e.g. `/anthropic`. */
   pathPrefix?: string;
   /** Default time to first token: milliseconds, or text such as `'300ms'`. */
@@ -404,6 +436,8 @@ export interface StartOptions {
   requestLogCapacity?: number;
   /** Store `"<redacted>"` instead of credential header values in the request log. */
   redactAuth?: boolean;
+  /** The binary's stderr: `'inherit'` (default) shows its log and startup errors; `'ignore'` keeps a piped test run from waiting on it. */
+  stderr?: 'inherit' | 'ignore';
   /** Extra command line arguments. */
   args?: string[];
   env?: Record<string, string>;

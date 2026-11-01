@@ -71,7 +71,7 @@ pub use ir::{ApiError, Delivery, FinishReason, Outcome, Reply, Request, Source, 
 pub use policy::{Policies, PolicyError, PolicyInfo, PolicySpec, Runtime};
 pub use reqlog::{DEFAULT_CAPACITY as DEFAULT_REQUEST_LOG_CAPACITY, RequestFilter, RequestLog, RequestRecord, StatusFilter};
 pub use script::{Engine, Match, ReplySpec, Rule, RuleInfo, ScriptError, ScriptFormat, ScriptState, Scripts};
-pub use snapshot::SnapshotInfo;
+pub use snapshot::{MAX_SNAPSHOTS, SnapshotInfo};
 pub use upstream::client::{ClientError, HttpClient};
 pub use watch::WatchConfig;
 
@@ -132,6 +132,8 @@ pub struct Config {
     /// Store `"<redacted>"` instead of the values of `authorization`, `proxy-authorization` and
     /// `x-api-key` in the request log, so the log can be shared.
     pub redact_auth: bool,
+    /// Most named snapshots held at once; the next `POST /_fakellm/snapshots` gets a 409.
+    pub max_snapshots: usize,
     /// A path the API is also served under, e.g. `/anthropic` makes `/anthropic/v1/messages` work.
     /// Paths that end in a known route (`/v1/messages`, ...) after any leading segments are
     /// accepted regardless; this exists for prefixes in front of routes without `/v1`.
@@ -159,6 +161,9 @@ pub struct Config {
     /// Also record the upstream's 401, 403, 408, 409, 429 and 5xx answers (`--record-errors`); by default they are
     /// relayed but not recorded, so a retry that succeeded is not shadowed on replay.
     pub record_errors: bool,
+    /// Regexes (`--record-redact REGEX`, repeatable): every match in the recorded texts (messages, tool arguments and
+    /// results, `extra`, replies) is replaced with `<redacted>` before it is stored or written. Needs `upstream`.
+    pub record_redact: Vec<String>,
     /// Seconds the upstream may take to send response headers (`--upstream-timeout`); 0 waits without limit. A
     /// non-streaming completion sends them only when it is done.
     pub upstream_timeout_secs: u64,
@@ -181,6 +186,7 @@ impl Default for Config {
             request_log: true,
             request_log_capacity: DEFAULT_REQUEST_LOG_CAPACITY,
             redact_auth: false,
+            max_snapshots: snapshot::MAX_SNAPSHOTS,
             path_prefix: None,
             trajectories: Vec::new(),
             policies: Vec::new(),
@@ -191,6 +197,7 @@ impl Default for Config {
             upstream_api_key: None,
             record: None,
             record_errors: false,
+            record_redact: Vec::new(),
             upstream_timeout_secs: 600,
             watch: None,
         }
@@ -346,6 +353,12 @@ impl Server {
     /// Reset, scripts and the request log: the same operations as the `/_fakellm/` HTTP API.
     pub fn control(&self) -> &Control {
         &self.control
+    }
+
+    /// A shared handle on the control plane, for work that must outlive a borrow of the server (a slow call on a
+    /// worker thread).
+    pub fn shared_control(&self) -> Arc<Control> {
+        self.control.clone()
     }
 
     /// The script rules and their hit counts.

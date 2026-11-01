@@ -26,7 +26,49 @@ async fn usage_override_on_chat_and_messages() {
     assert_eq!(r["usage"]["prompt_tokens_details"]["cached_tokens"], 100);
     let m = post_json(&s, "/v1/messages", &msg_body("hi")).await.json();
     assert_eq!(m["usage"]["output_tokens"], 64);
-    assert!(m["usage"]["input_tokens"].as_u64().unwrap() >= 20136, "{m}");
+    // Literal: never reduced by cached_tokens.
+    assert_eq!(m["usage"]["input_tokens"], 20236);
+    assert_eq!(m["usage"]["cache_read_input_tokens"], 100);
+}
+
+async fn stream_usage(s: &fakellm::Server) -> (Value, Value) {
+    let mut body = msg_body("hi");
+    body["stream"] = json!(true);
+    let events = open_sse(s, "/v1/messages", &[], &body).await.events().await;
+    let data = |name: &str| -> Value {
+        let e = events.iter().find(|e| e.event.as_deref() == Some(name)).unwrap();
+        serde_json::from_str::<Value>(&e.data).unwrap()
+    };
+    (
+        data("message_start")["message"]["usage"].clone(),
+        data("message_delta")["usage"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn anthropic_input_tokens_in_start_or_delta() {
+    let s = start().await;
+    let usage = json!({"input_tokens": 500, "output_tokens": 9, "cache_read_tokens": 100, "cache_creation_tokens": 20});
+    put_rules(&s, json!([{"reply": {"text": "hello", "usage": usage}}])).await;
+    let (start_u, delta_u) = stream_usage(&s).await;
+    assert_eq!(start_u["input_tokens"], 500);
+    assert_eq!(start_u["cache_read_input_tokens"], 100);
+    assert_eq!(start_u["cache_creation_input_tokens"], 20);
+    assert!(delta_u.get("input_tokens").is_none(), "{delta_u}");
+    assert_eq!(delta_u["output_tokens"], 9);
+
+    let mut usage = usage;
+    usage["input_tokens_in"] = json!("delta");
+    put_rules(&s, json!([{"reply": {"text": "hello", "usage": usage}}])).await;
+    let (start_u, delta_u) = stream_usage(&s).await;
+    assert!(start_u.get("input_tokens").is_none(), "{start_u}");
+    assert_eq!(delta_u["input_tokens"], 500);
+    assert_eq!(delta_u["cache_read_input_tokens"], 100);
+    assert_eq!(delta_u["output_tokens"], 9);
+
+    // count_tokens returns the rule's value as-is, whatever the cache counters say.
+    let r = post_json(&s, "/v1/messages/count_tokens", &msg_body("hi")).await.json();
+    assert_eq!(r["input_tokens"], 500);
 }
 
 #[tokio::test]
@@ -65,11 +107,15 @@ async fn count_tokens_consults_rules_with_usage() {
     let rules = get(&s, "/_fakellm/scripts").await.json();
     assert_eq!(
         (rules["rules"][0]["hits"].clone(), rules["rules"][1]["hits"].clone()),
-        (json!(0), json!(1))
+        (json!(0), json!(0))
     );
-    // The rule is spent now: back to the tokenizer.
+    // Counting does not spend the rule: it still answers the count, and the real request still finds it.
     let again = post_json(&s, "/v1/messages/count_tokens", &msg_body("hello there")).await.json();
-    assert_eq!(again, plain);
+    assert_eq!(again["input_tokens"], 777);
+    let real = post_json_with(&s, "/v1/messages", &[("anthropic-version", "2023-06-01")], &msg_body("hello there")).await;
+    assert_eq!(real.status, 200, "{}", real.body);
+    let rules = get(&s, "/_fakellm/scripts").await.json();
+    assert_eq!(rules["rules"][0]["hits"], 1);
 }
 
 #[tokio::test]

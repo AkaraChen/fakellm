@@ -57,6 +57,15 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `scripts put FILE [--keep-hits]` | `PUT /_fakellm/scripts[?keep_hits=true]`，`.yaml` / `.yml` 按 YAML 发，其他按 JSON；文本输出 `N rules loaded (M total)` |
 | `scripts add FILE` | `POST /_fakellm/scripts` |
 | `scripts clear` | `DELETE /_fakellm/scripts` |
+
+所有 `put` / `add` 的 `FILE` 写 `-` 都从标准输入读（内容按 JSON、JSONL 或 YAML 自动识别；策略从 stdin 读模块源码时要加 `--name`），如 `cat rules.yaml | fakellm ctl scripts put -`。
+
+| `trajectories list` / `get NAME [--jsonl]` | `GET /_fakellm/trajectories[/NAME]`，文本输出每条轨迹一行（步数、命中数、cursor、on_divergence） |
+| `trajectories put FILE` / `add FILE` | `PUT` / `POST /_fakellm/trajectories`，JSON、JSONL 或 YAML 文件 |
+| `trajectories delete NAME` / `clear` | `DELETE /_fakellm/trajectories[/NAME]` |
+| `policies list` / `get NAME` | `GET /_fakellm/policies[/NAME]`，文本输出名字、运行时、命中数和子进程是否在运行 |
+| `policies put FILE [--name N] [--runtime R]` / `add FILE ...` | `PUT` / `POST /_fakellm/policies`。`FILE` 是 ES 模块（`.js` / `.mjs` / `.cjs`，以文件名或 `--name` 作为策略名）或 JSON / YAML 注册体 `{name, source, runtime?}`；模块加载失败时服务器返回 400，命令退出码非 0 |
+| `policies delete NAME` / `clear` | `DELETE /_fakellm/policies[/NAME]` |
 | `cassettes list` / `get NAME` | `GET /_fakellm/cassettes[/NAME]`；`get recording` 是上游录到的内容 |
 | `cassettes put FILE` / `add FILE` | `PUT` / `POST /_fakellm/cassettes`，JSON、JSONL 或 YAML 文件 |
 | `cassettes delete NAME` / `clear` | `DELETE /_fakellm/cassettes[/NAME]` |
@@ -106,7 +115,7 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `DELETE /_fakellm/requests` | 清空请求日志 |
 | `GET` / `PUT /_fakellm/requests/config` | 读 / 改日志设置 |
 
-`fakellm ctl` 没有 trajectories 和 policies 子命令：这两组端点只能用 HTTP（curl）、`sdk/js` 或 Go helper 访问；启动时可用 `--trajectory`、`--policy` 加载文件。
+`fakellm ctl` 对这两组端点也有 `trajectories` 和 `policies` 子命令（见下面的 CLI 一节）；启动时可用 `--trajectory`、`--policy` 加载文件。
 
 方法不对返回 405（`MethodNotAllowed`），路径不存在返回 404。
 
@@ -155,7 +164,7 @@ $ curl -X DELETE $E/_fakellm/responses
 - **`previous_response_id`**：新请求的 `messages` 是 `[instructions] + 被引用响应的完整对话 + 新 input`；请求日志里记录的是这个展开后的结果，所以 `has_tool_result`、`turn` 等条件看到的是整个对话。存下来的是快照：删除被引用的响应，不影响已经从它派生出的响应。
 - **找不到**：`previous_response_id` 指向不存在（或 `store: false` 的、或已被 `DELETE`、已被清空的）响应时，返回 404 `invalid_request_error`，`param: previous_response_id`，`code: previous_response_not_found`，文案 “Previous response with id 'x' not found.”。这个请求以 `source: rejected` 记入日志。
 - `GET` / `DELETE /v1/responses/{id}` 对未知 id 返回 404 “Response with id 'x' not found.”；`DELETE` 成功返回 `{"id","object":"response","deleted":true}`。
-- 不支持：`/v1/responses/{id}/input_items`、`/cancel`、`background`（404 `Invalid URL`）。
+- **不做的 Responses 能力**（有意的，都返回 404 `Invalid URL`）：`/v1/responses/{id}/input_items`、`/cancel`、`background: true` 和 WebSocket 传输。原因：codex 走 HTTP SSE（见 [wire.md](wire.md) 的 codex 一节，请求里没有 `previous_response_id`、`store` 恒为 `false`），ai-sdk、openai-python、openai-node 的非后台调用也只用 `POST` / `GET` / `DELETE /v1/responses`；`background` 需要一个脱离请求的异步生命周期和轮询状态机，`/cancel` 只对它有意义，`/input_items` 需要把每次请求的 input 另存一份，而八个真实仓库的实验里没有任何消费方用到它们。需要时用自定义端点规则（`match.path` + `reply.body`）为单个用例伪造。
 
 ```
 $ curl $E/v1/responses -d '{"model":"m","input":"hi"}'                       # 得到 resp_A
@@ -207,7 +216,7 @@ $ curl -X DELETE $E/_fakellm/cassettes/chats
 
 `hits` 是回放次数，`consumed` 是 `once` 的 cassette 已用掉的 exchange 数。
 
-快照把当前的剧本（含命中计数）、轨迹进度、策略（含状态）、cassette（含已用标记和录制）、保存的 Responses 对象和时钟存下来；请求日志、启动配置和其他快照不在其中。还原不消耗快照，可以反复还原。名字是 1 到 64 个 `A-Za-z0-9._-` 字符，不给则是 `snapshot-N`；重名创建是 409，未知名字是 404，非法名字是 400。不要在有请求在飞时还原。
+快照把当前的剧本（含命中计数）、轨迹进度、策略（含状态）、cassette（含已用标记和录制）、保存的 Responses 对象和时钟存下来；请求日志、启动配置和其他快照不在其中。还原不消耗快照，可以反复还原。名字是 1 到 64 个 `A-Za-z0-9._-` 字符，不给则是 `snapshot-N`；重名创建是 409，未知名字是 404，非法名字是 400。最多同时保留 100 个快照，超出再创建是 409（`--max-snapshots N` / `Config::max_snapshots` / `FAKELLM_MAX_SNAPSHOTS` 调整，删掉一些就能继续）。不要在有请求在飞时还原。
 
 ```
 $ curl -X POST "$E/_fakellm/snapshots?name=after-login"

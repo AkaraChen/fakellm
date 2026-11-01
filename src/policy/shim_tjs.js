@@ -1,9 +1,10 @@
-// fakellm policy shim for txiki.js. UNTESTED: written from the txiki.js documentation, no `tjs` binary was available.
+// fakellm policy shim for txiki.js (tested against tjs v26.6.0; stdio are web streams: getReader() / getWriter()).
 // Protocol: see src/policy/protocol.rs. stdout carries the protocol only; console output goes to stderr.
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-const send = (message) => tjs.stdout.write(encoder.encode(JSON.stringify(message) + "\n"));
+const writer = tjs.stdout.getWriter();
+const send = (message) => writer.write(encoder.encode(JSON.stringify(message) + "\n"));
 const log = (...args) => console.error(args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "));
 console.log = console.info = console.debug = console.error;
 const describe = (e) => (e instanceof Error ? e.message : String(e));
@@ -51,12 +52,12 @@ async function handle(line) {
   }
 }
 
-const buffer = new Uint8Array(65536);
+const reader = tjs.stdin.getReader();
 let pending = "";
 for (;;) {
-  const n = await tjs.stdin.read(buffer);
-  if (!n) break;
-  pending += decoder.decode(buffer.subarray(0, n), { stream: true });
+  const { done, value } = await reader.read();
+  if (done) break;
+  pending += decoder.decode(value, { stream: true });
   let newline;
   while ((newline = pending.indexOf("\n")) >= 0) {
     const line = pending.slice(0, newline);

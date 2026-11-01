@@ -68,7 +68,7 @@ async fn restore_brings_everything_back() {
         &s,
         "PUT",
         "/_fakellm/trajectories",
-        &json!({"name": "t", "cursor": "by_hits", "steps": [{"reply": {"text": "s0"}}, {"reply": {"text": "s1"}}, {"reply": {"text": "s2"}}]}),
+        &json!({"name": "t", "cursor": "by_hits", "dedupe": false, "steps": [{"reply": {"text": "s0"}}, {"reply": {"text": "s1"}}, {"reply": {"text": "s2"}}]}),
     )
     .await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -260,4 +260,24 @@ async fn a_failed_restore_changes_nothing() {
     assert_eq!(get(&s, "/_fakellm/cassettes").await.json(), cassettes_before);
     assert_eq!(get(&s, "/_fakellm/policies").await.json()["policies"][0]["name"], policies_before);
     assert_eq!(chat_text(&chat(&s, &chat_body("gpt-4o", "x")).await), "after");
+}
+
+#[tokio::test]
+async fn snapshot_count_is_limited() {
+    // The default is 100; a smaller limit keeps the test quick and proves it is configurable.
+    let s = start_with(fakellm::Config {
+        max_snapshots: 3,
+        ..Default::default()
+    })
+    .await;
+    for i in 0..3 {
+        assert_eq!(snap(&s, &format!("s{i}")).await.status, 201);
+    }
+    let r = snap(&s, "s3").await;
+    assert_eq!(r.status, 409, "{}", r.body);
+    assert!(r.body.contains("too many snapshots"), "{}", r.body);
+    send(&s, "DELETE", "/_fakellm/snapshots/s0", &[], "").await;
+    assert_eq!(snap(&s, "s3").await.status, 201);
+    assert_eq!(fakellm::MAX_SNAPSHOTS, 100);
+    assert_eq!(fakellm::Config::default().max_snapshots, 100);
 }

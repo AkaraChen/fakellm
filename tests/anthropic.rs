@@ -200,3 +200,45 @@ async fn models_and_log_protocol() {
     let log = get(&s, "/_fakellm/requests?protocol=anthropic.messages").await.json();
     assert_eq!(log["requests"].as_array().map(|a| a.len()), Some(1), "{log}");
 }
+
+#[tokio::test]
+async fn response_fidelity_fields() {
+    let s = start().await;
+    put_rules(
+        &s,
+        json!([{"match": {"last_user": "sync"}, "reply": {"text": "ok"}},
+               {"match": {"last_user": "noargs"}, "reply": {"tool_calls": [{"name": "ping", "arguments": {}}]}},
+               {"reply": {"text": "ok"}}]),
+    )
+    .await;
+    // Sync usage.
+    let j = post_json_with(&s, "/v1/messages", H, &body("sync")).await.json();
+    assert_eq!(j["usage"]["service_tier"], "standard");
+    assert_eq!(j["usage"]["inference_geo"], "not_available");
+    assert_eq!(j["usage"]["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+    assert_eq!(j["usage"]["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+    // Streamed: message_start usage, context_management only when asked.
+    let mut b = body("hi");
+    b["stream"] = json!(true);
+    let ev = open_sse(&s, "/v1/messages", H, &b).await.events().await;
+    let start_ev = ev.iter().find(|e| e.event.as_deref() == Some("message_start")).unwrap().json();
+    assert_eq!(start_ev["message"]["usage"]["service_tier"], "standard");
+    assert!(start_ev["message"]["usage"]["cache_creation"].is_object());
+    let md = ev.iter().find(|e| e.event.as_deref() == Some("message_delta")).unwrap().json();
+    assert!(md["context_management"].is_null());
+    b["context_management"] = json!({"edits": []});
+    let ev = open_sse(&s, "/v1/messages", H, &b).await.events().await;
+    let md = ev.iter().find(|e| e.event.as_deref() == Some("message_delta")).unwrap().json();
+    assert_eq!(md["context_management"], json!({"applied_edits": []}));
+    // A tool without arguments streams one empty fragment, not `{}`.
+    let mut b = body("noargs");
+    b["stream"] = json!(true);
+    b["tools"] = json!([{"name": "ping", "description": "d", "input_schema": {"type": "object"}}]);
+    let ev = open_sse(&s, "/v1/messages", H, &b).await.events().await;
+    let frags: Vec<String> = ev
+        .iter()
+        .filter(|e| e.event.as_deref() == Some("content_block_delta"))
+        .map(|e| e.json()["delta"]["partial_json"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(frags, [""]);
+}

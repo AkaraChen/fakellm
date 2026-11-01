@@ -516,6 +516,7 @@ async fn config_policies_load_at_start() {
     let spec = fakellm::PolicySpec {
         name: "boot".into(),
         source: "export default () => ({ text: 'from config' });".into(),
+        files: Default::default(),
         runtime: Some(fakellm::Runtime::Node),
     };
     let s = start_with(fakellm::Config {
@@ -530,6 +531,7 @@ async fn config_policies_load_at_start() {
     let broken = fakellm::PolicySpec {
         name: "broken".into(),
         source: "export default (".into(),
+        files: Default::default(),
         runtime: Some(fakellm::Runtime::Node),
     };
     let err = fakellm::Server::start(fakellm::Config {
@@ -658,4 +660,45 @@ async fn match_body_sees_the_raw_json() {
     assert_eq!(text(&chat(&s, &body).await), "calm");
     body["damaged"] = json!(true);
     assert_eq!(text(&chat(&s, &body).await), "angry");
+}
+
+#[tokio::test]
+async fn policy_files_let_the_entry_import_a_helper() {
+    need_node!();
+    let s = start().await;
+    let body = json!({
+        "name": "multi",
+        "source": "import { greet } from './helper.js';\nimport { n } from './lib/num.mjs';\nexport default () => ({ text: greet('x') + n });",
+        "runtime": "node",
+        "files": {
+            "helper.js": "export const greet = (w) => 'hello ' + w + ' ';",
+            "lib/num.mjs": "export const n = 42;"
+        }
+    });
+    let r = send(
+        &s,
+        "PUT",
+        "/_fakellm/policies",
+        &[("content-type", "application/json")],
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    attach(&s, "multi").await;
+    assert_eq!(text(&chat(&s, &msg("x")).await), "hello x 42");
+
+    for bad in ["../evil.js", "/etc/x", "policy.mjs", ""] {
+        let mut b = body.clone();
+        b["name"] = json!("bad");
+        b["files"] = json!({ bad: "x" });
+        let r = send(
+            &s,
+            "PUT",
+            "/_fakellm/policies",
+            &[("content-type", "application/json")],
+            &b.to_string(),
+        )
+        .await;
+        assert_eq!(r.status, 400, "{bad}: {}", r.body);
+    }
 }

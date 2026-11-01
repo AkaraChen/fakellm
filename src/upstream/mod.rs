@@ -104,6 +104,8 @@ pub struct Upstream {
     recorder: Option<Recorder>,
     /// Whether retryable and credential errors are recorded too, see [`Upstream::records_status`].
     record_errors: bool,
+    /// `--record-redact` patterns applied to every recorded text, see [`Upstream::redact`].
+    redact: Vec<crate::script::Re>,
 }
 
 impl Upstream {
@@ -137,6 +139,7 @@ impl Upstream {
             client: HttpClient::new(),
             recorder,
             record_errors: false,
+            redact: Vec::new(),
         })
     }
 
@@ -158,6 +161,26 @@ impl Upstream {
     pub fn with_record_errors(mut self, on: bool) -> Self {
         self.record_errors = on;
         self
+    }
+
+    /// Replaces every match of `patterns` in the recorded texts with `<redacted>` (`--record-redact`). An
+    /// invalid pattern is an error naming it.
+    pub fn with_record_redact(mut self, patterns: &[String]) -> Result<Self, String> {
+        self.redact = patterns
+            .iter()
+            .map(|p| {
+                crate::script::Pattern(p.clone())
+                    .compile()
+                    .map_err(|e| format!("invalid --record-redact pattern {p:?}: {e}"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(self)
+    }
+
+    /// `exchange` with the `--record-redact` patterns applied to the texts of its request and outcome.
+    /// `None` when it cannot be redacted safely (the exchange is then not recorded).
+    pub fn redact(&self, exchange: crate::cassette::format::Exchange) -> Option<crate::cassette::format::Exchange> {
+        record::redact_exchange(exchange, &self.redact)
     }
 
     /// Whether an exchange the upstream answered with `status` is recorded. Transient errors (408, 409, 429, 5xx)

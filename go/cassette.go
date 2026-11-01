@@ -20,21 +20,27 @@ type Cassette struct {
 	MatchToolSchemas  bool             `json:"match_tool_schemas,omitempty"`
 	ModelGlob         string           `json:"model_glob,omitempty"`
 	Fuzzy             bool             `json:"fuzzy,omitempty"`
-	Once              bool             `json:"once,omitempty"`
-	Meta              map[string]any   `json:"meta,omitempty"`
-	Exchanges         []map[string]any `json:"exchanges"`
+	// FuzzyThreshold is the minimum Jaccard similarity for a fuzzy hit; nil means the server default (0.6).
+	FuzzyThreshold *float64 `json:"fuzzy_threshold,omitempty"`
+	// Sample answers with one of the cassette's replies, picked from the request seed, when nothing else matches.
+	Sample    bool             `json:"sample,omitempty"`
+	Once      bool             `json:"once,omitempty"`
+	Meta      map[string]any   `json:"meta,omitempty"`
+	Exchanges []map[string]any `json:"exchanges"`
 }
 
 // CassetteInfo is a registered cassette with its counters. Recording is true for the in-memory
 // recording of the upstream proxy, which is listed last under the name "recording".
 type CassetteInfo struct {
-	Name      string `json:"name"`
-	Exchanges int    `json:"exchanges"`
-	Once      bool   `json:"once"`
-	Fuzzy     bool   `json:"fuzzy"`
-	Hits      uint64 `json:"hits"`
-	Consumed  int    `json:"consumed"`
-	Recording bool   `json:"recording"`
+	Name           string  `json:"name"`
+	Exchanges      int     `json:"exchanges"`
+	Once           bool    `json:"once"`
+	Fuzzy          bool    `json:"fuzzy"`
+	FuzzyThreshold float64 `json:"fuzzy_threshold"`
+	Sample         bool    `json:"sample"`
+	Hits           uint64  `json:"hits"`
+	Consumed       int     `json:"consumed"`
+	Recording      bool    `json:"recording"`
 }
 
 // Cassettes returns the cassette client.

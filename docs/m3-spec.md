@@ -1,5 +1,7 @@
 # M3 implementation spec (internal)
 
+> Status: delivered. This is the implementation spec the milestone was built from, kept as history; the user docs (`docs/*.md`, Chinese) and the code are authoritative where they differ.
+
 Audience: the agents implementing M3 in parallel. Read this, `docs/design.md` (fake agent section), `docs/consumers.md`,
 `docs/m1-spec.md` (pipeline, ownership rules; they still apply) and the stub files you own. Everything marked
 "decided" is settled; do not reopen it. Where this spec is silent, follow the nearest existing behavior and `docs/design.md`.
@@ -319,7 +321,7 @@ render. Errors become `Outcome::Error` with `Source::Policy`. Sync `Engine::reso
 Field, validation (>= 1) and engine wiring (`delivery.args_chunk_bytes`) exist; the three frontends already take `delivery.args_chunk_bytes`. (e) adds the HTTP tests: with `args_chunk_bytes: 5` a 20-byte argument string
 arrives as 4 fragments in all three protocols; it overrides `--args-chunk-bytes`; `0` is a registration error. Combined with `tokens_per_sec` it gives oar's slow tool arguments.
 
-### D5 (c): Anthropic usage
+### D5 (c): Anthropic usage (done, kept as history)
 
 Decision: Anthropic's real `usage.input_tokens` excludes cache reads and cache writes (`total = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`), and
 `count_tokens` counts the whole input. So fakellm keeps `Usage.prompt_tokens` as the total (cache included) and Anthropic renders `input_tokens = prompt - cached - cache_creation` when the number is derived (unchanged).
@@ -329,7 +331,7 @@ override stays the total as before. `count_tokens`: `Engine::count_input_tokens`
 `anthropic::count_tokens` accordingly. Docs pass: replace the paragraph in `docs/scripts.md` that describes the subtraction and close the TODO item.
 Tests: rule `{input_tokens: 20236, cached_tokens: 5}` -> `input_tokens: 20236`, `cache_read_input_tokens: 5` (sync and stream); the request log shows `prompt_tokens: 20241`; derived case unchanged.
 
-### D6 (d): connection reset with RST
+### D6 (d): connection reset with RST (done, kept as history)
 
 Investigation result to confirm and then implement if it holds: tokio's `TcpStream::set_linger` (check it exists and is not removed in tokio 1.54; otherwise `TcpSocket`) sets `SO_LINGER{on, 0}`,
 which makes `close` send RST. The socket is owned by hyper through `TokioIo`, so the stream's body task cannot reach it, but a duplicate can: in the accept loop do `let std = socket.into_std()?; let handle = std.try_clone()?;
@@ -339,7 +341,7 @@ on the handle just before the body yields its error, so hyper's close sends RST.
 without a fork or `unsafe`, document why in a paragraph of `docs/m3-spec.md` section 9 and skip; do not leave half of it. Verify with a test that reads the client side error kind (`ConnectionReset`) on Linux; gate the assertion
 on `cfg(target_os = "linux")`.
 
-### D7 (c): `ctl requests list` marks hung requests
+### D7 (c): `ctl requests list` marks hung requests (done, kept as history)
 
 In `src/ctl.rs` the text table shows `hung` in the status column (instead of `0`) for records with `hung: true`; `--json` already has the field. Add a unit test in `ctl.rs` and an assertion in `tests/bin.rs` if a hang is cheap to arrange.
 

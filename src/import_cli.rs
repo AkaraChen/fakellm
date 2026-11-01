@@ -50,7 +50,7 @@ enum Source {
 
 #[derive(Args)]
 struct OutputArgs {
-    /// auto, sharegpt, wildchat, hermes-fc, swe-agent or openhands.
+    /// auto, sharegpt, wildchat, hermes-fc, swe-agent, openhands or xlam.
     #[arg(long, default_value = "auto")]
     format: Format,
     /// cassette or trajectory; default: cassette for sharegpt and wildchat, trajectory for the agent formats.

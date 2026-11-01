@@ -103,7 +103,7 @@ fn call_of(v: &Value) -> Option<CallSpec> {
 }
 
 /// The `tools` column: OpenAI function tools or bare `{name, description, parameters}`, in an array or a JSON string.
-fn tool_defs(row: &Value) -> Vec<ToolDef> {
+pub(crate) fn tool_defs(row: &Value) -> Vec<ToolDef> {
     array_field(row, "tools")
         .unwrap_or_default()
         .iter()

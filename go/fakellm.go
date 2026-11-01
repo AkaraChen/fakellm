@@ -66,6 +66,11 @@ type Options struct {
 	UpstreamAPIKey string
 	// Record is --record: a file that every exchange recorded from the upstream is appended to. Needs Upstream.
 	Record string
+	// RecordRedact is --record-redact (one flag per entry): regexes whose matches in the recorded texts become "<redacted>". Needs Upstream.
+	RecordRedact []string
+	// TrajectoryFiles and PolicyFiles are --trajectory and --policy: files the binary loads itself, watched unless Watch is false.
+	TrajectoryFiles []string
+	PolicyFiles     []string
 	// Watch reloads script, trajectory, policy and cassette files given in Args when they change.
 	// nil keeps the server default (on); false passes --no-watch.
 	Watch *bool
@@ -73,6 +78,14 @@ type Options struct {
 	Policies []Policy
 	// PolicyRuntime is --policy-runtime: tjs, node, bun or a path; empty means the server default.
 	PolicyRuntime string
+	// PolicyTimeoutMs is --policy-timeout-ms: how long a policy may take to decide, on the host clock; 0 means the server default (5000).
+	PolicyTimeoutMs int
+	// MaxSnapshots is --max-snapshots: the most named snapshots held at once; 0 means the server default.
+	MaxSnapshots int
+	// RecordErrors is --record-errors: also record the upstream's 401, 403, 408, 409, 429 and 5xx answers. Needs Upstream.
+	RecordErrors bool
+	// UpstreamTimeoutSecs is --upstream-timeout: seconds the upstream may take to send response headers; 0 means the server default (600).
+	UpstreamTimeoutSecs int
 	// PathPrefix also serves the API under this prefix, e.g. "/anthropic"; BaseURL and AnthropicBaseURL include it.
 	PathPrefix string
 	// Args are extra command-line arguments, appended last.
@@ -130,7 +143,8 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	for _, f := range []struct {
 		flag string
 		n    int
-	}{{"--fallback-tokens", opts.FallbackTokens}, {"--chunk-tokens", opts.ChunkTokens}, {"--args-chunk-bytes", opts.ArgsChunkBytes}} {
+	}{{"--fallback-tokens", opts.FallbackTokens}, {"--chunk-tokens", opts.ChunkTokens}, {"--args-chunk-bytes", opts.ArgsChunkBytes},
+		{"--policy-timeout-ms", opts.PolicyTimeoutMs}, {"--max-snapshots", opts.MaxSnapshots}, {"--upstream-timeout", opts.UpstreamTimeoutSecs}} {
 		if f.n > 0 {
 			args = append(args, f.flag, strconv.Itoa(f.n))
 		}
@@ -151,6 +165,17 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 		if f.v != "" {
 			args = append(args, f.flag, f.v)
 		}
+	}
+	for _, f := range []struct {
+		flag string
+		vs   []string
+	}{{"--record-redact", opts.RecordRedact}, {"--trajectory", opts.TrajectoryFiles}, {"--policy", opts.PolicyFiles}} {
+		for _, v := range f.vs {
+			args = append(args, f.flag, v)
+		}
+	}
+	if opts.RecordErrors {
+		args = append(args, "--record-errors")
 	}
 	if opts.Watch != nil && !*opts.Watch {
 		args = append(args, "--no-watch")

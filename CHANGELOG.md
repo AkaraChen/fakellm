@@ -2,6 +2,15 @@
 
 按里程碑记录，新的在前。版本号还是 `0.1.0`，还没有推过 `v*` tag，所以没有正式发布；日期是提交日期。设计思路见 [docs/design.md](docs/design.md)，待办见 [TODO.md](TODO.md)。
 
+## 未提交（收尾之后的一轮：保真、Python、e2e、清零 TODO）
+
+- 响应保真：Anthropic `usage` 补 `cache_creation`、`service_tier`、`inference_geo`，`message_delta.context_management`，空参数工具调用流出一个空 `input_json_delta`；Responses 的 `encrypted_content` 在 `added` 与 `done` 之间不同。有意保留的差异写进 [docs/wire.md](docs/wire.md#与真实-api-有意保留的差异)。
+- 修复：录制脱敏的正则运行时出错不再放行明文（整串脱敏，无法脱敏的交换不录）；`bindings/node` 加载策略时不再占着槽位读锁；`count_tokens` 不再消耗规则的命中预算；`replace_keep_hits` 按规则名带过计数，`after` 指向不存在的规则或成环时返回 400；`CassetteInfo` 返回 `fuzzy_threshold` 和 `sample`。
+- 新增：`xlam` 导入转换器；`sdk/python/fakellm_sdk`（`start`、`connect`、`reset`、`scripts`、`requests`）和官方 `openai` / `anthropic` 的 Python 测试；`sdk/node/faults.test.mjs`；`tests/agent_protocols.rs`、`custom_protocols.rs` 等多协议测试。
+- e2e：`claude-faults.sh`、`pi.sh`、`connect-rst.sh`、`connect-client.mjs`、`connect-proxy.mjs`；`.github/workflows/e2e.yml`（手动或每周）。在真实 txiki.js v26.6.0 上验证了 `tjs` shim，`import` 对着真实数据集跑过并修了 SWE-smith / OpenHands 的形状。
+- 文档：新增 [docs/release.md](docs/release.md)；TODO 只留已知差异和需要作者决定的事；`docs/design.md` 的里程碑表换成实际交付，未决问题都有了答案；`m1/m3/m4-spec.md` 标为历史。
+- 测试：`cargo test` 551 个通过；`sdk/js` 31、`sdk/node` 106、`bindings/node` 37（Bun 36 加 1 跳过）、Go 16、Python 17。
+
 ## 未提交（M4 之后）
 
 M4 之后的补充，来自 [docs/consumers.md](docs/consumers.md) 里的消费方缺口。

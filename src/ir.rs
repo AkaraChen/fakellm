@@ -535,6 +535,10 @@ pub struct Delivery {
     /// the first non-head frame (like `reset_after_chunks: 0`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reset: bool,
+    /// Anthropic streams only: put `input_tokens` (and the cache counters) in `message_delta`
+    /// instead of `message_start`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input_tokens_in_delta: bool,
 }
 
 impl Default for Delivery {
@@ -547,6 +551,7 @@ impl Default for Delivery {
             cut_after_chunks: None,
             reset_after_chunks: None,
             reset: false,
+            input_tokens_in_delta: false,
         }
     }
 }

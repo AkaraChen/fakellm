@@ -162,9 +162,17 @@ pub struct Cassette {
     /// Glob over the *request's* model; the cassette only answers matching requests. Default `*`.
     #[serde(default = "any_model", skip_serializing_if = "is_any_model")]
     pub model_glob: String,
-    /// Answer with the nearest exchange when none matches exactly.
+    /// Answer with the nearest exchange when none matches exactly: the one whose conversation has the highest
+    /// Jaccard similarity over normalized word sets, if it reaches `fuzzy_threshold`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fuzzy: bool,
+    /// Minimum Jaccard similarity (0..=1) for a `fuzzy` hit. Default 0.6.
+    #[serde(default = "default_threshold", skip_serializing_if = "is_default_threshold")]
+    pub fuzzy_threshold: f64,
+    /// Corpus sampling: when no exchange matches (exactly or fuzzily), answer with one of the cassette's replies
+    /// picked deterministically from the request seed, so a dataset serves any prompt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sample: bool,
     /// Each exchange answers once, in order of recording among equals; a spent exchange is skipped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub once: bool,
@@ -174,6 +182,17 @@ pub struct Cassette {
     /// May be empty (a freshly opened record file).
     #[serde(default)]
     pub exchanges: Vec<Exchange>,
+}
+
+/// `Cassette::fuzzy_threshold` when unset.
+pub const DEFAULT_FUZZY_THRESHOLD: f64 = 0.6;
+
+fn default_threshold() -> f64 {
+    DEFAULT_FUZZY_THRESHOLD
+}
+
+fn is_default_threshold(t: &f64) -> bool {
+    *t == DEFAULT_FUZZY_THRESHOLD
 }
 
 /// How a cassette text is split into documents; same detection rules as [`crate::TrajectoryFormat`].
@@ -214,6 +233,8 @@ impl Cassette {
             match_tool_schemas: false,
             model_glob: "*".into(),
             fuzzy: false,
+            fuzzy_threshold: DEFAULT_FUZZY_THRESHOLD,
+            sample: false,
             once: false,
             meta: Map::new(),
             exchanges: Vec::new(),
@@ -264,6 +285,9 @@ impl Cassette {
             return Err(fail("name must be non-empty, contain no `/` and not be `recording`".into()));
         }
         Matcher::compile(self).map_err(|e| fail(e.0))?;
+        if !(0.0..=1.0).contains(&self.fuzzy_threshold) {
+            return Err(fail("fuzzy_threshold must be between 0 and 1".into()));
+        }
         for (i, e) in self.exchanges.iter().enumerate() {
             let at = |m: String| fail(format!("exchange {i}: {m}"));
             if e.request.messages.is_empty() {

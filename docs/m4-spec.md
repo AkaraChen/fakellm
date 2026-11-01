@@ -1,5 +1,7 @@
 # M4 implementation spec (internal)
 
+> Status: delivered. This is the implementation spec the milestone was built from, kept as history; the user docs (`docs/*.md`, Chinese) and the code are authoritative where they differ.
+
 Audience: the agents implementing M4 in parallel. Read this, `docs/design.md` (cassette and Hugging Face sections),
 `docs/m3-spec.md` (the trajectory format is the base of the cassette format; its ownership rules still apply),
 `docs/agent.md`, `docs/consumers.md` and the stub files you own. Everything marked "decided" is settled; do not
@@ -466,5 +468,5 @@ Written against this spec; tests whose subject is still a stub carry `#[ignore =
 
 ## 13. Notes for the docs pass
 
-`docs/cassettes.md` (Chinese): recording with `--upstream`/`--record`, replay and the matching rules (3.2-3.4 as a user guide with the ignore table), the JSONL form, converting to a trajectory, Responses `previous_response_id` through the proxy, auth pass-through. `docs/import.md`: the formats and datasets table with licenses (design.md's), CLI, gated datasets and `HF_TOKEN`. `docs/scripts.md`: structured output in the default reply. `docs/control-plane.md`: cassette and
-snapshot routes, `reset?snapshots=`, status fields, the 409. `README.md`: flags (`--cassette`, `--upstream`, `--upstream-api-key`, `--record`, `--no-watch`), hot reload, subcommands. `docs/cassettes.md` also documents the loop guard and the credential table (4.2). `TODO.md`: close the M4 roadmap items and `--scripts` hot reload; note the unverified Docker build with `ring`.
+`docs/cassette.md` (Chinese): recording with `--upstream`/`--record`, replay and the matching rules (3.2-3.4 as a user guide with the ignore table), the JSONL form, converting to a trajectory, Responses `previous_response_id` through the proxy, auth pass-through. `docs/import.md`: the formats and datasets table with licenses (design.md's), CLI, gated datasets and `HF_TOKEN`. `docs/scripts.md`: structured output in the default reply. `docs/control-plane.md`: cassette and
+snapshot routes, `reset?snapshots=`, status fields, the 409. `README.md`: flags (`--cassette`, `--upstream`, `--upstream-api-key`, `--record`, `--no-watch`), hot reload, subcommands. `docs/cassette.md` also documents the loop guard and the credential table (4.2). `TODO.md`: close the M4 roadmap items and `--scripts` hot reload; note the unverified Docker build with `ring`.

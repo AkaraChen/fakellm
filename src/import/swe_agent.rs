@@ -12,6 +12,9 @@ use crate::agent::tool_map::{ToolMap, ToolMapping};
 use crate::import::{Builder, CallSpec, Conversation, arguments_string, array_field, copy_meta, row_id, str_of, value_text};
 use crate::ir::Role;
 
+static XML_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<function=([^>\s]+)>(.*?)</function>").expect("static regex"));
+static XML_PARAM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?s)<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>").expect("static regex"));
 static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)```[^\n`]*\n(.*?)\n?```").expect("static regex"));
 
 /// The tool map every SWE-agent conversation carries: `bash {command}` and `str_replace_editor {command, path,
@@ -27,6 +30,10 @@ pub fn default_tool_map() -> ToolMap {
     ToolMap(
         [
             ("bash".to_owned(), identity("bash", &["command"])),
+            // OpenHands' native tool names, as they appear in SWE-Gym/OpenHands-Sampled-Trajectories
+            ("execute_bash".to_owned(), identity("execute_bash", &["command"])),
+            ("think".to_owned(), identity("think", &["thought"])),
+            ("finish".to_owned(), identity("finish", &["message"])),
             (
                 "str_replace_editor".to_owned(),
                 identity(
@@ -47,7 +54,14 @@ pub fn matches(row: &Value) -> bool {
     {
         return true;
     }
-    array_field(row, "messages").is_some_and(|items| items.iter().any(|i| i.get("tool_calls").is_some_and(|c| !c.is_null())))
+    // SWE-smith's `xml` and `ticks` splits have no structured calls: the action is in the assistant text and the
+    // observations are user messages that start with "OBSERVATION:".
+    array_field(row, "messages").is_some_and(|items| {
+        items.iter().any(|i| i.get("tool_calls").is_some_and(|c| !c.is_null()))
+            || items.iter().any(|i| {
+                str_of(i, "role") == Some("user") && i.get("content").map(value_text).is_some_and(|t| t.starts_with("OBSERVATION:"))
+            })
+    })
 }
 
 /// Converts one row. `Err` carries the skip reason.
@@ -76,7 +90,7 @@ pub fn convert(row: &Value, index: usize) -> Result<Conversation, String> {
     b.finish(
         row_id(row, &["instance_id", "traj_id"], index),
         model,
-        Vec::new(),
+        crate::import::hermes::tool_defs(row),
         default_tool_map(),
         meta,
     )
@@ -139,15 +153,46 @@ fn split_action(text: &str) -> (String, Option<CallSpec>) {
     (discussion, Some(call))
 }
 
-/// `messages: [{role, content, tool_calls?, tool_call_id?}]` with structured calls.
+/// The `<function=NAME><parameter=KEY>VALUE</parameter>...</function>` call in an assistant text (SWE-smith `xml`
+/// split) and the text around it.
+fn split_xml_action(text: &str) -> Option<(String, CallSpec)> {
+    let m = XML_CALL.captures(text)?;
+    let whole = m.get(0).expect("group 0");
+    let mut args = Map::new();
+    for p in XML_PARAM.captures_iter(&m[2]) {
+        let value = &p[2];
+        let parsed = match &p[1] {
+            "insert_line" | "view_range" => serde_json::from_str(value).ok(),
+            _ => None,
+        };
+        args.insert(p[1].to_owned(), parsed.unwrap_or_else(|| Value::String(value.to_owned())));
+    }
+    let discussion = [&text[..whole.start()], &text[whole.end()..]]
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let call = CallSpec {
+        id: None,
+        name: m[1].to_owned(),
+        arguments: Value::Object(args).to_string(),
+    };
+    Some((discussion, call))
+}
+
+/// `messages: [{role, content, tool_calls?, tool_call_id?}]` with structured calls, or calls in the text.
 fn smith(items: &[Value], b: &mut Builder) {
     for item in items {
         let text = item.get("content").map(value_text).unwrap_or_default();
         match str_of(item, "role") {
             Some("system") => b.text(Role::System, &text),
+            Some("user") if b.has_pending() && text.starts_with("OBSERVATION:") => {
+                b.tool(None, &text);
+            }
             Some("user") => b.text(Role::User, &text),
             Some("assistant") => {
-                let calls = array_field(item, "tool_calls")
+                let calls: Vec<CallSpec> = array_field(item, "tool_calls")
                     .unwrap_or_default()
                     .iter()
                     .filter_map(|c| {
@@ -159,7 +204,14 @@ fn smith(items: &[Value], b: &mut Builder) {
                         })
                     })
                     .collect();
-                b.assistant(&text, None, calls);
+                if !calls.is_empty() {
+                    b.assistant(&text, None, calls);
+                } else if let Some((discussion, call)) = split_xml_action(&text) {
+                    b.assistant(&discussion, None, vec![call]);
+                } else {
+                    let (discussion, call) = split_action(&text);
+                    b.assistant(&discussion, None, call.into_iter().collect());
+                }
             }
             Some("tool") => {
                 b.tool(str_of(item, "tool_call_id"), &text);
