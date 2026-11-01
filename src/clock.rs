@@ -139,7 +139,7 @@ impl Clock {
 
     fn update(&self, f: impl Fn(i64, bool) -> (i64, bool)) -> Result<(), OutOfRange> {
         let mut result = Ok(());
-        let _ = self.state.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+        let _ = self.state.try_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
             let (value, frozen) = unpack(state);
             let (value, frozen) = f(value, frozen);
             match pack(value, frozen) {

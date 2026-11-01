@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+#
+# The same static fakellm binary on node:22-alpine, so policy scripts can also run on `node` as a subprocess
+# (`runtime: "node"`, `--policy-runtime node`). Policies without a runtime use the txiki.js embedded in the binary, as
+# in the default image (Dockerfile), which is smaller because it has no node. Run `tjs-sys/fetch-sources.sh` first (see Dockerfile).
+#
+#   docker build -f Dockerfile.node -t fakellm:node .
+#   docker run --rm -p 4010:4010 -v "$PWD/policies:/policies:ro" fakellm:node --policy /policies/reader.mjs
+#
+# `node` is on PATH; the rest is identical to the default image.
+#
+# `--build-arg SRC=ghcr.io/akarachen/fakellm:1.2.3` takes the binary from an already published image instead of
+# compiling it (release.yml does this, so the node variant needs no second Rust build).
+
+ARG SRC=built
+
+FROM rust:1-alpine AS build
+# git: txiki.js's CMake applies its own patches to the mbedtls and libwebsockets checkouts with `git apply`.
+RUN apk add --no-cache musl-dev make perl cmake g++ git linux-headers
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY tjs-sys ./tjs-sys
+COPY third_party ./third_party
+# The submodules' .git files point outside the build context; without them `git apply` works on the plain directories.
+RUN find third_party -name .git -type f -delete
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked \
+ && install -s target/release/fakellm /fakellm
+
+FROM alpine:3 AS built
+COPY --from=build /fakellm /usr/local/bin/fakellm
+
+FROM ${SRC} AS src
+
+FROM node:22-alpine
+RUN adduser -D -u 10001 fakellm
+COPY --from=src /usr/local/bin/fakellm /usr/local/bin/fakellm
+USER fakellm
+ENV FAKELLM_HOST=0.0.0.0 FAKELLM_PORT=4010
+EXPOSE 4010
+HEALTHCHECK --interval=5s --timeout=2s --start-period=2s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${FAKELLM_PORT}/_fakellm" >/dev/null || exit 1
+ENTRYPOINT ["fakellm"]
