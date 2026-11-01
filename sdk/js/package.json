@@ -8,7 +8,10 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
+  "repository": { "type": "git", "url": "git+https://github.com/AkaraChen/fakellm.git", "directory": "sdk/js" },
+  "bugs": { "url": "https://github.com/AkaraChen/fakellm/issues" },
+  "homepage": "https://github.com/AkaraChen/fakellm/tree/main/sdk/js#readme",
   "scripts": {
     "build": "tsc",
     "test": "npm run build && node --test \"test/*.test.mjs\"",

@@ -580,6 +580,7 @@ const MATCH_FIELDS: &[&str] = &[
     "last_user",
     "system",
     "any_message",
+    "body",
     "has_tool",
     "no_tools",
     "has_tool_result",
@@ -591,6 +592,7 @@ const MATCH_FIELDS: &[&str] = &[
     "protocol",
     "probability",
     "every_nth",
+    "path",
 ];
 
 /// `#<index> <name or -> hits/<times or inf> [exhausted] <matcher> -> <reply>`, from one
@@ -602,7 +604,7 @@ fn rule_line(r: &Value) -> String {
     for k in MATCH_FIELDS {
         if let Some(v) = r["match"].get(*k) {
             let shown = match v {
-                Value::String(s) if matches!(*k, "last_user" | "system" | "any_message" | "tool_result_contains") => {
+                Value::String(s) if matches!(*k, "last_user" | "system" | "any_message" | "body" | "tool_result_contains") => {
                     format!("/{}/", s.trim_matches('/'))
                 }
                 Value::String(s) => s.clone(),
@@ -630,6 +632,9 @@ fn reply_kind(reply: &Value) -> String {
     }
     if reply["tool_calls"].as_array().is_some_and(|t| !t.is_empty()) {
         return "tool_calls".into();
+    }
+    if !reply["body"].is_null() {
+        return "body".into();
     }
     "text".into()
 }

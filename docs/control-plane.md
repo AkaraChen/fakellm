@@ -188,7 +188,7 @@ $ curl -X DELETE $E/_fakellm/scripts
 $ curl -X PUT $E/_fakellm/scripts -d '[{"reply":{}}]'
 {"error":{"code":"BadRequest","message":"rule 0: reply needs `text`, `tool_calls`, `error`, `trajectory` or `policy`"}}
 $ curl -X PUT $E/_fakellm/scripts -d '[{"match":{"bogus":1},"reply":{"text":"x"}}]'
-{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `last_tool_call_id`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`"}}
+{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `body`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `last_tool_call_id`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`, `path`"}}
 ```
 
 ### Cassette 与快照
@@ -263,7 +263,7 @@ duration 的单位：`ns` `us` `ms` `s` `m` `h` `d`（24 小时）`w`，可以�
 
 ### 请求日志
 
-每个 API 请求（`/v1/*` 和不带前缀的 `/chat/completions`、`/messages`、`/responses`、`/models`，包括 404 和认证失败的）都会被记录，除非日志被关掉。三种协议在同一个日志里，用 `protocol` 区分。
+每个 API 请求（`/v1/*` 和不带前缀的 `/chat/completions`、`/messages`、`/responses`、`/models`，包括 404 和认证失败的）都会被记录，除非日志被关掉。三种协议在同一个日志里，用 `protocol` 区分。命中[自定义端点规则](scripts.md#自定义端点)的请求也会被记录（`protocol: "custom"`），不论路径在不在 `/v1` 下；没命中的未知路径照旧 404。
 
 ```
 $ curl "$E/_fakellm/requests?full=true&limit=1"
@@ -282,7 +282,7 @@ $ curl "$E/_fakellm/requests?full=true&limit=1"
 | `status` | 响应状态码；`0` 表示还没有（或永远不会有）响应：请求正被 `hang` / `hang_ms` 挂住，或客户端先放弃了。`reply` 里有 `hang` 字段 |
 | `hung` | `true`：请求此刻正被 `hang` / `hang_ms` 挂住。放行或客户端断开后变回 `false`，`status` 和 `latency_us` 随之更新 |
 | `latency_us` | 从到达到响应头就绪，微秒（真实时间；流的 body 不计，被时钟挂住的同步响应要等放行后才记录，包含等待） |
-| `protocol` | `openai.chat`、`openai.responses`、`openai.embeddings` 或 `anthropic.messages`；body 解析失败时为 `null` |
+| `protocol` | `openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages` 或 `custom`（[自定义端点](scripts.md#自定义端点)）；body 解析失败时为 `null` |
 | `model`、`stream` | 请求的模型名和是否流式；没有解析出请求时为 `null` / `false` |
 | `source` | 谁回答的：`{"kind": "script", "index", "name"}`、`{"kind": "trajectory", "index", "name", "trajectory", "step"}`、`{"kind": "policy", "index", "name", "policy"}`、`{"kind": "cassette", "name", "index"}`（cassette 回放，`index` 是 exchange 序号）、`{"kind": "upstream"}`（转发给 `--upstream` 的）、`{"kind": "fallback"}`、`{"kind": "strict"}`、`{"kind": "rejected"}`（在匹配之前就被拒绝：认证失败、JSON 不合法、校验失败、404） |
 | `rule` | 命中规则的 `name`；没有名字或不是规则回答时为 `null` |
@@ -308,7 +308,7 @@ Anthropic 请求和 Responses 请求的 `request`（解析后的结构）与 Cha
 | `model` | 模型名 glob（`*` 和 `?`，区分大小写） |
 | `has_tool` | 请求里提供了这个名字的工具 |
 | `stream` | `true` / `false` |
-| `protocol` | `openai.chat` / `openai.responses` / `openai.embeddings` / `anthropic.messages`（body 解析失败的请求没有协议，匹配不到任何一个） |
+| `protocol` | `openai.chat` / `openai.responses` / `openai.embeddings` / `anthropic.messages` / `custom`（body 解析失败的请求没有协议，匹配不到任何一个） |
 | `status` | 精确（`404`，挂起后放弃的是 `0`）、类别（`4xx`）、或 `error`（>= 400） |
 | `source` | `script`（也包含轨迹和策略的回答）/ `cassette` / `upstream` / `fallback` / `strict` / `rejected` |
 | `rule` | 规则名（精确） |

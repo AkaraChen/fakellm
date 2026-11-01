@@ -224,7 +224,7 @@ Errors are `invalid_request_error` 400 with `param: None`; messages follow Anthr
 | body not an object | "Input should be a valid dictionary or object" |
 | `model` missing / not string | "model: Field required" / "model: Input should be a valid string" |
 | `messages` missing / empty / not array | "messages: Field required" / "messages: at least one message is required" / "messages: Input should be a valid list" |
-| `messages[i].role` not `user`/`assistant` | "messages.{i}.role: Input should be 'user' or 'assistant'" |
+| `messages[i].role` not `user`/`assistant`/`system` (`system` is accepted leniently since Claude Code sends it; the message is treated as system) | "messages.{i}.role: Input should be 'user' or 'assistant'" |
 | `max_tokens` missing (`require_max_tokens`) | "max_tokens: Field required" |
 | `max_tokens` not a positive integer | "max_tokens: Input should be a valid integer" / "max_tokens: Input should be greater than or equal to 1" |
 | `thinking.type` not `enabled`/`adaptive`/`disabled` | "thinking.type: Input should be 'enabled', 'adaptive' or 'disabled'" |
@@ -562,7 +562,7 @@ model_provider = "fakellm"
 [model_providers.fakellm]
 name = "fakellm"
 base_url = "E/v1"
-env_key = "FAKELLM_API_KEY"
+# env_key = "FAKELLM_API_KEY"   # optional; if set, the env var must be non-empty
 wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0

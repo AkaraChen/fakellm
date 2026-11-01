@@ -124,7 +124,7 @@ fakellm 不发 `obfuscation`（随机填充，无语义）。
   [model_providers.fakellm]
   name = "fakellm"
   base_url = "http://127.0.0.1:PORT/v1"
-  env_key = "FAKELLM_API_KEY"        # 必须设置且非空，否则启动失败
+  # env_key = "FAKELLM_API_KEY"     # 可选；启用后对应环境变量必须设置且非空，否则启动失败（fakellm 不校验密钥，`wire codex` 默认注释掉）
   wire_api = "responses"
   request_max_retries = 0           # 默认 4
   stream_max_retries = 0            # 默认 5

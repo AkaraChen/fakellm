@@ -2,7 +2,7 @@
 
 一个专门给测试用的 LLM API 服务：全内存、不跑模型，启动只要几毫秒。
 只复刻协议（请求和响应的格式、SSE 分帧、错误体、状态码），回复来自你写的剧本，或者一个确定性的默认回复。
-和 fakes3 之于 S3 是同一个思路。目前实现了三种协议：OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages（加模型列表、`count_tokens` 和 Embeddings），三者共用同一套剧本、请求日志和虚拟时钟，还能扮演 agent 循环里的模型（[fake agent](#fake-agent)），也能把真实上游的往返录下来按含义回放（[cassette](#cassette上游代理与导入)），或导入 Hugging Face 数据集当夹具，用 Rust 编写。
+和 fakes3 之于 S3 是同一个思路。目前实现了三种协议：OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages（加模型列表、`count_tokens` 和 Embeddings），三者共用同一套剧本、请求日志和虚拟时钟，也能用一条规则回答非标准的 JSON 路径（[自定义端点](#自定义端点)），还能扮演 agent 循环里的模型（[fake agent](#fake-agent)），也能把真实上游的往返录下来按含义回放（[cassette](#cassette上游代理与导入)），或导入 Hugging Face 数据集当夹具，用 Rust 编写。
 
 ## 为什么
 
@@ -24,6 +24,7 @@ paseo 手写了约 5 个 `http.createServer` 假模型，raft 十几个测试文
 | Anthropic Messages（`anthropic.messages`） | `POST /v1/messages` | 同步和 SSE，`tool_use`、`thinking`（含 `signature`），`anthropic-beta` 头只记录不校验 |
 | | `POST /v1/messages/count_tokens` | 返回 `{"input_tokens": n}`，不消耗剧本 |
 | OpenAI Embeddings（`openai.embeddings`） | `POST /v1/embeddings` | 确定性向量，`float` / `base64`，见 [Embeddings](#embeddings)；剧本里只有带 `error` 的规则对它生效 |
+| 自定义端点（`custom`） | 任意 `POST <path>`，由带 `match.path` 和 `reply.body` 的规则回答 | 如 xsai 的 `/v1/systemone`；没有规则命中的未知路径仍是 404，见[自定义端点](#自定义端点) |
 | 模型列表 | `GET /v1/models`、`GET /v1/models/{id}` | 请求带 `anthropic-version` 头时返回 Anthropic 的格式（`display_name`、`created_at`、`has_more`），否则是 OpenAI 的 |
 
 所有路径也可以不带 `/v1` 前缀，也可以带任意前缀：`--path-prefix /anthropic` 配置的前缀会先被剥掉，此外前面多出的若干段只要后面恰好是上表里的某个路径（如 `/anthropic/v1/messages`、`/gateway/v2/proxy/v1/chat/completions`）就会被路由，请求日志里保留完整路径。其他路径是 404 `Invalid URL (METHOD path)`，带 `anthropic-version` 头的请求得到 Anthropic 格式的 404。
@@ -37,6 +38,8 @@ Anthropic 请求里 Claude Code 常常先发一条只有 `<system-reminder>` 块
 cargo build --release
 ./target/release/fakellm --port 0      # 0 表示随机选一个空闲端口，实际地址会打印到 stdout
 # http://127.0.0.1:41873
+export PATH=$PWD/target/release:$PATH            # 后面的 fakellm ctl / wire 命令直接用
+export FAKELLM_ENDPOINT=http://127.0.0.1:41873   # ctl 默认连 :4010，--port 0 时要指到实际地址
 ```
 
 启动完成后 stdout 打印的第一行就是 endpoint，可以当作就绪信号。OpenAI 客户端的 base URL 要加 `/v1`；API key 随便填（除非用了 `--api-key`）。
@@ -102,7 +105,7 @@ curl -X PUT http://127.0.0.1:41873/_fakellm/scripts \
 # {"added":1,"count":1}
 ```
 
-上面的例子这时都会打印 `pong`。`sdk/node/` 里有用官方 SDK 跑的完整测试：`openai`、`@anthropic-ai/sdk`、Vercel AI SDK 的 `@ai-sdk/openai`（Chat 和 Responses）和 `@ai-sdk/anthropic`，共六个套件（`cargo test` 会在装了 node 时自动运行它们，先在该目录 `npm ci`；没装 `node_modules` 会打印 skip 并跳过）。
+上面的例子这时都会打印 `pong`。`sdk/node/` 里有用官方 SDK 跑的完整测试：`openai`、`@anthropic-ai/sdk`、Vercel AI SDK 的 `@ai-sdk/openai`（Chat 和 Responses）和 `@ai-sdk/anthropic`，以及 agent、cassette、结构化输出等套件（`cargo test` 会在装了 node 时自动运行它们，先在该目录 `npm ci`；没装 `node_modules` 会打印 skip 并跳过）。
 
 ### 接线真实的 agent：`fakellm wire`
 
@@ -134,7 +137,7 @@ fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json     # file
 |---|---|
 | `name` | 可选。规则名，出现在请求日志里，可以用 `rule=` 过滤 |
 | `match` | 条件，缺省或 `{}` 匹配所有请求。所有写出的字段都要满足 |
-| `reply` | 回复：`text` / `tool_calls` / `error` / `hang` 四选一（`text` 和 `tool_calls` 可以同时有） |
+| `reply` | 回复：`text` / `tool_calls` / `error` / `hang` 四选一（`text` 和 `tool_calls` 可以同时有）；还有 `trajectory` / `policy`（见 [Fake agent](#fake-agent)）和自定义端点的 `body` |
 | `times` | 这条规则最多回答几次，用完后跳过，缺省不限 |
 
 `match` 常用字段（完整列表和语义见 [docs/scripts.md](docs/scripts.md)）：
@@ -149,7 +152,8 @@ fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json     # file
 | `last_tool_result` | 结尾的 tool 结果里有某个函数的结果 |
 | `last_tool_call_id` | 结尾的 tool 结果里有一条回答的是这个 id 的工具调用（`tool_call_id` / `call_id` / `tool_use_id`） |
 | `stream` / `turn` | 只匹配流式 / 非流式；已经有几条 assistant 消息 |
-| `protocol` | 只匹配某个协议：`openai.chat`、`openai.responses`、`anthropic.messages` |
+| `protocol` | 只匹配某个协议：`openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages` |
+| `path` / `body` | 自定义端点：请求路径的 glob / 原始请求正文的正则，见[自定义端点](#自定义端点) |
 | `probability` | 0 到 1，其他条件都满足后按这个概率命中（确定性的，同样的请求序列每次得到同样的结果） |
 | `every_nth` | 其他条件都满足的请求里，每第 N 个命中（`3` 命中第 3、6、9 个） |
 
@@ -160,6 +164,7 @@ fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json     # file
 | 字段 | 含义 |
 |---|---|
 | `text` / `tool_calls` | 回复文本 / 工具调用（`arguments` 可以故意写成不完整的 JSON） |
+| `body` / `status` / `headers` | 自定义端点的回复：原样返回的 JSON / 状态码（默认 200）/ 响应头，必须和 `match.path` 一起写 |
 | `usage` | 覆盖 tokenizer 的 token 计数：`prompt_tokens` / `input_tokens`、`completion_tokens` / `output_tokens`、`cached_tokens`、`reasoning_tokens`、`cache_creation_tokens`，只覆盖写了的字段；`count_tokens` 也会用它（见 [docs/scripts.md](docs/scripts.md#usage)） |
 | `reasoning` / `reasoning_opaque` | 推理文本，和随它发的 `signature`（Anthropic）/ `encrypted_content`（Responses） |
 | `error` | 错误：`status` 必填，`type` / `code` / `message` / `param` / `retry_after` 可覆盖；`in_stream: true` 把错误放进事件流；`headers` 加额外响应头（`retry-after-ms`、`x-should-retry`） |
@@ -398,7 +403,7 @@ Anthropic 路由上，上面的错误都用 Anthropic 的错误体，`code` 和 
 ```
 
 - **重试头**：`error.headers` 可以加 `retry-after-ms`、`x-should-retry`（官方 SDK 用它覆盖自己的重试判断），`retry_after` 只写 `retry-after`。
-- **流中途断开有三种**：`cut_after_chunks` 是干净地结束 chunked body（没有 finish 事件，没有 `[DONE]`；客户端看到流提前结束）；`in_stream: true` 的错误是 200 的流里出现一个错误事件（Chat 是 `data: {"error": ...}` 加 `[DONE]`，Anthropic 是 `event: error`，Responses 是 `response.failed`）。`stream.reset_after_chunks`（同步响应用 `reply.reset: true`）在同一位置直接关闭连接，不发结尾的 `0\r\n\r\n`：连接以 FIN 关闭而不是 RST，客户端看到 `premature close` / `terminated` / `unexpected EOF`，通常不是 `ECONNRESET`。
+- **流中途断开有三种**：`cut_after_chunks` 是干净地结束 chunked body（没有 finish 事件，没有 `[DONE]`；客户端看到流提前结束）；`in_stream: true` 的错误是 200 的流里出现一个错误事件（Chat 是 `data: {"error": ...}` 加 `[DONE]`，Anthropic 是 `event: error`，Responses 是 `response.failed`）。`stream.reset_after_chunks`（同步响应用 `reply.reset: true`）在同一位置直接关闭连接，不发结尾的 `0\r\n\r\n`：Linux 等 unix 平台上连接设了 `SO_LINGER(0)`，关闭时发真正的 TCP RST，客户端看到 `ECONNRESET` / `connection reset by peer`；只有非 unix 平台退回 FIN（客户端看到 `premature close` / `unexpected EOF`）。
 - **挂起**：`hang` 的请求一被挂住就以 `status: 0`、`hung: true` 记入请求日志，测试不用等客户端放弃就能看到它；`hang_ms` 读服务端时钟，冻结时钟时一直挂着，`advance` 后放行；`reset` 会唤醒所有挂住的请求（有 `hang_ms` 的按规则其余部分回答，只写 `hang: true` 的回 503）。详见[控制面](#控制面)。
 - **codex 的限制**：codex 对 HTTP 400 的 body 不分类（一律是不重试的 `InvalidRequest`），要让它认出 `context_length_exceeded`、`insufficient_quota`、`rate_limit_exceeded`、`server_is_overloaded`，错误必须是流内的 `response.failed`，也就是规则里写 `in_stream: true`。写法见 [docs/scripts.md](docs/scripts.md#示例五codex-的上下文溢出)。codex 的 `wire` 配置同时把它的重试关掉了，并把空闲超时降到 5 秒，所以挂起超过 5 秒的流会被它当作超时。
 
@@ -407,6 +412,17 @@ Anthropic 路由上，上面的错误都用 Anthropic 的错误体，`code` 和 
 `POST /v1/embeddings`（也接受 `/embeddings` 和任意前缀）：`input` 可以是字符串、字符串数组、一个 token 数组或 token 数组的数组；`dimensions` 默认 1536，`encoding_format` 支持 `float` 和 `base64`。
 向量由模型名和输入内容的哈希生成并做 L2 归一化，所以同一输入（同一模型）每次都得到同一个向量，不同输入得到不同向量，同一批里长度一致。`usage.prompt_tokens` 等于 `total_tokens`。
 剧本里只有带 `error` 的规则对这个端点生效。
+
+## 自定义端点
+
+有些 SDK 除了 LLM 路由还会调用非标准的 JSON 接口（xsai 的 `POST /v1/systemone`）。写一条带 `match.path`（路径 glob）和 `reply.body`（原样返回的 JSON，可加 `status`、`headers`）的规则就能回答它，`match.body` 用正则按原始请求正文区分同一路径上的不同请求：
+
+```yaml
+- match: { path: /v1/systemone, body: "/angry/i" }
+  reply: { status: 202, headers: { x-fake: "1" }, body: { answers: { damaged: { type: noul, noul: 0.9 } } } }
+```
+
+没有规则命中的未知路径仍是 404；请求日志里 `protocol` 为 `custom`（`ctl requests list --protocol custom`）；这类请求不经过 cassette、上游和回退，不支持流式和 `delay_ms`。完整规则见 [docs/scripts.md](docs/scripts.md#自定义端点)。
 
 ## Fake agent
 
@@ -423,7 +439,7 @@ agent 框架 ──messages + tools──▶ fakellm（扮演模型）
 ```
 
 - **轨迹（trajectory）**：一次运行写成回合列表（JSON、YAML 或 JSONL），按请求里的历史选步骤，所以重试和并行对话互不干扰；每步可以用 `expect` 检查客户端送回来的工具结果，偏离时 `strict` 报 400 并给出差异、`lenient` 照常继续、`stop` 直接收尾；`tool_map` 把数据集里的工具名和参数（`bash {command}`）改写成你的 agent 的写法（`run_shell {cmd}`）。
-- **策略脚本（policy）**：一个 JS 模块 `decide(request, context)` 看请求返回回复，状态由 fakellm 保存；运行时是 txiki.js（`tjs`）、Node 或 Bun。**注册策略就是在本机执行代码**，不要把控制面暴露出去。
+- **策略脚本（policy）**：一个 JS 模块 `decide(request, context)` 看请求返回回复，状态由 fakellm 保存；返回 `null` 或 `{decline: true}` 表示“不归我”，请求落到后面的规则；运行时是 txiki.js（`tjs`）、Node 或 Bun。**注册策略就是在本机执行代码**，不要把控制面暴露出去。
 
 ```bash
 fakellm --trajectory fix-bug.yaml --policy reader.mjs --scripts rules.yaml
@@ -601,7 +617,7 @@ String endpoint = "http://" + llm.getHost() + ":" + llm.getMappedPort(4010);
 
 ## JS / TS 客户端（sdk/js）
 
-[`sdk/js`](sdk/js/README.md) 是纯 TypeScript 的客户端：启动 `fakellm` 二进制、从 stdout 读到地址，再通过 `fetch` 调用[控制面](docs/control-plane.md)。Node、Bun、vitest、node:test 都能用。**尚未发布到 npm**，目前从 git 路径安装，并且需要一个 `fakellm` 二进制（`cargo build` 得到 `target/debug/fakellm`，或设 `FAKELLM_BIN`，或放在 `PATH` 上）：
+[`sdk/js`](sdk/js/README.md) 是纯 TypeScript 的客户端：启动 `fakellm` 二进制、从 stdout 读到地址，再通过 `fetch` 调用[控制面](docs/control-plane.md)。Node、Bun、vitest、node:test 都能用。**尚未发布到 npm**，目前从 git 路径安装，并且需要一个 `fakellm` 二进制（`cargo build` 得到 `target/debug/fakellm`；用 `export FAKELLM_BIN=$PWD/target/debug/fakellm` 指给它，或放在 `PATH` 上）：
 
 ```bash
 npm install --save-dev "github:akarachen/fakellm#path:sdk/js"
@@ -669,13 +685,13 @@ await server.stop();                    // 关闭监听和所有未结束的连�
 
 `start(options?)` 的选项：`host`、`port`、`apiKey`、`models`、`strict`、`scripts`（规则数组，或 JSON / YAML 字符串）、`trajectories`、`policies`（数组，或 JSON / YAML / JSONL 字符串）、`policyRuntime`、`cassettes`（数组，或 JSON / YAML / JSONL 字符串）、`upstream`、`upstreamApiKey`、`record`（文件路径）、`watch`（`{ scripts?, trajectories?, policies?, cassettes? }` 文件路径，变化时重新加载；默认什么都不监视）、`pathPrefix`、`ttft`、`tokensPerSec`、`fallbackTokens`、`chunkTokens`、`argsChunkBytes`、`requestLog`、`requestLogCapacity`、`redactAuth`。服务器对象的属性有 `endpoint`、`baseUrl`、`anthropicBaseUrl`、`host`、`port`，以及 `scripts`、`trajectories`、`cassettes`、`snapshots`、`policies`、`requests`、`responses`、`clock`、`reset()`、`status()`、`wire(target, format?)`、`stop()`。类型声明由 `napi build` 生成（`index.d.ts`）。没有调用 `stop()` 的服务器对象被垃圾回收时也会停止，所以在用到它的地址期间要保留引用。
 
-- **Bun**：同一个 `.node` 在 Bun 下可以加载，`bun test __test__/openai.test.mjs` 在本机通过（20 通过，1 跳过：那一条需要 `node --expose-gc`）；CI 的 `napi-bun` 任务会跑它。Bun 的 napi 实现和 Node 不是同一个，除这个测试覆盖的内容外没有别的保证。
+- **Bun**：同一个 `.node` 在 Bun 下可以加载，`bun test __test__/openai.test.mjs` 在本机通过（25 通过，1 跳过：那一条需要 `node --expose-gc`）；CI 的 `napi-bun` 任务会跑它。Bun 的 napi 实现和 Node 不是同一个，除这个测试覆盖的内容外没有别的保证。
 - **平台**：构建目标是 Linux 的 x64 / arm64，glibc 和 musl；macOS 和 Windows 没有构建，也没有验证过。
 - 自己编译：`cd bindings/node && npm ci && npm run build`（需要 Rust 工具链），`npm test` 用官方 `openai` 和 `@anthropic-ai/sdk` 跑一遍。
 
 ## Go helper（go/）
 
-[`go/`](go/README.md) 在 Go 测试里启动 `fakellm` 二进制并包装控制面，用法像 testcontainers 但不需要 Docker；只用标准库，需要 Go 1.24。二进制按 `Options.Bin`、`FAKELLM_BIN`、`PATH` 的顺序查找；`fakellm.Download` 从 GitHub release 下载，但**release 现在还不存在**（第一次推 `v*` tag 之后才有），在此之前自己 `cargo build`。
+[`go/`](go/README.md) 在 Go 测试里启动 `fakellm` 二进制并包装控制面，用法像 testcontainers 但不需要 Docker；只用标准库，需要 Go 1.24。二进制按 `Options.Bin`、`FAKELLM_BIN`、`PATH` 的顺序查找；`fakellm.Download` 从 GitHub release 下载，但**release 现在还不存在**（第一次推 `v*` tag 之后才有），在此之前自己 `cargo build`，并 `export FAKELLM_BIN=$PWD/target/debug/fakellm`。
 
 ```go
 import fakellm "github.com/AkaraChen/fakellm/go"
@@ -712,7 +728,7 @@ func TestAgent(t *testing.T) {
 | `--host` | `FAKELLM_HOST` | `127.0.0.1` | 监听地址 |
 | `--port` | `FAKELLM_PORT` | `4010` | 监听端口，`0` 为随机；实际地址打印到 stdout |
 | `--api-key` | `FAKELLM_API_KEY` | 无 | 设置后必须匹配（`Authorization: Bearer` 或 `x-api-key`），否则 401（Anthropic 路由用 Anthropic 的错误体）；不设则任意 key 都行。只管 API，不管控制面 |
-| `--models` | `FAKELLM_MODELS` | 14 个常见名字（gpt-4o、gpt-5、o3、gpt-5.5、claude-sonnet-4-5、claude-opus-4-1、claude-haiku-4-5 等） | `GET /v1/models` 返回的列表，逗号分隔。不影响生成接口，那里任何模型名都接受 |
+| `--models` | `FAKELLM_MODELS` | 16 个常见名字（gpt-4o、gpt-5、o3、gpt-5.5、claude-sonnet-4-5、claude-opus-4-1、claude-haiku-4-5 等） | `GET /v1/models` 返回的列表，逗号分隔。不影响生成接口，那里任何模型名都接受 |
 | `--strict` | `FAKELLM_STRICT` | 关 | 没有规则命中时返回 400 而不是默认回复。环境变量认 `true/false`、`1/0`、`yes/no`、`on/off` |
 | `--scripts` | `FAKELLM_SCRIPTS` | 无 | 启动时加载的规则文件；`.json` / `.yaml` / `.yml` 按扩展名，其他按内容判断。规则不合法则启动失败 |
 | `--fallback-tokens` | `FAKELLM_FALLBACK_TOKENS` | `32` | 默认回复的长度（token） |
@@ -792,6 +808,37 @@ fakellm ctl requests list --status 0   # 此刻被 hang 挂住的请求（JSON �
 - 响应对象的 `usage`、`output` 项 id（`msg_`、`fc_`、`rs_`）由请求派生，`created_at` 来自服务端时钟。
 - 保存的对象最多 1000 个，见 [Responses 的状态](#responses-的状态与-previous_response_id)。
 
+## 测试与验证
+
+CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`sdk/js` 与 `sdk/node` 的 `npm test` 和 `bun test`、Go 的 `go vet` 和 `go test`、`bindings/node` 的 Bun 测试和 `e2e/docker.sh`。需要真实 claude / codex / opencode 的 e2e 脚本不在 CI 里，手工运行。下面的数字是 2026-11-01 在本机的结果。
+
+| 套件 | 命令 | 当前结果 |
+|---|---|---|
+| 格式与 lint | `cargo fmt --check`；`cargo clippy --all-targets -- -D warnings` | 干净 |
+| Rust 单元和集成测试 | `cargo test` | 491 个通过：库 243、二进制 11、`tests/*.rs` 22 个文件共 235、文档测试 2 |
+| 官方 SDK 套件（`sdk/node`） | 先 `cd sdk/node && npm ci`；`cargo test` 里的 `tests/node_sdk.rs` 会自动跑它，也可以 `npm test` 或 `bun test` | 59 个通过（node 和 bun 都是），10 个测试文件，覆盖 `openai`、`@anthropic-ai/sdk`、`@ai-sdk/openai`、`@ai-sdk/anthropic` 以及 agent、cassette、结构化输出 |
+| JS / TS 客户端（`sdk/js`） | `cd sdk/js && npm ci && npm test`；`bun test` | 21 个通过（node 和 bun 都是） |
+| Node 原生绑定（`bindings/node`） | `cd bindings/node && npm ci && npm run build:debug && npm test`；Bun：`bun test __test__/openai.test.mjs` | node 26 个通过；Bun 25 个通过、1 个跳过（那一条需要 `node --expose-gc`） |
+| Go helper（`go/`） | `cd go && go vet ./... && go test -count=1 ./...` | 15 个通过 |
+| 发布前检查 | `cargo publish --dry-run`（工作区有未提交改动时加 `--allow-dirty`）；`npm pack --dry-run`（`sdk/js`、`bindings/node`） | 通过 |
+
+真实 harness 和镜像的 e2e 脚本（`e2e/*.sh`），每个都会先 `cargo build`，用 `FAKELLM_BIN` 可以换二进制，成功时最后一行如下：
+
+| 脚本 | 需要 | 验证什么 | 成功时的最后一行 |
+|---|---|---|---|
+| `e2e/claude.sh` | `claude` | `claude -p` 得到 `FAKELLM_OK` | `PASS` |
+| `e2e/claude-trajectory.sh` | `claude` | 轨迹加 `tool_map`（shell 到 Bash）驱动 Claude Code 的工具循环 | `claude trajectory e2e ok` |
+| `e2e/codex.sh` | `codex` | 纯文本和一轮 `exec_command` 工具调用 | `codex e2e ok` |
+| `e2e/codex-faults.sh` | `codex` | 流内 `context_length_exceeded` 错误 | `codex faults e2e ok` |
+| `e2e/codex-trajectory.sh` | `codex` | 轨迹驱动 codex 的工具循环 | `codex trajectory e2e ok` |
+| `e2e/opencode.sh` | `opencode` | 标题旁路请求加主请求 | `PASS` |
+| `e2e/opencode-policy.sh` | `opencode`、node | 策略脚本驱动 opencode | `opencode policy e2e ok` |
+| `e2e/docker.sh` | `docker` | 构建镜像、随机端口启动、请求一次 chat completion | `PASS docker ...` |
+
+这八个脚本在 M4 之后的核对中全部通过（记下的是每个脚本最后一行输出，没有逐个记退出码）。版本：codex 0.162.1、Claude Code 2.1.314、opencode 1.18.29。没有覆盖的部分（pi、真实 `tjs`、真实上游、各 harness 的故障重试）见 [TODO.md](TODO.md)。
+
+消费方实验（八个真实仓库的测试对着 fakellm 跑）的结果和复现方法见 [docs/consumers.md](docs/consumers.md)。
+
 ## 路线图
 
 | 阶段 | 内容 | 状态 |
@@ -801,22 +848,26 @@ fakellm ctl requests list --status 0   # 此刻被 hang 挂住的请求（JSON �
 | M1 | 故障注入（`probability`、`every_nth`、`hang`、`error.headers`、`error.in_stream`、`cut_after_chunks`、`reset_after_chunks`、按协议的错误体） | 已完成 |
 | M1 | `fakellm wire` helper 和 codex / claude / opencode 的冒烟 e2e（`e2e/*.sh`，手工运行） | 已完成 |
 | M2 | napi 绑定（Node 和 Bun，`bindings/node`）、JS / TS 客户端（`sdk/js`）、Go helper（`go/`） | 已完成 |
-| M2 | Docker 镜像和 GHCR 发布（`Dockerfile`、`release.yml`） | 已完成 |
-| M2 | e2e 进 CI、补 pi 的 e2e | 未做（`e2e/codex-faults.sh` 已覆盖 codex 的故障场景，手工运行） |
+| M2 | Docker 镜像和 GHCR 发布（`Dockerfile`、`release.yml`） | 已完成（还没推过 tag，没有真正发布） |
 | M3 | fake agent：轨迹回放、工具映射、txiki.js / Node / Bun 策略脚本，见 [docs/agent.md](docs/agent.md) | 已完成 |
 | M3 | `POST /v1/embeddings`，见 [Embeddings](#embeddings) | 已完成 |
 | M3 | 可配置的路径前缀、`last_user` 忽略 `<system-reminder>`、`last_user_raw`、`stream.args_chunk_bytes` | 已完成 |
 | M4 | cassette 录制回放（`--upstream`、`--record`）、`fakellm import hf`、快照、热加载，见 [docs/cassette.md](docs/cassette.md) | 已完成 |
 | M4 | 按 `json_schema` 生成结构化输出 | 已完成 |
+| M4 之后 | 自定义端点规则（`match.path` / `reply.body`）、策略脚本的 `decline`、启动错误信息、LICENSE | 已完成（未提交） |
 
-M0 到 M4 的路线图都已完成。接下来：
+每个里程碑的细节见 [CHANGELOG.md](CHANGELOG.md)。M0 到 M4 的路线图都已完成。
 
-- **发布**：第一次推 `v*` tag，发布 GHCR 镜像、GitHub release 二进制（`go/` 的 `Download` 依赖它）和 npm 包（`@fakellm/native`、`sdk/js`），之后在真实镜像上验证 testcontainers 片段；发布到 crates.io。
-- **验证**：e2e 进 CI，补 pi 和 paseo；Docker 镜像（alpine）里没有 JS 运行时，策略脚本跑不起来；用真实的 `tjs` 跑一遍策略脚本的测试。
+**有意没做的**（不是遗漏，原因见[不做的事](#不做的事)）：真正的推理和与任何真实模型一致的 tokenizer、多模态生成、内容审核、持久化、分发数据集、向量相似度式的语义匹配。
+
+**还没做的**（详见 [TODO.md](TODO.md)）：
+
+- **发布**：第一次推 `v*` tag，发布 GHCR 镜像、GitHub release 二进制（`go/` 的 `Download` 依赖它）和 npm 包（`@fakellm/native`、`sdk/js`），之后在真实镜像上验证 testcontainers 片段；发布到 crates.io；`bindings/node` 的 macOS / Windows 构建。
+- **验证**：e2e 进 CI，补 pi 的 e2e；Docker 镜像（alpine）里没有 JS 运行时，策略脚本跑不起来；用真实的 `tjs` 跑一遍策略脚本的测试；对着真实上游录制回放。
 - **协议**：Responses 的 WebSocket、`background`、`/cancel`、`/input_items`。
-- **消费方缺口**：任意谓词或 turn 范围匹配、函数式回复、自定义端点规则（`docs/consumers.md` 整理的缺口）。
+- **消费方缺口**：跨请求的序列/状态匹配、Anthropic 缓存与 `input_tokens` 的耦合、与真实 API 的响应保真差异（`docs/consumers.md` 整理的缺口）。
 
-完整的设计思路见 [docs/design.md](docs/design.md)，具体的待办和已知问题见 [TODO.md](TODO.md)。
+完整的设计思路见 [docs/design.md](docs/design.md)。
 
 ## 不做的事
 

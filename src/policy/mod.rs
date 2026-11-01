@@ -399,7 +399,8 @@ impl Policies {
     ///    `ApiError::policy_crashed`; an `error` line, a reply that is not a `ReplySpec` or one that fails
     ///    validation (`trajectory` is allowed, `policy` is not) is `ApiError::policy_error`.
     /// 4. On success stores the reply's `state` (when present) and counts the hit; failures do not count.
-    pub async fn decide(&self, name: &str, req: &Request) -> Result<ReplySpec, ApiError> {
+    ///    A decline (`null`/`undefined`/`{decline: true}`) is `Ok(None)`: `state` is stored, no hit counts.
+    pub async fn decide(&self, name: &str, req: &Request) -> Result<Option<ReplySpec>, ApiError> {
         let entry = self.find(name).ok_or_else(|| ApiError::policy_not_found(name))?;
         let mut live = entry.live.lock().await;
         if live.process.as_mut().is_some_and(|p| p.exited()) {
@@ -449,7 +450,16 @@ impl Policies {
         };
         guard.armed = false;
         live.process = Some(process);
-        let reply = outcome.map_err(|m| ApiError::policy_error(name, &m))?;
+        let reply = match outcome.map_err(|m| ApiError::policy_error(name, &m))? {
+            Some(reply) => reply,
+            None => {
+                // Declined: the state is kept, but the decision does not count as a hit.
+                if let Some(next) = next_state {
+                    entry.snap.lock().state = next;
+                }
+                return Ok(None);
+            }
+        };
         if reply.policy.is_some() {
             return Err(ApiError::policy_error(name, "a policy may not reply with `policy`"));
         }
@@ -459,7 +469,7 @@ impl Policies {
             snap.state = next;
         }
         snap.hits += 1;
-        Ok(reply)
+        Ok(Some(reply))
     }
 }
 
@@ -469,7 +479,7 @@ fn close(entries: &[Arc<Entry>]) {
     }
 }
 
-type Answer = (Result<ReplySpec, String>, Option<Value>);
+type Answer = (Result<Option<ReplySpec>, String>, Option<Value>);
 
 /// Writes `line` and reads until the answer with `id`; `None` when the process is gone.
 async fn exchange(process: &mut runtime::Process, id: u64, line: &str) -> Option<Answer> {
@@ -574,9 +584,9 @@ mod tests {
             let policies = Policies::default();
             policies.replace(vec![spec("p", STATEFUL, rt.clone())]).await.unwrap();
             let first = policies.decide("p", &request(&["read_file"])).await.unwrap();
-            assert_eq!(first.tool_calls.unwrap()[0].name, "read_file", "{rt}");
+            assert_eq!(first.unwrap().tool_calls.unwrap()[0].name, "read_file", "{rt}");
             let second = policies.decide("p", &request(&[])).await.unwrap();
-            assert_eq!(second.text.as_deref(), Some("done after read"), "{rt}");
+            assert_eq!(second.unwrap().text.as_deref(), Some("done after read"), "{rt}");
             let info = policies.get("p").unwrap();
             assert_eq!((info.hits, info.restarts, info.state), (2, 0, serde_json::json!({"stage": "read"})));
             let mut log = info.log;
@@ -619,7 +629,10 @@ mod tests {
                 .message
                 .contains("nope")
         );
-        assert_eq!(policies.decide("p", &request(&[])).await.unwrap().text.as_deref(), Some("ok"));
+        assert_eq!(
+            policies.decide("p", &request(&[])).await.unwrap().unwrap().text.as_deref(),
+            Some("ok")
+        );
         assert_eq!(policies.get("p").unwrap().hits, 1);
         let err = policies.decide("zzz", &request(&[])).await.unwrap_err();
         assert_eq!(err.code.as_deref(), Some("fakellm_policy_not_found"));
@@ -640,7 +653,10 @@ mod tests {
         assert_eq!((err.status, err.code.as_deref()), (500, Some("fakellm_policy_timeout")));
         let info = policies.get("p").unwrap();
         assert_eq!((info.running, info.hits), (false, 0));
-        assert_eq!(policies.decide("p", &request(&[])).await.unwrap().text.as_deref(), Some("fast"));
+        assert_eq!(
+            policies.decide("p", &request(&[])).await.unwrap().unwrap().text.as_deref(),
+            Some("fast")
+        );
         assert_eq!(policies.get("p").unwrap().restarts, 1);
     }
 
@@ -660,7 +676,7 @@ mod tests {
             let err = policies.decide("p", &request(&["die"])).await.unwrap_err();
             assert_eq!((err.status, err.code.as_deref()), (500, Some("fakellm_policy_crashed")));
             let again = policies.decide("p", &request(&[])).await.unwrap();
-            assert_eq!(again.text.as_deref(), Some("hit 1"));
+            assert_eq!(again.unwrap().text.as_deref(), Some("hit 1"));
             let info = policies.get("p").unwrap();
             assert_eq!((info.restarts, info.hits, info.state), (1, 2, serde_json::json!({"kept": true})));
         }

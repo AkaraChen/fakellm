@@ -3,7 +3,7 @@
  * (docs/control-plane.md). Field names are exactly the server's; unknown fields are rejected by it.
  */
 
-export type Protocol = 'openai.chat' | 'openai.responses' | 'anthropic.messages' | 'openai.embeddings';
+export type Protocol = 'openai.chat' | 'openai.responses' | 'anthropic.messages' | 'openai.embeddings' | 'custom';
 
 /** A regex-or-literal pattern string as understood by the server (see docs/scripts.md). */
 export type Pattern = string;
@@ -13,6 +13,9 @@ export interface Match {
   last_user?: Pattern;
   system?: Pattern;
   any_message?: Pattern;
+  body?: Pattern;
+  /** Glob over the request path; makes the rule a custom-endpoint rule. */
+  path?: string;
   has_tool?: string;
   no_tools?: boolean;
   has_tool_result?: boolean;
@@ -85,6 +88,12 @@ export interface Reply {
   trajectory?: string;
   /** Let this registered policy decide the reply. Excludes the content fields. */
   policy?: string;
+  /** Custom endpoint only (needs match.path): raw JSON body of the reply. */
+  body?: unknown;
+  /** Custom endpoint only: HTTP status, default 200. */
+  status?: number;
+  /** Custom endpoint only: extra response headers. */
+  headers?: Record<string, string>;
 }
 
 export interface Rule {

@@ -86,6 +86,7 @@ impl Reassembler {
                 Protocol::AnthropicMessages => anthropic_sse(&events),
                 Protocol::OpenaiResponses => responses_sse(&events),
                 Protocol::OpenaiEmbeddings => Err("an embeddings response cannot be an event stream".into()),
+                Protocol::Custom => Err("a custom endpoint response cannot be an event stream".into()),
             };
         }
         let body: Value = serde_json::from_slice(&self.buf).map_err(|e| format!("the response body is not JSON: {e}"))?;
@@ -120,6 +121,7 @@ pub fn sync_reply(protocol: Protocol, body: &Value) -> Result<Reply, String> {
             },
             ..Reply::default()
         }),
+        Protocol::Custom => Err("a custom endpoint is never relayed upstream".into()),
     }
 }
 

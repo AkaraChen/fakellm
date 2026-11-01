@@ -23,6 +23,8 @@ type Match struct {
 	LastUser          string   `json:"last_user,omitempty"`
 	System            string   `json:"system,omitempty"`
 	AnyMessage        string   `json:"any_message,omitempty"`
+	Body              string   `json:"body,omitempty"`
+	Path              string   `json:"path,omitempty"`
 	HasTool           string   `json:"has_tool,omitempty"`
 	NoTools           *bool    `json:"no_tools,omitempty"`
 	HasToolResult     *bool    `json:"has_tool_result,omitempty"`
@@ -57,6 +59,11 @@ type ReplySpec struct {
 	// Trajectory and Policy delegate the reply to a registered trajectory or policy by name.
 	Trajectory string `json:"trajectory,omitempty"`
 	Policy     string `json:"policy,omitempty"`
+	// Body, Status and Headers make a custom-endpoint reply (needs Match.Path): raw JSON body,
+	// HTTP status (default 200) and extra headers.
+	Body    json.RawMessage   `json:"body,omitempty"`
+	Status  int               `json:"status,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // ToolCallSpec is a tool call to emit. Arguments is any JSON value; a string is sent verbatim.

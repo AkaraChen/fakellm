@@ -427,3 +427,23 @@ func TestLogConfigWireOptionsAndScriptFile(t *testing.T) {
 		t.Fatalf("put count %d %v", n, err)
 	}
 }
+
+func TestCustomEndpointRule(t *testing.T) {
+	s, ctx := start(t, fakellm.Options{})
+	_, err := s.Scripts().Put(ctx, []fakellm.Rule{{
+		Match: fakellm.Match{Path: "/v1/systemone", Body: "angry"},
+		Reply: fakellm.ReplySpec{Body: json.RawMessage(`{"mood":"x"}`), Status: 202, Headers: map[string]string{"x-c": "y"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.Post(s.URL()+"/v1/systemone", "application/json", strings.NewReader(`{"state":"angry"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 202 || res.Header.Get("x-c") != "y" || !strings.Contains(string(b), `"mood":"x"`) {
+		t.Fatalf("got %d %v %s", res.StatusCode, res.Header, b)
+	}
+}

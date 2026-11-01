@@ -333,3 +333,13 @@ test('start: cassettes, upstream and record', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('custom endpoint rule: match.path/body and reply body/status/headers', async () => {
+  /** @type {import('../dist/index.js').Rule} */
+  const rule = { match: { path: '/v1/systemone', body: 'angry' }, reply: { body: { mood: 'x' }, status: 202, headers: { 'x-c': 'y' } } };
+  await srv.scripts.put([rule]);
+  const r = await fetch(`${srv.url}/v1/systemone`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"state":"angry"}' });
+  assert.equal(r.status, 202);
+  assert.equal(r.headers.get('x-c'), 'y');
+  assert.deepEqual(await r.json(), { mood: 'x' });
+});

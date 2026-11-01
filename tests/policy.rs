@@ -585,3 +585,77 @@ async fn idle_death_restarts_before_the_next_request() {
     }
     assert_eq!(info(&s, "mortal").await["restarts"], 2);
 }
+
+#[tokio::test]
+async fn declining_policy_falls_through_to_the_next_rule() {
+    need_node!();
+    let s = start().await;
+    // null, undefined and {decline: true} all mean "not mine"
+    for (i, body) in ["return null;", "return undefined;", "return { decline: true };"]
+        .iter()
+        .enumerate()
+    {
+        let name = format!("d{i}");
+        add_policy(&s, &name, &format!("export default () => {{ {body} }}")).await;
+        put_rules(
+            &s,
+            json!([
+                {"name": "pol", "times": 5, "reply": {"policy": name}},
+                {"name": "txt", "reply": {"text": "fallthrough"}},
+            ]),
+        )
+        .await;
+        let r = chat(&s, &msg("hi")).await;
+        assert_eq!((r.status, text(&r)), (200, "fallthrough".to_owned()), "{body}");
+        let rules = get(&s, "/_fakellm/scripts").await.json();
+        let rules = rules["rules"].as_array().unwrap_or_else(|| panic!("{rules}")).clone();
+        assert_eq!((rules[0]["hits"].as_u64(), rules[1]["hits"].as_u64()), (Some(0), Some(1)), "{body}");
+        assert_eq!(info(&s, &name).await["hits"], 0, "a decline is not a policy hit");
+    }
+}
+
+#[tokio::test]
+async fn policy_declines_one_request_and_accepts_a_later_one() {
+    need_node!();
+    let s = start().await;
+    add_policy(
+        &s,
+        "picky",
+        "export default (r, c) => r.messages.at(-1).content.map((p) => p.text ?? '').join('').includes('mine') ? { text: 'policy', state: { n: (c.state?.n ?? 0) + 1 } } : null;",
+    )
+    .await;
+    put_rules(&s, json!([{"reply": {"policy": "picky"}}, {"reply": {"text": "other"}}])).await;
+    assert_eq!(text(&chat(&s, &msg("hello")).await), "other");
+    assert_eq!(text(&chat(&s, &msg("this is mine")).await), "policy");
+    assert_eq!(text(&chat(&s, &msg("hello again")).await), "other");
+    let i = info(&s, "picky").await;
+    assert_eq!((i["hits"].as_u64(), i["state"]["n"].as_u64()), (Some(1), Some(1)));
+}
+
+#[tokio::test]
+async fn declining_everything_reaches_the_fallback() {
+    need_node!();
+    let s = start().await;
+    add_policy(&s, "no", "export default () => null;").await;
+    attach(&s, "no").await;
+    let r = chat(&s, &msg("hi")).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_ne!(code(&r), "fakellm_policy_error");
+}
+
+#[tokio::test]
+async fn match_body_sees_the_raw_json() {
+    let s = start().await;
+    put_rules(
+        &s,
+        json!([
+            {"match": {"body": "\"damaged\"\\s*:\\s*true"}, "reply": {"text": "angry"}},
+            {"reply": {"text": "calm"}},
+        ]),
+    )
+    .await;
+    let mut body = msg("hi");
+    assert_eq!(text(&chat(&s, &body).await), "calm");
+    body["damaged"] = json!(true);
+    assert_eq!(text(&chat(&s, &body).await), "angry");
+}

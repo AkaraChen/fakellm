@@ -36,8 +36,14 @@ async function handle(line) {
     request.tools ??= []; // the IR omits empty collections; policies should not have to
     request.stop ??= [];
     const out = await decide(request, { state, hits, log });
-    if (out === null || typeof out !== "object" || Array.isArray(out)) {
-      throw new Error("decide must return an object (a ReplySpec, optionally with a `state` field)");
+    if (out === null || out === undefined || (typeof out === "object" && !Array.isArray(out) && out.decline === true)) {
+      // "not mine": fakellm moves on to the next script rule
+      const kept = out ? out.state : undefined;
+      send(kept === undefined ? { id, decline: true } : { id, decline: true, state: kept });
+      return;
+    }
+    if (typeof out !== "object" || Array.isArray(out)) {
+      throw new Error("decide must return an object (a ReplySpec, optionally with a `state` field), null or {decline: true}");
     }
     const { state: next, ...reply } = out;
     send(next === undefined ? { id, reply } : { id, reply, state: next });

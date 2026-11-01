@@ -165,7 +165,17 @@ enum Cmd {
     },
 }
 
-fn main() -> std::io::Result<std::process::ExitCode> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("fakellm: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> std::io::Result<std::process::ExitCode> {
     let opt = Opt::parse();
     match opt.command {
         Some(Cmd::Ctl(c)) => {
@@ -245,6 +255,7 @@ fn main() -> std::io::Result<std::process::ExitCode> {
     if ttft < 0 {
         return Err(invalid("--ttft must not be negative".into()));
     }
+    let listen = format!("{}:{}", opt.host, opt.port);
     let config = fakellm::Config {
         host: opt.host,
         port: opt.port,
@@ -283,7 +294,10 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         watch,
     };
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
-        let mut server = fakellm::Server::start(config).await?;
+        let mut server = fakellm::Server::start(config).await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::AddrInUse => std::io::Error::new(e.kind(), format!("cannot listen on {listen}: address already in use")),
+            _ => e,
+        })?;
         println!("{}", server.endpoint());
         std::io::stdout().flush()?;
         tokio::select! {

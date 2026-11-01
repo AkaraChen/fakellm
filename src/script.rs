@@ -53,6 +53,9 @@ pub struct Match {
     /// Regex over the text of any message, any role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub any_message: Option<Pattern>,
+    /// Regex over the raw JSON body text of the request, as the client sent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Pattern>,
     /// A tool with this name is offered in `tools`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_tool: Option<String>,
@@ -92,6 +95,11 @@ pub struct Match {
     /// held), counting from 1; `every_nth: 3` matches the 3rd, 6th, 9th.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every_nth: Option<u32>,
+    /// Glob over the request path (`/v1/systemone`, `/v1/*`), after the gateway prefix is removed.
+    /// A rule with `path` is a custom endpoint rule: it applies to any path under the API, known
+    /// or not, needs `reply.body`, and only ever sees requests the standard routes do not serve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -219,6 +227,15 @@ pub struct ReplySpec {
     /// `trajectory`, never `policy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
+    /// Custom endpoint rules (`match.path`): the JSON body to answer with, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Value>,
+    /// Custom endpoint rules: HTTP status of the answer, 200 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Custom endpoint rules: extra response headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 impl ReplySpec {
@@ -333,6 +350,7 @@ struct Matchers {
     last_user_raw: Option<Regex>,
     system: Option<Regex>,
     any_message: Option<Regex>,
+    body: Option<Regex>,
     tool_result_contains: Option<Regex>,
 }
 
@@ -348,6 +366,7 @@ impl Matchers {
             last_user_raw: one("last_user_raw", &m.last_user_raw)?,
             system: one("system", &m.system)?,
             any_message: one("any_message", &m.any_message)?,
+            body: one("body", &m.body)?,
             tool_result_contains: one("tool_result_contains", &m.tool_result_contains)?,
         })
     }
@@ -361,6 +380,36 @@ fn validate(rule: &Rule) -> Result<(), String> {
     }
     if rule.matcher.every_nth == Some(0) {
         return Err("match.every_nth must be at least 1".into());
+    }
+    let custom = rule.matcher.path.is_some();
+    let r = &rule.reply;
+    if custom != r.body.is_some() {
+        return Err("`match.path` and `reply.body` go together".into());
+    }
+    if !custom && (r.status.is_some() || r.headers.is_some()) {
+        return Err("`reply.status` and `reply.headers` need `match.path`".into());
+    }
+    if custom {
+        if r.text.is_some()
+            || r.tool_calls.is_some()
+            || r.error.is_some()
+            || r.trajectory.is_some()
+            || r.policy.is_some()
+            || r.reasoning.is_some()
+        {
+            return Err("a custom endpoint reply has only `body`, `status` and `headers`".into());
+        }
+        if let Some(s) = r.status
+            && !(100..=599).contains(&s)
+        {
+            return Err(format!("reply.status {s} is not an HTTP status"));
+        }
+        for (k, v) in r.headers.iter().flatten() {
+            if http::HeaderName::from_bytes(k.as_bytes()).is_err() || http::HeaderValue::from_str(v).is_err() {
+                return Err(format!("reply.headers: invalid header {k:?}"));
+            }
+        }
+        return Ok(());
     }
     validate_reply(&rule.reply)
 }
@@ -474,6 +523,11 @@ impl Compiled {
 
     fn conditions_hold(&self, req: &Request) -> bool {
         let m = &self.rule.matcher;
+        match (&m.path, &req.path) {
+            (Some(g), Some(p)) if glob_match(g, p) => {}
+            (None, None) => {}
+            _ => return false,
+        }
         if let Some(p) = m.protocol
             && p != req.protocol
         {
@@ -503,6 +557,15 @@ impl Compiled {
             && !req.messages.iter().any(|msg| re.is_match(&msg.text_content()))
         {
             return false;
+        }
+        if let Some(re) = &self.re.body {
+            let hit = match &req.raw_body {
+                Some(raw) => re.is_match(raw),
+                None => re.is_match(&serde_json::to_string(req).unwrap_or_default()),
+            };
+            if !hit {
+                return false;
+            }
         }
         if let Some(name) = &m.has_tool
             && !req.has_tool(name)
@@ -649,15 +712,37 @@ impl Scripts {
     /// The first unexhausted rule matching `req`, counting the hit. Returns the rule's index and a
     /// clone of its reply spec.
     pub fn resolve(&self, req: &Request) -> Option<(usize, Option<String>, ReplySpec)> {
-        self.resolve_where(req, |_| true)
+        self.resolve_from(req, 0)
+    }
+
+    /// [`Scripts::resolve`] looking only at rules from index `start` on (a policy declined the
+    /// rules before).
+    pub fn resolve_from(&self, req: &Request, start: usize) -> Option<(usize, Option<String>, ReplySpec)> {
+        self.resolve_where_from(req, start, |_| true)
+    }
+
+    /// Takes back the hit of rule `index`, which a policy declined.
+    pub(crate) fn uncount_hit(&self, index: usize) {
+        if let Some(c) = self.inner.lock().get_mut(index) {
+            c.hits = c.hits.saturating_sub(1);
+        }
     }
 
     /// Like [`Scripts::resolve`], but rules whose reply fails `accept` are skipped entirely: they
     /// are not reached and keep their hit budget.
     pub fn resolve_where(&self, req: &Request, accept: impl Fn(&ReplySpec) -> bool) -> Option<(usize, Option<String>, ReplySpec)> {
+        self.resolve_where_from(req, 0, accept)
+    }
+
+    fn resolve_where_from(
+        &self,
+        req: &Request,
+        start: usize,
+        accept: impl Fn(&ReplySpec) -> bool,
+    ) -> Option<(usize, Option<String>, ReplySpec)> {
         let mut inner = self.inner.lock();
         let mut found = None;
-        for (index, c) in inner.iter_mut().enumerate() {
+        for (index, c) in inner.iter_mut().enumerate().skip(start) {
             if !c.exhausted() && accept(&c.rule.reply) && c.matches(req) {
                 found = Some((index, c));
                 break;
@@ -731,19 +816,33 @@ impl Engine {
     /// ([`Policies::decide`], awaited; the reply it returns is then treated like the rule's own,
     /// with the rule's delivery fields as defaults).
     pub async fn resolve_async(&self, req: &Request) -> Outcome {
-        let Some((index, name, mut spec)) = self.scripts.resolve(req) else {
-            return self.unscripted(req);
-        };
-        let Some(policy) = spec.policy.take() else {
-            return self.resolve_matched(req, index, name, spec, None);
-        };
-        match self.policies.decide(&policy, req).await {
-            Ok(decided) => {
-                let decided = decided.with_defaults_from(&spec);
-                self.resolve_matched(req, index, name, decided, Some(policy))
+        let mut start = 0;
+        loop {
+            let Some((index, name, mut spec)) = self.scripts.resolve_from(req, start) else {
+                return self.unscripted(req);
+            };
+            let Some(policy) = spec.policy.take() else {
+                return self.resolve_matched(req, index, name, spec, None);
+            };
+            match self.policies.decide(&policy, req).await {
+                Ok(Some(decided)) => {
+                    let decided = decided.with_defaults_from(&spec);
+                    return self.resolve_matched(req, index, name, decided, Some(policy));
+                }
+                // Declined: the rule did not match after all, so it takes no hit and the next rule gets a turn.
+                Ok(None) => {
+                    self.scripts.uncount_hit(index);
+                    start = index + 1;
+                }
+                Err(error) => return self.error_outcome(error, Source::Policy { index, name, policy }),
             }
-            Err(error) => self.error_outcome(error, Source::Policy { index, name, policy }),
         }
+    }
+
+    /// For a request on a path the standard routes do not serve: the first rule with `match.path`
+    /// and `reply.body` that matches, counting its hit.
+    pub fn resolve_custom(&self, req: &Request) -> Option<(usize, Option<String>, ReplySpec)> {
+        self.scripts.resolve_where(req, |r| r.body.is_some())
     }
 
     /// For endpoints that generate nothing scriptable (`POST /v1/embeddings`): the first rule that

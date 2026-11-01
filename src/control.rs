@@ -815,9 +815,10 @@ fn request_filter(q: &[(String, String)]) -> Result<RequestFilter, ControlError>
                     "openai.responses" => Protocol::OpenaiResponses,
                     "anthropic.messages" => Protocol::AnthropicMessages,
                     "openai.embeddings" => Protocol::OpenaiEmbeddings,
+                    "custom" => Protocol::Custom,
                     _ => {
                         return Err(bad(
-                            "expected openai.chat, openai.responses, openai.embeddings or anthropic.messages",
+                            "expected openai.chat, openai.responses, openai.embeddings, anthropic.messages or custom",
                         ));
                     }
                 })

@@ -426,3 +426,12 @@ test('start: watch reloads a cassette file', () =>
       rmSync(dir, { recursive: true, force: true })
     }
   }))
+
+test('custom endpoint rule: match.path/body and reply body/status/headers', () =>
+  withServer(undefined, async (s) => {
+    s.scripts.put([{ match: { path: '/v1/systemone', body: 'angry' }, reply: { body: { mood: 'x' }, status: 202, headers: { 'x-c': 'y' } } }])
+    const r = await fetch(`${s.endpoint}/v1/systemone`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"state":"angry"}' })
+    assert.equal(r.status, 202)
+    assert.equal(r.headers.get('x-c'), 'y')
+    assert.deepEqual(await r.json(), { mood: 'x' })
+  }))

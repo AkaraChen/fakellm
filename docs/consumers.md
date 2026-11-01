@@ -1,37 +1,97 @@
 # 真实消费方实验：用 fakellm 替换别人仓库测试里的 LLM 后端
 
-本文记录三轮实验：在 `/home/akrc/Developer/fakellm-research` 下克隆了会调用 LLM API 的开源仓库，各开一个本地分支 `fakellm`，把它们的测试或 e2e 改成对着 fakellm 跑，用来找 fakellm 的缺口。第一轮六个仓库（xsai、pi-mono、claude-agent-sdk-python、opencode、raft、oar），第二轮（M2 二进制）新增 paseo、ai-sdk 一致性对照，并重跑 oar；第三轮（M3 二进制：trajectory、JS 策略脚本、路径前缀、`args_chunk_bytes`、embeddings）重跑 oar、xsai、raft、pi-mono。所有提交都只在本地，没有推送。
+> 本文是作者本机的一次性实验记录：`$RESEARCH_DIR`（即 fakellm-research 目录）不随仓库发布，其中的路径和本地分支不可直接复现。下面写的命令是当时的做法，换了机器要自己克隆这些仓库、重新建分支。
+
+在 `$RESEARCH_DIR` 下克隆了八个会调用 LLM API 的开源仓库，各开一个本地分支 `fakellm`，把它们的测试或 e2e 改成对着 fakellm 跑，用来找 fakellm 的缺口。实验分三轮，每轮用当时最新的二进制：
+
+- 第一轮（M1 二进制）：xsai、pi-mono、claude-agent-sdk-python、opencode、raft、oar 六个仓库。
+- 第二轮（M2 二进制）：新增 paseo 和 ai-sdk 一致性对照，重跑 oar。
+- 第三轮（M3 二进制：trajectory、JS 策略脚本、路径前缀、`args_chunk_bytes`、embeddings）：重跑 oar、xsai、raft、pi-mono。
+- 补充（M4 之后）：自定义端点规则让 xsai 的最后两个用例通过（`83f149e`，用当前工作区的二进制重跑确认）。
+
+所有提交都只在本地，没有推送。
 
 统一约定：
 
-- 二进制用 `FAKELLM_BIN`，默认 `/home/akrc/Developer/fakellm-research/bin/fakellm`，以 `--port 0` 启动，从第一行 stdout 读 URL。
+- 二进制用 `FAKELLM_BIN`，默认 `$RESEARCH_DIR/bin/fakellm`，以 `--port 0` 启动，从第一行 stdout 读 URL。
 - OpenAI 风格的客户端用 `url + /v1`；Anthropic SDK 用裸 `url`；真正的 `claude` CLI 用 `ANTHROPIC_BASE_URL=url`。
 - 规则按测试期望手写，用 `PUT /_fakellm/scripts` 注册，`POST /_fakellm/reset` 隔离用例。
-- 第一轮的二进制没有 `reply.usage` 覆盖，也没有 embeddings；第二轮用 M2 构建，`reply.usage` 已可用（oar 重跑已验证），embeddings 在工作区里已实现但 xsai 尚未重跑。
+- 第一轮的二进制没有 `reply.usage` 覆盖，也没有 embeddings；第二轮用 M2 构建，`reply.usage` 已可用（oar 重跑已验证），embeddings 在第三轮由 M3 二进制实现，xsai 重跑已通过。
 
 ## 总览
 
-| 仓库 | 分支 / 提交 | 结果 | 阻塞缺口 |
-|---|---|---|---|
-| xsai | `fakellm` / `e9febde`（第三轮无新提交） | 14 个 e2e：第三轮 12 通过，2 失败（原 10） | `/v1/systemone` |
-| pi-mono | `fakellm` / `9cc6a5a` | 第三轮 ai 10 + agent 4 全通过（原 9 + 1） | 无 |
-| claude-agent-sdk-python | `fakellm` / `6bd191f` | 15 个通过，hooks 3 个跳过（未写规则） | 无 |
-| opencode | `fakellm` / `c200d6b` | 全通过 | 无 |
-| raft | `fakellm` / `0adb751` | 第三轮 158 个通过（原 157，新增 1 个 reset 用例） | 无 |
-| oar（第一轮） | `fakellm` / `a86b115` | sea-trial 全通过；vendor 全量有失败 | 多项，见缺口表 |
-| paseo（第二轮） | `fakellm` / `50ee5ef` | 6 个文件全部迁移并通过（16 个测试） | 无阻塞；见缺口 4、5、7 |
-| ai-sdk 一致性（第二轮） | `fakellm` / `23d6d62` | 新增 7 个对照测试全通过 | 无阻塞；差异见下 |
-| oar（第二轮重跑） | `fakellm` / `a6c4802` | claude 49/19，codex 41/11 | predicate 与函数式回复 |
-| oar（第三轮） | `fakellm` / `fee3096` | claude 66/2（改后应为 67/1），codex 50/2，opencode 10/0 | 3 个未解决失败，见缺口 6、7 |
+每格是该轮跑到的结果（通过 / 失败），`—` 表示这一轮没有跑这个仓库。
+
+| 仓库 | 第一轮 | 第二轮 | 第三轮 | 补充 | 现状 |
+|---|---|---|---|---|---|
+| xsai | 10 / 4（共 14 个 e2e） | — | 12 / 2 | 14 / 0 | 全通过 |
+| pi-mono | ai 9 + agent 1，全通过 | — | ai 10 + agent 4，全通过 | — | 全通过 |
+| claude-agent-sdk-python | 15 通过，hooks 3 个跳过（没写规则） | — | — | — | 全通过 |
+| opencode | 全通过（session-runner 1 个，真实 CLI e2e 2 个） | — | — | — | 全通过 |
+| raft | 157 / 0 | — | 158 / 0（新增 1 个 reset 用例） | — | 全通过 |
+| oar（vendor 全量） | claude 46 / 22，codex 39 / 13；sea-trial 套件全通过 | claude 49 / 19，codex 41 / 11，opencode 6 / 4 | claude 66 / 2（改映射后应为 67 / 1），codex 50 / 2，opencode 10 / 0 | 未重跑 | 剩 3 个未解决失败 |
+| paseo | — | 6 个文件、16 个测试全部迁移并通过 | — | — | 全通过 |
+| ai-sdk 一致性 | — | 7 个对照测试全通过 | — | — | 全通过，差异见缺口 3 |
+
+阅读方法：第一轮的失败几乎全是 fakellm 缺的东西（`reply.usage`、embeddings、路径前缀、谓词与函数式回复、自定义端点）；到补充这一轮，除 oar 的 3 个失败外没有已知的 fakellm 缺口会让这些仓库的测试失败。
+
+## 本地分支与提交
+
+分支名都是 `fakellm`，基于各仓库的默认分支（opencode 是 `dev`，其余是 `main`）；下表是分支上比默认分支多出来的提交，从旧到新。
+
+| 仓库（`$RESEARCH_DIR/` 下） | 提交 |
+|---|---|
+| `xsai` | `e9febde` 跑 e2e 套件（`scripts/e2e-fakellm.sh` 加规则文件）；`83f149e` 用自定义端点规则回答 `/v1/systemone` |
+| `pi-mono` | `839c592` pi-ai 适配器与 agent 循环的 e2e；`9cc6a5a` reset、trajectory、策略用例 |
+| `claude-agent-sdk-python` | `6bd191f` 可选的 fakellm 后端（`FAKELLM_BIN`） |
+| `opencode` | `c200d6b` session-runner 与真实 opencode CLI 对着 fakellm 跑 |
+| `raft-source` | `678808f` provider wire 测试改用 fakellm；`0adb751` 恢复 `/anthropic` 前缀，新增 reset 代理用例 |
+| `oar` | `a86b115` `OAR_MOCK=fakellm` 适配器；`3c66603` usage、latency、chunkSize 映射；`960a8ab` `last_user` / `any_message` 选择；`a6c4802` 无工具谓词与否定正则；`fee3096` 每个动态夹具一个策略加回调 |
+| `paseo` | `50ee5ef` codex / claude / opencode 本地 e2e 改用 fakellm |
+| `ai` | `23d6d62` openai 与 anthropic 的夹具一致性对照 |
+
+## 如何复现
+
+前提：`export RESEARCH_DIR=<克隆目录>`，`export FAKELLM_BIN=<fakellm 仓库>/target/debug/fakellm`（`cargo build` 得到），Node 版本见各节。命令的完整形式、环境变量和注意事项在各仓库自己的一节里。
+
+| 仓库 | 命令（在该仓库的克隆目录里） | 详见 |
+|---|---|---|
+| xsai | `scripts/e2e-fakellm.sh`（加 `--reporter=verbose` 看逐条） | [xsai](#xsai) |
+| pi-mono | `cd packages/ai && npx vitest --run test/fakellm.e2e.test.ts`；`cd packages/agent && npx vitest --run test/fakellm.e2e.test.ts` | [pi-mono](#pi-mono) |
+| claude-agent-sdk-python | `.venv/bin/pytest e2e-tests/test_*.py -m e2e -v`（必须设 `FAKELLM_BIN`，否则会打真实 API） | [claude-agent-sdk-python](#claude-agent-sdk-python) |
+| opencode | `cd packages/core && bun run test test/session-runner-recorded.test.ts test/fakellm-cli.e2e.test.ts` | [opencode](#opencode) |
+| raft | `cd packages/daemon && pnpm exec vitest run src/agentProcessManager.builtin.e2e.test.ts src/drivers/kimi-sdk.test.ts src/drivers/pi.test.ts` | [raft](#raft) |
+| oar | `CI=1 OAR_MOCK=fakellm OAR_TEST=<claude\|codex\|opencode>-aimock npx vitest run sea-trial/vendor`（必须 `CI=1`） | [oar](#oar)、[第三轮](#第三轮m3-二进制) |
+| paseo | `cd packages/server && npx vitest run <文件>`（先构建没有 `dist` 的工作区包） | [paseo（第二轮）](#paseo第二轮) |
+| ai-sdk | `cd packages/<openai\|anthropic> && npx vitest run --config vitest.node.config.js src/fakellm-conformance.test.ts` | [ai-sdk 一致性对照（第二轮）](#ai-sdk-一致性对照第二轮) |
+
+## 结论
+
+fakellm 解决了的：
+
+- **手写假服务不用再写**。paseo 迁移六个文件净减 392 行（+144/−536）；raft 删掉三个文件里各自手写的假 provider；opencode、claude-agent-sdk-python 的真实 CLI 也能直接连上。三种协议在同一套规则上都跑通，最常用的匹配键是 `has_tool_result`、`turn`、`system`、`no_tools`、`model`。
+- **请求日志取代手写计数**：按规则、协议、原始正文断言（例如 `function_call_output`），比各家手写的内存数组直接。
+- **三轮里补上的功能都有对应的通过用例**：`reply.usage` 覆盖、embeddings（xsai）、路径前缀（raft）、`stream.args_chunk_bytes`（oar 的慢参数用例）、真正的 RST（pi-mono、raft）、trajectory 与策略（pi-mono 的 agent 循环）、谓词与函数式回复经策略实现（oar 从 49 / 41 提到 66 / 50）、自定义端点（xsai 14 / 14）。
+- **一致性对照**：汇总断言（文本、工具、finish reason、usage）与真实 API 抓包夹具一致。
+
+还没解决的：
+
+- oar 的 3 个失败（缺口 6、7）；其中 claude-partials 已查清，换 `last_user` 重试即可，但没有重跑。
+- oar 的适配器还在用 HTTP 回调自己遍历后续夹具；策略的 `decline`（放弃，落到后面的规则）已经实现，适配器没有改用，也没有在 oar 上验证（缺口 1）。
+- 响应保真度：块粒度、Anthropic 的 usage 元数据、`model` 别名、`encrypted_content`（缺口 3）；这些不影响多数客户端，但会影响逐块断言。
+- Anthropic 缓存读取与 `input_tokens` 耦合、`input_tokens` 出现在 `message_start` 还是 `message_delta` 不可控（缺口 2、4）。
+- 没有声明式的跨请求序列匹配（paseo 的 guardian 仍靠 `times:1` 的顺序）；Rust regex 不支持环视（缺口 1、8）。
+- 覆盖：trajectory 与策略只在 openai-completions 上被真实消费方测过；CONNECT 代理转发 RST 的行为没验证（缺口 9、10）。
+- 所有实验都对着本地二进制，没有一个消费方在 CI 里持续跑；分支都只在本地。
 
 ## xsai
 
-- 克隆：`/home/akrc/Developer/fakellm-research/xsai`，分支 `fakellm`，提交 `e9febde`。
+- 克隆：`$RESEARCH_DIR/xsai`，分支 `fakellm`，提交 `e9febde`（跑套件），补充提交 `83f149e`（自定义端点规则，见第三轮一节末尾）。
 - 运行：
 
 ```bash
 eval "$(fnm env)"; fnm use 26
-cd /home/akrc/Developer/fakellm-research/xsai && scripts/e2e-fakellm.sh
+cd $RESEARCH_DIR/xsai && scripts/e2e-fakellm.sh
 ```
 
 脚本在 `127.0.0.1:11434` 起 fakellm（`--models qwen3.5:0.8b,qwen3-embedding:0.6b,tev1:0.8b --scripts scripts/e2e-fakellm.rules.yaml`），跑 `pnpm test:e2e`，退出时 kill。`FAKELLM_BIN` 可覆盖二进制，额外参数透传给 vitest。只新增了 `scripts/e2e-fakellm.sh` 和 `scripts/e2e-fakellm.rules.yaml`，没改仓库源码或配置。
@@ -54,7 +114,7 @@ cd /home/akrc/Developer/fakellm-research/xsai && scripts/e2e-fakellm.sh
 
 ## pi-mono
 
-- 克隆：`/home/akrc/Developer/fakellm-research/pi-mono`，分支 `fakellm`，提交 `839c592`。
+- 克隆：`$RESEARCH_DIR/pi-mono`，分支 `fakellm`，提交 `839c592`。
 - 新增：`packages/ai/test/helpers/fakellm.ts`（helper，暴露 `rules`、`reset`、`requests`、`clock`、`stop`）、`packages/ai/test/fakellm.e2e.test.ts`（9 个）、`packages/agent/test/fakellm.e2e.test.ts`（1 个）。
 - 运行：
 
@@ -78,13 +138,13 @@ agent 的测试依赖生成的模型数据，先跑一次 `cd packages/ai && npm
 
 ## claude-agent-sdk-python
 
-- 克隆：`/home/akrc/Developer/fakellm-research/claude-agent-sdk-python`，分支 `fakellm`，提交 `6bd191f`。
+- 克隆：`$RESEARCH_DIR/claude-agent-sdk-python`，分支 `fakellm`，提交 `6bd191f`。
 - 新增 `e2e-tests/conftest_fakellm.py`（fixture 和按测试名索引的 `RULES`），`conftest.py` 只在设置 `FAKELLM_BIN` 时导入它。session fixture 起 fakellm，并在 `os.environ` 里设置 CLI 所需的 base URL、API key、临时 `CLAUDE_CONFIG_DIR`，以及遥测、更新、版本检查开关；每个用例前 reset 并 PUT 该用例的规则加一个兜底规则；没有 `RULES` 条目的测试被跳过。`FAKELLM_LOG` 可在会话结束时导出完整请求日志。
 - 运行：
 
 ```bash
-cd /home/akrc/Developer/fakellm-research/claude-agent-sdk-python
-FAKELLM_BIN=/home/akrc/Developer/fakellm-research/bin/fakellm \
+cd $RESEARCH_DIR/claude-agent-sdk-python
+FAKELLM_BIN=$RESEARCH_DIR/bin/fakellm \
  .venv/bin/pytest e2e-tests/test_error_results.py e2e-tests/test_verbatim_prompts.py \
  e2e-tests/test_structured_output.py e2e-tests/test_include_partial_messages.py \
  e2e-tests/test_sdk_mcp_tools.py -m e2e -v
@@ -114,12 +174,12 @@ FAKELLM_BIN=/home/akrc/Developer/fakellm-research/bin/fakellm \
 
 ## opencode
 
-- 克隆：`/home/akrc/Developer/fakellm-research/opencode`，分支 `fakellm`，提交 `c200d6b`（`bun.lock` 原本就有改动，未提交）。
+- 克隆：`$RESEARCH_DIR/opencode`，分支 `fakellm`，提交 `c200d6b`（`bun.lock` 原本就有改动，未提交）。
 - 新增 `packages/core/test/lib/fakellm.ts`（helper）、`packages/core/test/fakellm-cli.e2e.test.ts`（2 个：纯文本、bash 工具往返）；`session-runner-recorded.test.ts` 在设置 `FAKELLM_BIN` 时改用 `FetchHttpClient.layer` 和 fakellm 的 `url + /v1`，原断言全保留，另加一条日志里只命中 `main` 规则的断言。
 - 运行（在 `packages/core`）：
 
 ```bash
-FAKELLM_BIN=/home/akrc/Developer/fakellm-research/bin/fakellm bun run test test/session-runner-recorded.test.ts
+FAKELLM_BIN=$RESEARCH_DIR/bin/fakellm bun run test test/session-runner-recorded.test.ts
 FAKELLM_BIN=... bun run test test/fakellm-cli.e2e.test.ts
 ```
 
@@ -142,12 +202,12 @@ FAKELLM_BIN=... bun run test test/fakellm-cli.e2e.test.ts
 
 ## raft
 
-- 克隆：`/home/akrc/Developer/fakellm-research/raft-source`，分支 `fakellm`，提交 `678808f`。
+- 克隆：`$RESEARCH_DIR/raft-source`，分支 `fakellm`，提交 `678808f`。
 - 新增 `packages/daemon/src/testing/fakellm.ts`（`startFakeLlm()`，返回 `{url, openAiBaseUrl, setRules, requests(query), reset, close}`，`requests()` 带 `full=true`，每条有 `.raw`、`.path`、`.rule`、`.protocol`、`.headers`）；改写了三个测试文件里手写的假服务（`startFakeAnthropicServer` 等被删除）。
 - 运行：
 
 ```bash
-cd /home/akrc/Developer/fakellm-research/raft-source/packages/daemon
+cd $RESEARCH_DIR/raft-source/packages/daemon
 pnpm exec vitest run src/agentProcessManager.builtin.e2e.test.ts src/drivers/kimi-sdk.test.ts src/drivers/pi.test.ts
 ```
 
@@ -171,7 +231,7 @@ pnpm exec vitest run src/agentProcessManager.builtin.e2e.test.ts src/drivers/kim
 
 ## oar
 
-- 克隆：`/home/akrc/Developer/fakellm-research/oar`，分支 `fakellm`，提交 `a86b115`。
+- 克隆：`$RESEARCH_DIR/oar`，分支 `fakellm`，提交 `a86b115`。
 - 适配器 `sea-trial/harness/fakellm.ts`；`aimock.ts`、`aimock-acp.ts` 改为通过 `newMock()` 构建 mock；`sea-trial/vendor/support/system-prompt.ts` 增加 fakellm 分支。
 - 运行（Node 24，在克隆目录）：
 
@@ -205,7 +265,7 @@ CI=1 OAR_MOCK=fakellm OAR_TEST=claude-aimock pnpm exec vitest run sea-trial/vend
 
 ## paseo（第二轮）
 
-- 克隆：`/home/akrc/Developer/fakellm-research/paseo`，分支 `fakellm`，提交 `50ee5ef`（提交时用 `-c core.hooksPath=/dev/null` 跳过 hooks）。
+- 克隆：`$RESEARCH_DIR/paseo`，分支 `fakellm`，提交 `50ee5ef`（提交时用 `-c core.hooksPath=/dev/null` 跳过 hooks）。
 - 新增 `packages/server/src/test-utils/fakellm.ts`（84 行，`startFakellm({models?})`）：以 `--port 0` 启动 `FAKELLM_BIN` 或 M2 二进制，从 stdout 读 URL；暴露 `setRules`、`requests(query)`（总是 `full=true`）、`reset`、`stop`（SIGTERM，3 秒后 SIGKILL）。
 - 先要构建没有 `dist` 的工作区包（protocol、highlight、relay、plugin），否则 vitest 解析不了 `@getpaseo/protocol`。
 - 运行（逐个文件，在 `packages/server`）：
@@ -243,13 +303,13 @@ paseo 暴露的缺口：
 
 目的不是迁移测试，而是拿 ai-sdk 自带的真实 API 抓包夹具当对照：同一份夹具，一边经 msw test-server 回放得到期望的 parts，另一边把最终内容翻译成规则交给 fakellm，用同一个 `doStream` 取实际 parts，再比较。
 
-- 克隆：`/home/akrc/Developer/fakellm-research/ai`，分支 `fakellm`，提交 `23d6d62`（提交 hook 对两个文件跑了 ultracite）。
+- 克隆：`$RESEARCH_DIR/ai`，分支 `fakellm`，提交 `23d6d62`（提交 hook 对两个文件跑了 ultracite）。
 - 新增：`packages/openai/src/fakellm-conformance.test.ts`（481 行，3 个测试）、`packages/anthropic/src/fakellm-conformance.test.ts`（424 行，4 个测试）；两个文件之前都不存在，共享 helper 复制在各自文件里。
 - 运行（在 `packages/<pkg>`；先构建一次依赖 `pnpm --filter @ai-sdk/provider --filter @ai-sdk/provider-utils --filter @ai-sdk/test-server build`）：
 
 ```bash
 eval "$(fnm env)"; fnm use 24
-FAKELLM_BIN=/home/akrc/Developer/fakellm-research/bin/fakellm npx vitest run --config vitest.node.config.js src/fakellm-conformance.test.ts --silent=false --reporter=verbose
+FAKELLM_BIN=$RESEARCH_DIR/bin/fakellm npx vitest run --config vitest.node.config.js src/fakellm-conformance.test.ts --silent=false --reporter=verbose
 ```
 
 不设 `FAKELLM_BIN` 时 7 个全部跳过，设置后 7 个全通过。
@@ -316,14 +376,14 @@ predicate 与函数式回复占 Claude、Codex 30 个失败中的 26 个，外�
 
 ## 第三轮（M3 二进制）
 
-M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前缀容忍、忽略 `<system-reminder>` 的 `last_user`（原文用 `last_user_raw`）、`stream.args_chunk_bytes`、embeddings。二进制 `/home/akrc/Developer/fakellm-research/bin/fakellm`，Node 24（xsai 用 26.8.1）。所有提交仅在本地。
+M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前缀容忍、忽略 `<system-reminder>` 的 `last_user`（原文用 `last_user_raw`）、`stream.args_chunk_bytes`、embeddings。二进制 `$RESEARCH_DIR/bin/fakellm`，Node 24（xsai 用 26.8.1）。所有提交仅在本地。
 
 ### oar（`fee3096`，只改 `sea-trial/harness/fakellm.ts`）
 
 - 做法偏离原计划：不能把 `Function.prototype.toString` 的源码塞进策略，因为谓词和回复函数闭包了可变的测试状态（`active`、`slow`、`providerCalls`、`calls`）和 `currentTurnSays`。改为每个动态夹具（非 no_tools 谓词，或函数式回复）注册成策略 `fx<N>`，策略源码是一个很小的 node 模块，把 IR 请求 POST 到测试进程里的 HTTP 回调服务（`127.0.0.1:0`）；回调构造 aimock 形状的视图，原样运行谓词和回复函数，用已有的 `translateReply` 转成 ReplySpec 返回。
 - fakellm 的策略没有“放行/未命中后落到下一条规则”的语义，所以回调自己按顺序用 JS 移植的静态匹配器遍历后面的夹具，都不匹配就返回 404 spec。启动参数 `--policy-timeout-ms 60000`，策略运行时用 `process.execPath`。`reset()` 同时清夹具和策略。
 - 慢参数映射：工具调用回复的 `chunkSize` 映射为 `stream.args_chunk_bytes`，`latency` 映射为 `tokens_per_sec = 1000/latency`（fakellm 每个 token 发一个参数块；实测 10 token/s 下 19 块用 1.9 秒）。claude-partials 的 slow-arguments 现通过。
-- 命令（Node 24，三个后端并行各跑一次）：`CI=1 OAR_MOCK=fakellm OAR_TEST=<claude-aimock|codex-aimock|opencode-aimock> npx vitest run sea-trial/vendor --reporter=json --outputFile=/tmp/oarp/res/<backend>.json`
+- 命令（Node 24，三个后端并行各跑一次）：`CI=1 OAR_MOCK=fakellm OAR_TEST=<claude-aimock|codex-aimock|opencode-aimock> npx vitest run sea-trial/vendor --reporter=json --outputFile=$TMPDIR/oarp/res/<backend>.json`
 
 | 后端 | 第二轮 | 第三轮 |
 |---|---|---|
@@ -353,14 +413,15 @@ M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前
   - 响应：`answers`（`{type:'choice', choice, confidence, probabilities}`、`{type:'score', score, confidence, probabilities:{'0','1','2'}}`、`{type:'noul', noul:p}`）和 `usage:{input_tokens, output_tokens}`。
   - 测试约束：`damaged.probability` 对 angry 输入大于 0.5、happy 输入小于 0.5（需要按 `state` 区分两个请求）；`route.choice` 为 `shipping` 且概率在 `['billing','shipping']` 上和为 1；`anger.score` 大于 1 且不大于 2；`usage.input_tokens` 大于 0。
 - 值得做，成本低：纯 JSON POST。但路由器对非标准路径一律 404，策略脚本也到不了；需要“自定义端点规则”（匹配任意 `POST <path>`，返回静态或模板化 JSON，可带策略）。按 `damaged` 匹配需要 body 级匹配器（`last_user` 对没有 messages 的请求无效）。
-- 脚本用 `sleep 1` 而不是轮询就绪；fakellm 日志在 `/tmp/xsai-fakellm.log`。
+- 脚本用 `sleep 1` 而不是轮询就绪；fakellm 日志在 `$TMPDIR/xsai-fakellm.log`。
+- 补充（`83f149e`，只改 `scripts/e2e-fakellm.rules.yaml`，加 16 行）：用 `match: { path: /v1/systemone, body: ... }` 加 `reply.body` 写了 `systemone-angry` 和 `systemone-happy` 两条规则（按 `state` 里的 `shattered screen` / `quick delivery` 区分），两个 decide 用例通过，合计 14 / 14，6 个测试文件全过。用当前工作区构建的二进制重跑确认过。规则写法见 [docs/scripts.md](scripts.md#自定义端点)。
 
 ### raft（`0adb751`，在 `678808f` 之上，只改 `packages/daemon/src/drivers/pi.test.ts`）
 
 - 三个原本丢掉前缀的 Anthropic 用例（契约捕获 helper、工具往返、resume）恢复使用 `${fake.url}/anthropic`，路径断言改为 `startsWith("/anthropic/v1/messages")`（请求日志记录完整前缀路径），“fakellm 没有 /anthropic 前缀”的注释删除。路径前缀缺口已解决。
 - 新增一个用例：Pi provider 经 CONNECT 代理访问真实 fakellm 子进程，规则 `reply.stream.reset_after_chunks: 1`（`last_user: "stream failure proof"`），断言 pi-ai 报 `stopReason: "error"`、`errorMessage: "terminated"`，并断言 CONNECT 目标 `direct-unreachable.invalid:80`。
 - 命令（`packages/daemon`，Node 24）：`npx vitest run src/agentProcessManager.builtin.e2e.test.ts src/drivers/kimi-sdk.test.ts src/drivers/pi.test.ts`。157 通过，加 reset 用例后 158 通过；没有跑完整 daemon 套件。
-- 发现：裸 `net` 客户端对 M3 二进制得到 `ECONNRESET`，没有干净的 `end`，即二进制发真正的 RST（与 `docs/m3-spec.md` 的 linger 0 一致），而 `docs/scripts.md`、README、本文旧版写的“FIN 不是 RST”已过时。经 Node CONNECT 代理时 undici 仍报 `terminated`，没抓到代理是转发 RST 还是转成 FIN；该用例在 pi-ai 层区分不了 FIN 与 RST。
+- 发现：裸 `net` 客户端对 M3 二进制得到 `ECONNRESET`，没有干净的 `end`，即二进制发真正的 RST（与 `docs/m3-spec.md` 的 linger 0 一致），`docs/scripts.md`、README、本文旧版写的“FIN 不是 RST”曾经过时，现已更正。经 Node CONNECT 代理时 undici 仍报 `terminated`，没抓到代理是转发 RST 还是转成 FIN；该用例在 pi-ai 层区分不了 FIN 与 RST。
 - 第一次插入新用例落进了上一个用例体里，过滤运行时被跳过，提交前已修正括号位置。
 
 ### pi-mono（`9cc6a5a`，Node 24.20.0）
@@ -375,27 +436,32 @@ M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前
 
 ## fakellm 缺口
 
-三轮之后重新排序：先按需要它的仓库数，同数时按受影响的用例数；第三轮已解决的缺口移到表后。
+三轮和一次补充之后重新排序：先按需要它的仓库数，同数时按受影响的用例数；第三轮已解决的缺口移到表后。
 
 | # | 缺口 | 涉及仓库 | 精确的失败断言或行为 |
 |---|---|---|---|
-| 1 | 策略脚本没有“放行/未命中”语义，动态夹具要靠外部回调模拟（oar、paseo） | oar、paseo | 第三轮 oar 用每个动态夹具一个策略加测试进程里的 HTTP 回调实现了 predicate 与函数式回复（claude 49 到 66、codex 41 到 50、opencode 6 到 10），但策略拒绝时 fakellm 不会落到下一条规则，适配器只能在回调里用 JS 重写静态匹配器并自己返回 404；每个动态夹具一个 node 子进程（约 100ms）。paseo 的 guardian 与主请求仍只靠 `times:1` 的顺序区分，没有匹配条件。需要策略返回“declined”落到后续规则，或声明式的序列/状态匹配 |
+| 1 | 策略脚本的“放行”语义已实现，但 oar 适配器未改用；paseo 的序列匹配仍缺（oar、paseo） | oar、paseo | 第三轮 oar 用每个动态夹具一个策略加测试进程里的 HTTP 回调实现了 predicate 与函数式回复（claude 49 到 66、codex 41 到 50、opencode 6 到 10），当时策略拒绝时不能落到下一条规则，适配器只能在回调里用 JS 重写静态匹配器并自己返回 404，每个动态夹具一个 node 子进程（约 100ms）。之后策略返回 `null` / `{decline: true}` 已经能落到后续规则（[docs/agent.md](agent.md#策略脚本)，`tests/policy.rs` 覆盖），oar 适配器还没改用，也没重跑。paseo 的 guardian 与主请求仍只靠 `times:1` 的顺序区分，没有匹配条件，需要声明式的序列/状态匹配 |
 | 2 | Anthropic 缓存读取与 `input_tokens` 耦合，`count_tokens` 不一致（paseo、ai-sdk） | paseo、ai-sdk | 规则的 `usage.input_tokens` 对 Anthropic 要包含缓存读取（paseo 写 `20236+turn+cache`，ai-sdk 写 input + cache read + cache write），响应里被扣减；`count_tokens` 不扣，会返回被抬高的值。TODO「文档与一致性」已有此条 |
 | 3 | 与真实 API 的响应保真差异（ai-sdk） | ai-sdk | anthropic usage 缺 `cache_creation`、`service_tier`、`inference_geo`；`model` 是请求别名而非带日期的 id；`message_start` 的 `output_tokens` 为 1（夹具 10 和 2）；`message_delta` 缺 `context_management`，`contextManagement` 为 `null` 而非 `{appliedEdits: []}`；`tool-no-args` 多一个 `{}` 的 `tool-input-delta`；responses 的 `encrypted_content` 在 `output_item.added` 与 `.done` 上相同；每个 delta 一个分词 token，块数多于真实 API；responses `tool-input-delta` 夹具 13 块、fakellm 2 块（`args_chunk_bytes` 现可调，但未对照重测） |
 | 4 | Anthropic 的 `input_tokens` 位置不可控（paseo） | paseo | 不能选择 `message_start` 还是 `message_delta`；paseo 的 Claude `start`/`delta` 两个用例变成同一 wire 形状 |
-| 5 | 自定义端点规则：`POST /v1/systemone`（xsai） | xsai | 两个 decide 用例 `HTTP 404 Invalid URL (POST /v1/systemone)`。格式已查清（见第三轮 xsai）。路由器对非标准路径一律 404，需要“匹配任意 `POST <path>`、返回静态/模板 JSON、带 body 级匹配器（JSON 路径或 body 包含）”的规则；一个特性可同时覆盖 angry/happy 两个用例 |
+| 5 | ~~自定义端点规则：`POST /v1/systemone`（xsai）~~ 已解决 | xsai | 已实现 `match.path` / `match.body` 加 `reply.body` / `status` / `headers`（[docs/scripts.md](scripts.md#自定义端点)）；xsai 的 `83f149e` 让两个 decide 用例通过，14 / 14 |
 | 6 | Anthropic 适配只能用 `any_message`，误命中历史消息（oar） | oar | claude-partials "native background child completed blocks retain attribution"：父级后续请求含 Task tool_use 参数（带 `CHILD_PARTIAL`），`any_message` 命中子规则。M3 的 `last_user` 已忽略 `<system-reminder>`，可能已可替换，但第三轮未重试（此前换成 `last_user` 曾使 Claude 49 掉到 44，原因是 Claude 在提示词后追加 reminder 和 tool_result 轮）。需要先用 M3 重试，再决定是否要“最后一条真实 user 消息”的更精确语义 |
 | 7 | oar 两个未诊断的 codex 失败，无法判断是否 fakellm 问题 | oar | `failure-classes` unknown model：结果多一个字段，疑为错误体形状差异；`service-tier` "resume preserves the saved tier"：继承会话报 `default` 而不是 `priority`。两者在 aimock 基线上第一轮就失败，不涉及谓词 |
 | 8 | 正则不支持环视（oar） | oar | Rust regex 无 lookahead；opencode 的“不含 X”已能靠规则顺序表达，适配器遇到其他环视仍抛错；回落路径也忽略否定正则。低优先级 |
-| 9 | 文档过时：RST 行为（raft） | raft | 二进制已发 RST（裸 `net` 客户端得到 `ECONNRESET`），但 README、`docs/scripts.md` 仍写“FIN 不是 RST”；未验证 CONNECT 代理会转发 RST 还是转成 FIN。经代理和 pi-ai 看到的都是 `terminated`，区分不了 |
+| 9 | 文档过时：RST 行为（raft）。文档已更正，仅剩代理验证 | raft | 二进制已发 RST（裸 `net` 客户端得到 `ECONNRESET`），README、`docs/scripts.md` 已改成 RST；未验证 CONNECT 代理会转发 RST 还是转成 FIN。经代理和 pi-ai 看到的都是 `terminated`，区分不了 |
 | 10 | trajectory/策略的覆盖缺口（pi-mono） | pi-mono | agent 测试只用 openai-completions，Responses 与 Anthropic 的 trajectory/策略没测；bun 与 tjs 运行时没试；`args_chunk_bytes`（仅 oar 间接覆盖）、`last_user_raw`、路径前缀容忍（仅 raft 覆盖）没有专门测试 |
+
+补充一轮已解决：
+
+- 自定义端点规则（xsai）：见缺口 5，14 / 14。
+- 策略的“放行”语义：`decline` 已实现；剩下的是 oar 适配器改用它（缺口 1）。
 
 第三轮已解决：
 
 - 工具参数流式分块与延迟（oar）：`stream.args_chunk_bytes` 加 `tokens_per_sec`，slow-arguments 用例通过（10 token/s 下 19 块用 1.9 秒）。
 - 可配置路径前缀（raft）：`/anthropic/v1/messages` 现可用，raft 三个用例已恢复前缀并通过。
 - `POST /v1/embeddings`（xsai）：embed 两个用例通过，已验证。
-- `reset_after_chunks` 的 RST（pi-mono、raft）：二进制现发真正的 RST；剩余的只是文档过时（缺口 9）。
+- `reset_after_chunks` 的 RST（pi-mono、raft）：二进制现发真正的 RST；文档已更正，剩余只是 CONNECT 代理转发 RST 的验证（缺口 9）。
 - 任意谓词与函数式回复（oar）：可由策略脚本实现，剩余问题见缺口 1。
 - Anthropic 的 system 角色消息与 `<system-reminder>` 污染 `last_user`：M3 已让 `last_user` 忽略 reminder（`last_user_raw` 取原文），oar 重试见缺口 6。
 

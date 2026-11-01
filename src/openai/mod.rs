@@ -5,6 +5,7 @@
 //! errors, the Responses store hand-off, and the request log. See docs/m1-spec.md.
 
 pub mod chat;
+mod custom;
 pub mod embeddings;
 pub mod error;
 pub mod models;
@@ -58,6 +59,8 @@ struct Trace {
     /// The request was relayed upstream: the log record is written when the relayed body ends
     /// (`upstream::record::finish`), not by [`handle`].
     deferred: bool,
+    /// A custom endpoint rule answered: log the request even though the path is not under `/v1`.
+    custom: bool,
 }
 
 /// Records a request as `status: 0` when its future is dropped while parked on the server clock
@@ -281,6 +284,7 @@ pub(crate) async fn handle(shared: &Shared, req: http::Request<hyper::body::Inco
     if trace.deferred {
         return response;
     }
+    let logged = logged || (trace.custom && shared.control.log.is_enabled());
     if logged && shared.control.generation() == generation {
         if let Some(seq) = trace.hung_seq {
             let (status, latency) = (response.status().as_u16(), started.elapsed());
@@ -330,6 +334,11 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
     let route = route(&parts.method, path);
     let style = style(&route, path, &parts.headers);
     if matches!(route, Route::Unknown) {
+        if let Ok(b) = Limited::new(body, MAX_BODY).collect().await
+            && let Some(resp) = custom::respond(shared, path, &b.to_bytes(), trace)
+        {
+            return resp;
+        }
         return reject(
             trace,
             style,
@@ -500,6 +509,8 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
         }
         Err(e) => return reject(trace, style, e),
     };
+    let mut req = req;
+    req.raw_body = Some(String::from_utf8_lossy(bytes).into());
     let seed = fallback::request_seed(&req);
     trace.seed = Some(seed);
     let mut outcome = control.engine.resolve_async(&req).await;

@@ -45,6 +45,7 @@
 | `last_user_raw` | 正则 | 同上，但匹配最近一条 user 消息的原文，不做任何处理（Claude Code 的第一条 user 消息是 reminder 块时用它） |
 | `system` | 正则 | 匹配所有 system 和 developer 消息拼起来的文本（用换行连接） |
 | `any_message` | 正则 | 任何一条消息（任何角色）的文本匹配即可 |
+| `body` | 正则 | 匹配请求的原始 JSON 正文（客户端发来的文本，字段顺序和空白都原样保留）。适合按非标准字段匹配，比如 `"damaged"\s*:\s*true`。任何规则都能用 |
 | `has_tool` | 字符串 | `tools` 里提供了这个名字的工具 |
 | `no_tools` | 布尔 | `true`：没有提供任何工具；`false`：至少提供了一个 |
 | `has_tool_result` | 布尔 | `true`：最后一条 assistant 消息之后有 tool 结果（客户端刚执行完工具）；`false`：没有 |
@@ -57,6 +58,7 @@
 | `protocol` | 字符串 | 只匹配某个协议：`openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages`。写别的值是 400 |
 | `probability` | 数字 | 0 到 1。其他条件都满足后，以这个概率命中。不在范围内（包括 NaN）是 400 |
 | `every_nth` | 整数 | 至少为 1。其他条件都满足的请求里，每第 N 个命中：`every_nth: 3` 命中第 3、6、9 个 |
+| `path` | glob | 自定义端点规则，见[自定义端点](#自定义端点)：匹配请求路径（去掉网关前缀之后），`*` 任意串、`?` 一个字符。必须和 `reply.body` 一起写 |
 
 细节：
 
@@ -106,7 +108,10 @@
 | `stream` | 对象 | 流式节奏，见下 |
 | `delay_ms` | 整数 | 同步响应或错误响应发出前的等待，毫秒，服务端时钟。流式请求里等同 `stream.ttft_ms`（`stream.ttft_ms` 优先） |
 | `trajectory` | 字符串 | 把请求交给这条已注册的[轨迹](agent.md#轨迹)，由它按请求里的历史选一步来回答。不能和 `text`、`tool_calls`、`reasoning`、`finish_reason`、`error`、`policy` 同时写；`stream`、`delay_ms`、`hang*`、`reset`、`usage` 是步骤的默认值。名字在请求到来时才查，找不到是 400 `fakellm_trajectory_not_found` |
-| `policy` | 字符串 | 把请求交给这个已注册的[策略脚本](agent.md#策略脚本)，由 JS 模块决定回复。同样不能和内容、`error`、`trajectory` 同时写，规则上的 `stream`、`delay_ms`、`hang*`、`reset`、`usage` 是策略回复的默认值。找不到是 400 `fakellm_policy_not_found` |
+| `body` | 任意 JSON | 仅自定义端点规则：原样返回的 JSON 正文。见[自定义端点](#自定义端点) |
+| `status` | 整数 | 仅自定义端点规则：HTTP 状态码，默认 200，范围 100 到 599 |
+| `headers` | 对象 | 仅自定义端点规则：额外的响应头（可以覆盖 `content-type`） |
+| `policy` | 字符串 | 把请求交给这个已注册的[策略脚本](agent.md#策略脚本)，由 JS 模块决定回复。同样不能和内容、`error`、`trajectory` 同时写，规则上的 `stream`、`delay_ms`、`hang*`、`reset`、`usage` 是策略回复的默认值。找不到是 400 `fakellm_policy_not_found`。策略可以“放弃”：`decide` 返回 `null` / `undefined` / `{decline: true}` 时这条规则视为没匹配上（不计命中，策略的 `hits` 也不加），引擎继续往下找后面的规则，直到有规则回答或落到 cassette / 回退 |
 
 没有被覆盖的 `usage` 字段由服务端用内置 tokenizer 算出：`prompt_tokens` 来自整个请求，`completion_tokens` 是文本、工具调用参数和推理文本的 token 之和。
 
@@ -254,6 +259,39 @@ HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}
 `response.incomplete` 的 `content_filter` 原因会被 codex 重试，`max_output_tokens` 是硬错误；对应 `finish_reason: content_filter` 和 `finish_reason: length`。
 
 以上这些除了 `e2e/codex.sh` 的两个正常场景和 `e2e/codex-faults.sh`（真实 codex 0.162.1）验证的 `context_length_exceeded` 外，没有用真实 codex 逐项验证过：`in_stream: true` 时 codex 打印 “Codex ran out of room in the model's context window...” 并退出码 1，不重试（只有 1 个请求）；同一条规则不加 `in_stream`（HTTP 400）时，codex 原样打印错误体 JSON，没有这句友好提示。`response.failed` 的形状有 `tests/responses.rs` 覆盖。
+
+## 自定义端点
+
+有些 SDK 和 harness 除了 LLM 路由，还会调用非标准的 JSON 接口。写一条带 `match.path` 和 `reply.body` 的规则就能回答它：
+
+- `match.path` 是路径 glob。设置之后这条规则适用于 API 下的任意路径，包括标准路由不认识的路径；它只看这类请求，不会被 `/v1/chat/completions` 等标准请求命中，反过来没有 `path` 的规则（包括 `any: true`）也不会命中自定义请求。
+- `reply.body` 是原样返回的 JSON；`reply.status`（默认 200）和 `reply.headers` 可选。`path` 和 `body` 必须成对出现，且这类回复不能再写 `text`、`tool_calls`、`error`、`trajectory`、`policy`、`reasoning`；`status` / `headers` 没有 `path` 是 400。
+- 用 `match.body`（正则，匹配原始请求正文）区分同一路径上的不同请求；`times`、`name`、`every_nth`、`probability` 照常生效，规则按顺序，第一条命中的回答。
+- 没有任何规则命中的未知路径仍是 404 `Invalid URL (POST /path)`。
+- 请求日志里 `protocol` 为 `"custom"`，`raw` 是原始正文，`rule` 和 `source` 是命中的规则，`reply.text` 是返回的 JSON 文本；`/_fakellm/requests?protocol=custom` 可以过滤。自定义请求不经过 cassette、上游和回退，不支持流式和 `delay_ms`。
+
+示例：xsai 的 decide 包 `POST /v1/systemone`（请求 `{model, state, questions}`，响应 `{answers, usage}`，格式见 consumers.md），按 `state` 区分两个用例：
+
+```yaml
+- name: systemone-angry
+  match: { path: /v1/systemone, body: "/angry/i" }
+  reply:
+    body:
+      answers:
+        damaged: { type: noul, noul: 0.9 }
+        route: { type: choice, choice: shipping, confidence: 0.8, probabilities: { billing: 0.2, shipping: 0.8 } }
+        anger: { type: score, score: 2, confidence: 0.7, probabilities: { "0": 0.1, "1": 0.2, "2": 0.7 } }
+      usage: { input_tokens: 42, output_tokens: 8 }
+- name: systemone-happy
+  match: { path: /v1/systemone, body: "/happy/i" }
+  reply:
+    status: 200
+    headers: { x-fake: "1" }
+    body:
+      answers:
+        damaged: { type: noul, noul: 0.1 }
+      usage: { input_tokens: 42, output_tokens: 8 }
+```
 
 ## 与 cassette、上游的关系
 

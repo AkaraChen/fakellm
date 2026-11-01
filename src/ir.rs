@@ -33,6 +33,9 @@ pub enum Protocol {
     /// nothing is generated, so scripts only ever contribute errors.
     #[serde(rename = "openai.embeddings")]
     OpenaiEmbeddings,
+    /// A non-standard JSON endpoint answered by a rule with `match.path` and `reply.body`.
+    #[serde(rename = "custom")]
+    Custom,
 }
 
 impl Protocol {
@@ -42,6 +45,7 @@ impl Protocol {
             Self::OpenaiResponses => "openai.responses",
             Self::AnthropicMessages => "anthropic.messages",
             Self::OpenaiEmbeddings => "openai.embeddings",
+            Self::Custom => "custom",
         }
     }
 }
@@ -260,6 +264,13 @@ pub struct Request {
     /// Top-level fields the frontend did not interpret, verbatim.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
+    /// The request body as received, for `Match.body`. Not part of the IR's JSON form; when absent
+    /// (hand-built requests) `Match.body` sees the IR serialized instead.
+    #[serde(skip)]
+    pub raw_body: Option<std::sync::Arc<str>>,
+    /// The API path of a custom endpoint request (`Protocol::Custom`), for `Match.path`; `None` on the standard routes.
+    #[serde(skip)]
+    pub path: Option<String>,
 }
 
 fn one() -> u32 {
@@ -311,6 +322,8 @@ impl Request {
             user: None,
             metadata: Map::new(),
             extra: Map::new(),
+            raw_body: None,
+            path: None,
         }
     }
 

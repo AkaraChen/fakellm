@@ -191,6 +191,7 @@ export default function decide(request, context) {
 - `request` 是解析后的请求，和 `GET /_fakellm/requests?full=true` 里的 `request` 完全一样：`messages`（`role`、`content` 是 `{type, text}` 的数组、`tool_calls`、`tool_call_id`）、`tools`、`model`、`stream` 等，文本都是原文，没有去掉 `<system-reminder>`。
 - `context` 有三样：`state`（上一次返回的状态，初始 `{}`）、`hits`（这个策略之前已经做过几次决定，第一次是 0）、`log(...)`（写一行日志）。
 - 返回值是一个回复对象，字段同剧本的 `reply`（`text`、`tool_calls`、`error`、`usage`、`stream` 等），**可以**写 `trajectory` 让某条轨迹来回答这个请求，**不能**写 `policy`；加一个可选的 `state`。规则上的 `stream`、`delay_ms`、`hang*`、`reset`、`usage` 是策略回复的默认值。回复既没有内容、也没有 `error`、`hang` 或 `trajectory` 是 400 `fakellm_policy_error`。
+- **放弃（decline）**：返回 `null`、`undefined` 或 `{decline: true}` 表示“这个请求不归我”。引擎把这条规则当作没匹配上：规则不计命中（`times` 不消耗），策略的 `hits` 不加，然后继续试后面的规则。`{decline: true, state: ...}` 仍会保存 `state`。只有策略有这个能力，轨迹没有。比如一个策略只接管带某个工具的请求，其余的落到后面的 `text` 规则。注意：放弃之后若再没有规则匹配，请求走 cassette / 上游 / 回退，和没有这条规则一样。
 
 ### JSONL 协议
 
