@@ -74,8 +74,16 @@ jobs:
         with:
           workspaces: bindings/node
 
+      # txiki.js's ada needs C++20 constexpr std::string (gcc 12+); 22.04 ships gcc 11.
+      - name: Install gcc 12
+        if: ${{ !matrix.alpine }}
+        run: sudo apt-get update -q && sudo apt-get install -y -q g++-12
+
       - name: Build and test
         if: ${{ !matrix.alpine }}
+        env:
+          CC: gcc-12
+          CXX: g++-12
         run: |
           npm ci
           npx napi build --platform --release -- --locked
@@ -88,7 +96,7 @@ jobs:
           # napi defaults to a cross linker name on aarch64 musl; Alpine's native cc is the right one.
           docker run --rm -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
             -v "$PWD/../..:/work" -w /work/bindings/node node:24-alpine sh -euxc '
-            apk add --no-cache build-base perl linux-headers rustup cmake
+            apk add --no-cache build-base perl linux-headers rustup cmake git
             rustup-init -y --profile minimal --default-toolchain stable
             . "$HOME/.cargo/env"
             export RUSTFLAGS="-C target-feature=-crt-static"
