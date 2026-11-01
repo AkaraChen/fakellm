@@ -49,6 +49,7 @@
 | `has_tool_result` | 布尔 | `true`：最后一条 assistant 消息之后有 tool 结果（客户端刚执行完工具）；`false`：没有 |
 | `last_tool_result` | 字符串 | 那一串 tool 结果里，有一条是这个函数的结果 |
 | `tool_result_contains` | 正则 | 那一串 tool 结果中，有一条的文本匹配 |
+| `last_tool_call_id` | 字符串 | 那一串 tool 结果里，有一条回答的是这个 id 的工具调用（`tool_call_id` / `call_id` / `tool_use_id`） |
 | `stream` | 布尔 | `true` 只匹配流式请求，`false` 只匹配非流式 |
 | `turn` | 整数 | 请求里已有多少条 assistant 消息；第一次请求是 `0` |
 | `any` | 布尔 | 显式的“全部匹配”，只为可读，`{}` 等价 |
@@ -98,6 +99,7 @@
 | `reasoning_opaque` | 字符串 | 跟 `reasoning` 一起发的不透明串：Anthropic `thinking` 块的 `signature`，Responses `reasoning` 项的 `encrypted_content`（请求的 `include` 里有 `reasoning.encrypted_content` 时才发）。不写则由请求派生一个确定的值。Chat 里没有对应物，被忽略 |
 | `hang` | 布尔 | `true`：收到请求后不回答，一直挂到客户端放弃。见[挂起](#挂起) |
 | `hang_ms` | 整数 | 挂这么久（服务端时钟，毫秒）再按这条规则的其余部分回答。隐含 `hang` |
+| `usage` | 对象 | 覆盖 tokenizer 的计数，只覆盖写了的字段，其余照常计算。见下 |
 | `error` | 对象 | 见下 |
 | `finish_reason` | `stop` / `length` / `tool_calls` / `content_filter` | 覆盖自动推断的结束原因。默认：被 `max_tokens` 截断为 `length`，有工具调用为 `tool_calls`，否则 `stop` |
 | `stream` | 对象 | 流式节奏，见下 |
@@ -126,12 +128,23 @@
 | `param` | 字符串 | 覆盖 `param` |
 | `retry_after` | 数字 | 秒，可以带小数；写入 `retry-after` 头，向上取整成整数秒（`0.5` 写成 `1`） |
 | `in_stream` | 布尔 | 流式请求时，不返回 HTTP 错误，而是返回 200 的事件流，错误作为流里的事件发出。非流式请求忽略它（仍是 HTTP 错误）。见[协议里的错误形态](#协议里的错误形态) |
-| `headers` | 对象 | 额外的响应头，值是字符串，如 `retry-after-ms: "250"`、`x-should-retry: "false"`。头名会转成小写，名字或值不合法的头被丢弃。流内错误（`in_stream`）下 HTTP 头里没有这些，只有 Responses 的 `response.failed` 把它们放进 `error.headers` |
+| `headers` | 对象 | 额外的响应头，值是字符串，如 `retry-after-ms: "250"`、`x-should-retry: "false"`。头名会转成小写，名字或值不合法的头被丢弃。流内错误（`in_stream`）时它们设在 200 的 SSE 响应头上（三个协议一致），Responses 的 `response.failed` 另外把它们放进 `response.error.headers` |
 
 只写 `status` 时，`type` / `code` / `message` 取真实 API 对这个状态码的默认值，**默认值随请求的协议而变**（状态码表见 [README](../README.md#错误与状态码)）：Chat 和 Responses 用 OpenAI 的格式 `{"error": {"message", "type", "param", "code"}}`（四个键总在）；Anthropic 用 `{"type": "error", "error": {"type", "message"}}`，`code` 和 `param` 在这个协议里没有位置，会被丢掉。
 错误在 `delay_ms` 之后才发出。默认情况下流式请求遇到错误规则也是一个普通的 HTTP 错误响应（不是 SSE），所以客户端能像真实 API 那样在流开始前重试；要模拟流已经开始之后才出的错，用 `in_stream: true`。
 
-两处默认值要留意：`status: 404` 的 Chat / Responses 默认文案里写死的是模型名 `unknown`（不是请求里的模型名），Anthropic 默认是 `Not found.`；想要和请求一致的文案就自己写 `message`。
+只写 `status: 404` 时，生成接口的默认文案回显请求里的模型名：Chat / Responses 是 “The model `x` does not exist ...”，Anthropic 是 `model: x`。
+
+### Usage
+
+`usage` 的字段同时接受 OpenAI 和 Anthropic 的写法：`prompt_tokens` / `input_tokens`、`completion_tokens` / `output_tokens`（含推理）、`cached_tokens`（`cache_read_tokens`）、`reasoning_tokens`、`cache_creation_tokens`（`cache_creation_input_tokens`）。写了的字段原样出现在响应的 usage 里（流式也是），没写的照常用 tokenizer 计算（唯一的例外：Anthropic 协议的 `usage.input_tokens` 是扣掉缓存读写之后的值，所以规则里写 `input_tokens: 20236` 又写 `cached_tokens: 5` 时，Anthropic 响应里是 `input_tokens: 20231`、`cache_read_input_tokens: 5`；`count_tokens` 返回的仍是 20236）；`completion_tokens` 没写时，会用你给的 `reasoning_tokens` 重新累加。
+
+`POST /v1/messages/count_tokens` 也会查剧本：第一条匹配且写了 `usage.input_tokens` 的规则，它的值就是返回的 `input_tokens`，并**算一次命中**（受 `times` 约束）；没有这样的规则时返回 tokenizer 的计数。没写 `input_tokens` 的规则在 count_tokens 里被整条跳过，不会被消耗。
+
+```yaml
+- match: { last_user: "context" }
+  reply: { text: "ok", usage: { input_tokens: 20236, output_tokens: 64 } }
+```
 
 ### Stream
 
@@ -142,7 +155,10 @@
 | `ttft_ms` | 整数 | 首 token 延迟：从请求开始到发出第一个 chunk（role chunk），毫秒 |
 | `tokens_per_sec` | 数字 | 流式速度，必须大于 0。chunk 之间等待 `chunk_tokens / tokens_per_sec` 秒；不写则 chunk 之间不等待 |
 | `chunk_tokens` | 整数 | 每个 content chunk 含几个 token，默认 1（真实 API 的行为）；0 按 1 处理 |
-| `cut_after_chunks` | 整数 | 发完这么多个 content chunk 后结束 body，**不发 finish chunk 和 `[DONE]`**（Anthropic 没有 `message_delta` / `message_stop`，Responses 没有 `response.completed`），用来测客户端的流中断处理。结束是干净的 chunked 结尾，不是 TCP 重置 |
+| `cut_after_chunks` | 整数 | 发完这么多个 content chunk 后结束 body，**不发 finish chunk 和 `[DONE]`**（Anthropic 没有 `message_delta` / `message_stop`，Responses 没有 `response.completed`），用来测客户端的流中断处理。结束是干净的 chunked 结尾，不是连接中断（要中断用 `reset_after_chunks`） |
+| `reset_after_chunks` | 整数 | 和 `cut_after_chunks` 同一个位置，但连接被**异常中断**（没有结尾的 `0\r\n\r\n`）：连接以 FIN 关闭（不是 RST），客户端看到 `premature close` / `terminated` / `unexpected EOF` / 不完整的 chunked body（通常不是 ECONNRESET），而不是干净的流结束。两者都写时取较小的那个 |
+
+`reply.reset: true`：同步响应在响应头（200）和一半 body 发出后连接被中断；流式请求在第一个非头部帧处中断（等价于 `reset_after_chunks: 0`）。连接以 FIN 关闭（没有结尾 chunk），不是 TCP RST，客户端在读 body 时报传输错误。限制：响应头已经发出，所以不可能表现成 HTTP 错误状态，也无法在发头之前断开（那种情况用 `hang` 加客户端超时）。
 
 所有时间都读服务端时钟：冻结时钟时流停在对应位置，`advance` 后放行。详见[控制面的时钟一节](control-plane.md#时钟)。
 
@@ -171,8 +187,10 @@
   reply: { hang_ms: 30000, text: "finally" }       # 冻结时钟时一直挂着，advance 30s 后才回答
 ```
 
-- 等待读的是服务端时钟：冻结时钟时 `hang_ms` 不会结束，`ctl clock advance 30s` 立刻放行。`hang: true`（没有 `hang_ms`）永远不会自己结束，推进时钟也没用；`reset` 也不会唤醒已经挂住的请求。
-- 客户端放弃（超时、abort、断开）后，这个请求以 **`status: 0`** 记入请求日志，表示“没有发出任何响应”，`reply.hang` 是 `{"until_ms": null}` 或毫秒数；如果等待期间日志被清空，这条记录会被丢弃。
+- 请求一被挂住就写进请求日志：`status: 0`、`hung: true`，测试里不用等客户端放弃就能看到它。放行（时钟到点、`reset`）后这条记录被更新为真实的 `status` 和 `latency_us`、`hung: false`；客户端先放弃则 `status` 仍为 `0`、`hung: false`、`latency_us` 为挂了多久。
+- `reset` 会唤醒所有挂住的请求：有 `hang_ms` 的按规则其余部分回答（`text` / `tool_calls` / `error`），只写 `hang: true` 的回 503（没有可回答的内容）。
+- 等待读的是服务端时钟：冻结时钟时 `hang_ms` 不会结束，`ctl clock advance 30s` 立刻放行。`hang: true`（没有 `hang_ms`）永远不会自己结束，推进时钟也没用。
+- 客户端放弃（超时、abort、断开）后，这个请求的记录保持 **`status: 0`**，表示“没有发出任何响应”，`reply.hang` 是 `{"until_ms": null}` 或毫秒数；如果等待期间日志被清空，这条记录会被丢弃。
   所以挂起的请求要等客户端放弃之后才在日志里出现，断言前先让客户端超时：`fakellm ctl requests list --status 0`。
 - 不要把 `hang` 和 `delay_ms` / `stream.ttft_ms` 搞混：后者是“等一会儿再发响应头”（流的响应头在 `ttft` 之前就发了，非流式和错误响应在等待结束后才发），`hang` 是“根本不回”。
 - 带 `hang_ms` 又带 `error` 的规则，是“挂一会儿再失败”，常用来模拟网关超时前的长时间无响应。
@@ -205,6 +223,7 @@ Responses 的 `response.error.code` 由规则决定：写了 `code` 就用它；
 | `overloaded` | `status: 503`（默认 `server_error`，“The engine is currently overloaded”）；也可以用 `529`（默认 `overloaded_error`） | `status: 529`（默认 `overloaded_error`） |
 | `provider` | `status: 500`（默认 `server_error`）或 502 / 504 | `status: 500`（默认 `api_error`）或 502 / 504 |
 | 流中途断开 | `stream: { cut_after_chunks: N }` | 同左 |
+| 流中途连接中断（无结尾 chunk） | `stream: { reset_after_chunks: N }`；同步用 `reply: { reset: true }`（头已发出，见 Stream 一节） | 同左 |
 | 流中途出错 | 加 `in_stream: true` | 同左 |
 | 挂起 | `hang: true` 或 `hang_ms` | 同左 |
 
@@ -230,7 +249,7 @@ codex 对 HTTP 错误体不做细分类：**400 的 body 一律是不重试的 `
 HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}}` 是 usage limit（codex 会读 `x-codex-active-limit` 头，用 `error.headers` 加）；`insufficient_quota` 是额度错误；其他 429 是 RetryLimit；5xx 重试；401、404 也会被当成可重试的意外状态码。
 `response.incomplete` 的 `content_filter` 原因会被 codex 重试，`max_output_tokens` 是硬错误；对应 `finish_reason: content_filter` 和 `finish_reason: length`。
 
-以上这些除了 `e2e/codex.sh` 的两个正常场景外，没有用真实 codex 逐项验证过；`response.failed` 的形状有 `tests/responses.rs` 覆盖。
+以上这些除了 `e2e/codex.sh` 的两个正常场景和 `e2e/codex-faults.sh`（真实 codex 0.162.1）验证的 `context_length_exceeded` 外，没有用真实 codex 逐项验证过：`in_stream: true` 时 codex 打印 “Codex ran out of room in the model's context window...” 并退出码 1，不重试（只有 1 个请求）；同一条规则不加 `in_stream`（HTTP 400）时，codex 原样打印错误体 JSON，没有这句友好提示。`response.failed` 的形状有 `tests/responses.rs` 覆盖。
 
 ## 示例一：最简单的文本
 

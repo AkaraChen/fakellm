@@ -46,24 +46,41 @@ struct Trace {
     request_id: Option<String>,
     /// Method, path, headers and arrival time, for [`HangGuard`].
     head: Option<RequestRecord>,
+    /// Log seq of the record written when the request was parked by a `hang` rule; the final
+    /// status and latency go there instead of into a new record.
+    hung_seq: Option<u64>,
 }
 
 /// Records a request as `status: 0` when its future is dropped while parked on the server clock
 /// (a hang, or the latency of an error or sync reply; client disconnected); hyper drops the
-/// handler then, so the normal log call at the end never runs. Skipped when a reset happened
+/// handler then, so the normal log call at the end never runs. A request parked by a `hang` rule
+/// already has a record (`hung_seq`), which is updated instead. Skipped when a reset happened
 /// since the request arrived, so a stale request cannot write into the cleared log.
 struct HangGuard {
     control: Arc<crate::control::Control>,
     record: Option<RequestRecord>,
     generation: u64,
+    started: Instant,
+    hung_seq: Option<u64>,
 }
 
 impl Drop for HangGuard {
     fn drop(&mut self) {
-        if let Some(record) = self.record.take()
-            && self.control.generation() == self.generation
-        {
-            self.control.log.record(record);
+        let Some(record) = self.record.take() else { return };
+        if self.control.generation() != self.generation {
+            return;
+        }
+        match self.hung_seq {
+            Some(seq) => {
+                let latency = self.started.elapsed();
+                self.control.log.update(seq, |r| {
+                    r.hung = false;
+                    r.latency = latency;
+                });
+            }
+            None => {
+                self.control.log.record(record);
+            }
         }
     }
 }
@@ -177,6 +194,7 @@ pub(crate) async fn handle(shared: &Shared, req: http::Request<hyper::body::Inco
             method: parts.method.clone(),
             path: parts.uri.path_and_query().map_or(path.clone(), |p| p.as_str().to_owned()),
             status: 0,
+            hung: false,
             latency: Duration::ZERO,
             headers: parts
                 .headers
@@ -206,12 +224,22 @@ pub(crate) async fn handle(shared: &Shared, req: http::Request<hyper::body::Inco
     headers.insert("openai-processing-ms", header_value(&started.elapsed().as_millis().to_string()));
 
     if logged && shared.control.generation() == generation {
+        if let Some(seq) = trace.hung_seq {
+            let (status, latency) = (response.status().as_u16(), started.elapsed());
+            shared.control.log.update(seq, |r| {
+                r.status = status;
+                r.latency = latency;
+                r.hung = false;
+            });
+            return response;
+        }
         shared.control.log.record(RequestRecord {
             seq: 0,
             time: arrived,
             method: parts.method.clone(),
             path: parts.uri.path_and_query().map_or(path.clone(), |p| p.as_str().to_owned()),
             status: response.status().as_u16(),
+            hung: false,
             latency: started.elapsed(),
             headers: parts
                 .headers
@@ -308,7 +336,7 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
         Route::Chat => complete(shared, Api::Chat, &bytes, trace).await,
         Route::Messages => complete(shared, Api::Messages, &bytes, trace).await,
         Route::Responses => complete(shared, Api::Responses, &bytes, trace).await,
-        Route::CountTokens => count_tokens(&bytes, trace),
+        Route::CountTokens => count_tokens(shared, &bytes, trace),
         Route::ResponseGet(id) => match shared.control.responses.get(id) {
             Some(r) => json_response(200, &r.response),
             None => reject(trace, style, responses::not_found(id)),
@@ -350,15 +378,16 @@ fn reject(trace: &mut Trace, style: Style, err: ApiError) -> Response {
 }
 
 /// `POST /v1/messages/count_tokens`: parse like Messages (without requiring `max_tokens`) and
-/// answer `{"input_tokens": n}`. No script rule is consulted or consumed.
-fn count_tokens(bytes: &[u8], trace: &mut Trace) -> Response {
+/// answer `{"input_tokens": n}`. Only a rule with `usage.input_tokens` is consulted, and its hit
+/// is counted (see `Engine::count_input_tokens`).
+fn count_tokens(shared: &Shared, bytes: &[u8], trace: &mut Trace) -> Response {
     trace.seed = Some(fallback::hash64(bytes));
     let Some(value) = note_body(trace, Some(bytes)) else {
         return reject(trace, Style::Anthropic, ApiError::invalid_request(ANTHROPIC_JSON_HINT));
     };
     match anthropic::messages::parse(&value, false) {
         Ok(req) => {
-            let body = anthropic::count_tokens(&req);
+            let body = anthropic::count_tokens(&shared.control.engine, &req);
             trace.request = Some(Arc::new(req));
             json_response(200, &body)
         }
@@ -418,13 +447,39 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
             ..h
         }),
         generation: control.generation(),
+        started: Instant::now(),
+        hung_seq: None,
     };
     if let Outcome::Hang { until, then } = outcome {
-        match until.and_then(|d| arrived.checked_add(d)) {
-            Some(deadline) => control.clock.wait_until(deadline).await,
-            None => std::future::pending::<()>().await,
+        // Registered before the record is visible, so a reset right after cannot be missed.
+        let released = control.release.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if let Some(record) = &guard.record {
+            let seq = control.log.record(RequestRecord {
+                hung: true,
+                ..record.clone()
+            });
+            (guard.hung_seq, trace.hung_seq) = ((seq != 0).then_some(seq), (seq != 0).then_some(seq));
         }
+        let by_reset = tokio::select! {
+            () = async {
+                match until.and_then(|d| arrived.checked_add(d)) {
+                    Some(deadline) => control.clock.wait_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => false,
+            () = &mut released => true,
+        };
         outcome = *then;
+        // A hang without a reply of its own, woken by a reset, can only be an overload.
+        if by_reset && until.is_none() && is_placeholder(&outcome) {
+            outcome = Outcome::Error {
+                error: ApiError::overloaded(),
+                delivery: Default::default(),
+                source: outcome.source().clone(),
+            };
+        }
     }
     let unique = seed ^ fallback::hash64(&control.next_salt().to_le_bytes());
     let request_id = format!("req_{unique:016x}");
@@ -434,6 +489,8 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
         match outcome {
             Outcome::Error { error, delivery, .. } => {
                 if error.in_stream && req.stream {
+                    let mut headers = crate::error_headers(&error);
+                    headers.push(("x-request-id".into(), request_id));
                     let frames = match api {
                         Api::Chat => chat::error_frames(&error),
                         Api::Messages => {
@@ -445,13 +502,7 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
                         }
                         Api::Responses => responses_stream::error_frames(&req, &error, &response_meta(control, &req, unique)),
                     };
-                    return sse::respond(
-                        control.clock.clone(),
-                        delivery,
-                        frames,
-                        vec![("x-request-id".into(), request_id)],
-                        sentinel(api),
-                    );
+                    return sse::respond(control.clock.clone(), delivery, frames, headers, sentinel(api));
                 }
                 wait(&control.clock, delivery.ttft).await;
                 match style {
@@ -478,7 +529,7 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
                         )
                     } else {
                         wait(&control.clock, sync_latency(&reply, &delivery)).await;
-                        json_response(200, &chat::render_sync(&req, &reply, &meta))
+                        sync_done(json_response(200, &chat::render_sync(&req, &reply, &meta)), &delivery).await
                     }
                 }
                 Api::Messages => {
@@ -497,7 +548,11 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
                         )
                     } else {
                         wait(&control.clock, sync_latency(&reply, &delivery)).await;
-                        json_response(200, &anthropic::messages::render_sync(&req, &reply, &meta))
+                        sync_done(
+                            json_response(200, &anthropic::messages::render_sync(&req, &reply, &meta)),
+                            &delivery,
+                        )
+                        .await
                     }
                 }
                 Api::Responses => {
@@ -518,7 +573,7 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
                         // the wait cannot be undone by a late insert.
                         control.responses.insert_opt(stored);
                         wait(&control.clock, sync_latency(&reply, &delivery)).await;
-                        json_response(200, &responses::render_sync(&req, &reply, &meta))
+                        sync_done(json_response(200, &responses::render_sync(&req, &reply, &meta)), &delivery).await
                     }
                 }
             },
@@ -528,6 +583,11 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
     .await;
     guard.record = None;
     response
+}
+
+/// The empty reply `Engine::resolve` builds for a rule that only says `hang: true`.
+fn is_placeholder(outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::Reply { reply, .. } if reply.text.as_deref().is_none_or(str::is_empty) && reply.tool_calls.is_empty())
 }
 
 fn response_meta(control: &crate::control::Control, req: &Request, unique: u64) -> responses::ResponseMeta {
@@ -560,6 +620,10 @@ async fn wait(clock: &crate::clock::Clock, d: Duration) {
     if let Some(deadline) = now.checked_add(d) {
         clock.wait_until(deadline).await;
     }
+}
+
+async fn sync_done(resp: crate::Response, delivery: &crate::ir::Delivery) -> crate::Response {
+    if delivery.reset { sse::reset_body(resp).await } else { resp }
 }
 
 #[cfg(test)]

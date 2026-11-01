@@ -57,7 +57,7 @@ model_provider = "fakellm"
 [model_providers.fakellm]
 name = "fakellm"
 base_url = "http://127.0.0.1:41873/v1"
-env_key = "FAKELLM_API_KEY"
+# env_key = "FAKELLM_API_KEY"   # 可选，见下
 wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
@@ -74,7 +74,7 @@ FAKELLM_API_KEY=fakellm codex -c model=gpt-5.5 -c model_provider=fakellm \
 注意：
 
 - **codex 不读 `OPENAI_BASE_URL`**，内置 `openai` provider 的 `base_url` 也被忽略。只有自定义 provider 能改地址，这就是为什么必须用上面的配置。codex 现在只有 Responses（`wire_api = "chat"` 启动即报错），fakellm 的 `POST /v1/responses` 就是为它做的。
-- **`env_key` 指向的环境变量必须设置且非空**，否则启动失败；值随便填（除非 fakellm 配了 `--api-key`，那就得一致）。不需要 `codex login`，也不需要 `CODEX_API_KEY` / `OPENAI_API_KEY`。
+- **`env_key` 是可选的**，输出里把它注释掉了，没有它 codex 照常运行（已用真实 codex 验证，不发 `Authorization`）。一旦启用，它指向的环境变量必须设置且非空，否则 codex 启动即报 `Missing environment variable`；只有 fakellm 配了 `--api-key` 时才需要启用（值要一致）。下面的命令行形式自带 `FAKELLM_API_KEY=fakellm`，所以保留了 `env_key`。不需要 `codex login`，也不需要 `CODEX_API_KEY` / `OPENAI_API_KEY`。
 - `request_max_retries = 0`、`stream_max_retries = 0` 关掉 codex 的重试（默认 4 和 5 次），`stream_idle_timeout_ms = 5000` 把空闲超时从 5 分钟降到 5 秒。这意味着**挂住超过 5 秒的流会被 codex 当作超时错误**；测 `hang` 时心里要有数。
 - **故障必须通过 `response.failed` 事件注入**，也就是错误规则要写 `in_stream: true`。codex 对 HTTP 400 的 body 不做分类（一律是不重试的 `InvalidRequest`），所以用 HTTP 400 写不出 `context_length_exceeded`；示例见 [scripts.md](scripts.md#示例五codex-的上下文溢出)。
 - codex 以 `exec` 非交互运行时的实测情况（codex-cli 0.162.1）：
@@ -109,7 +109,9 @@ $ fakellm wire opencode --endpoint http://127.0.0.1:41873 --format json
 }
 ```
 
-放在项目根目录或 `~/.config/opencode/opencode.json`。不想写文件，把同样的 JSON（紧凑形式）放进 `OPENCODE_CONFIG_CONTENT`（`shell` 格式的第一行 `export` 就是它）。`wire opencode` 的 `shell` 输出会把 JSON 打印两遍（一次是文件内容，一次是说明片段），这是已知的小毛病，不影响使用。
+放在项目根目录或 `~/.config/opencode/opencode.json`。不想写文件，把同样的 JSON（紧凑形式）放进 `OPENCODE_CONFIG_CONTENT`（`shell` 格式的第一行 `export` 就是它）。`shell` 输出里 JSON 出现两次：紧凑形式的环境变量，和 `# opencode.json` 下的文件内容，二选一用即可。
+
+`--file NAME` 只打印一个生成文件的原始内容，方便直接重定向：`fakellm wire pi --file models.json > ~/.pi/agent/models.json`、`fakellm wire codex --file config.toml`、`fakellm wire opencode --file opencode.json`。文件名不对时报错并列出可选项（退出码 2）；不能和 `--format` 同时用。
 
 注意：
 

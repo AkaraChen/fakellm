@@ -23,6 +23,9 @@ pub struct RequestRecord {
     /// Path and query exactly as sent.
     pub path: String,
     pub status: u16,
+    /// Parked by a `hang` rule right now; `status` is 0 and `latency` zero until it is released
+    /// or the client gives up.
+    pub hung: bool,
     /// From arrival until the response head was ready; a streamed body is not included.
     pub latency: Duration,
     /// Request headers, lower-cased names, in order. `authorization` and `x-api-key` values are
@@ -247,6 +250,15 @@ impl RequestLog {
         seq
     }
 
+    /// Edits the record with this `seq` in place; a no-op when it was dropped or cleared.
+    pub fn update(&self, seq: u64, edit: impl FnOnce(&mut RequestRecord)) {
+        let mut inner = self.inner.lock();
+        let start = inner.records.partition_point(|r| r.seq < seq);
+        if let Some(r) = inner.records.get_mut(start).filter(|r| r.seq == seq) {
+            edit(r);
+        }
+    }
+
     /// Matching records, oldest first, plus the number of matches before `limit` was applied.
     pub fn list(&self, filter: &RequestFilter) -> (Vec<RequestRecord>, usize) {
         let inner = self.inner.lock();
@@ -376,6 +388,7 @@ mod tests {
             method: http::Method::POST,
             path: path.into(),
             status,
+            hung: false,
             latency: Duration::ZERO,
             headers: Vec::new(),
             raw: None,

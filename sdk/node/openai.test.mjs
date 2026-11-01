@@ -168,3 +168,24 @@ test('streaming n=2 keeps choices separate', async () => {
   assert.deepEqual(text, ['alpha beta gamma', 'alpha beta gamma']);
   assert.deepEqual(finishes, [1, 1]);
 });
+
+test('reset_after_chunks: the SDK throws a connection error mid-stream', async () => {
+  await srv.ctl.put('/scripts', [
+    { reply: { text: 'one two three four five six', stream: { chunk_tokens: 1, reset_after_chunks: 2 } } },
+  ]);
+  const stream = await client.chat.completions.create({ model: 'gpt-4o', messages: user('go'), stream: true });
+  const chunks = [];
+  let failure;
+  try {
+    for await (const c of stream) chunks.push(c);
+  } catch (e) {
+    failure = e;
+  }
+  assert.ok(failure, 'expected the stream to throw');
+  // Observed: undici surfaces the abort as TypeError('terminated') with cause 'other side closed'.
+  assert.match(failure.message, /terminated|connection|closed/i);
+  assert.ok(chunks.length >= 1);
+  assert.ok(chunks.every((c) => !c.choices[0]?.finish_reason));
+  const log = await srv.ctl.get('/requests');
+  assert.equal(log.requests.length, 1);
+});

@@ -56,7 +56,10 @@ pub use reqlog::{DEFAULT_CAPACITY as DEFAULT_REQUEST_LOG_CAPACITY, RequestFilter
 pub use script::{Engine, Match, ReplySpec, Rule, RuleInfo, ScriptError, ScriptFormat, Scripts};
 
 /// Response body type used throughout: fully buffered JSON, or a streamed SSE body.
-pub type Body = BoxBody<Bytes, Infallible>;
+/// Boxed so a body can fail mid-flight (the reset faults): hyper then drops the connection
+/// without the terminating chunk.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub type Body = BoxBody<Bytes, BoxError>;
 pub type Response = http::Response<Body>;
 
 /// Models `GET /v1/models` lists when [`Config::models`] is left empty. Any model name is
@@ -127,9 +130,9 @@ impl Default for Config {
     }
 }
 
-/// A running server. [`Server::shutdown`] stops it and waits; dropping it also closes the
-/// listener, but does not wait. Connections that are already open keep being served until their
-/// clients hang up or the Tokio runtime shuts down.
+/// A running server. [`Server::shutdown`] stops it and waits; dropping it stops it too, but does
+/// not wait. Stopping closes the listener, aborts every open connection (idle keep-alive sockets,
+/// streams, `hang` requests) and wakes parked requests.
 pub struct Server {
     addr: SocketAddr,
     control: Arc<Control>,
@@ -153,10 +156,13 @@ impl Server {
                 config.models.clone()
             },
         });
+        let stop_control = control.clone();
         let task = tokio::spawn(async move {
             let http = ConnBuilder::new(TokioExecutor::new());
+            let mut conns = tokio::task::JoinSet::new();
             loop {
                 let socket = tokio::select! {
+                    Some(_) = conns.join_next(), if !conns.is_empty() => continue,
                     r = listener.accept() => match r {
                         Ok((socket, _peer)) => socket,
                         Err(e) => {
@@ -173,10 +179,12 @@ impl Server {
                     async move { Ok::<_, Infallible>(shared.handle(req).await) }
                 });
                 let conn = http.serve_connection_with_upgrades(TokioIo::new(socket), service).into_owned();
-                tokio::spawn(async move {
+                conns.spawn(async move {
                     let _ = conn.await;
                 });
             }
+            conns.shutdown().await;
+            stop_control.release.notify_waiters();
         });
         Ok(Self {
             addr,
@@ -221,6 +229,11 @@ impl Server {
         self.control.reset();
     }
 
+    /// Like [`Server::reset`], but [`ResetOptions`] picks what is cleared.
+    pub fn reset_with(&self, opts: ResetOptions) {
+        self.control.reset_with(opts);
+    }
+
     /// Logged requests matching `filter`, oldest first, and the match count before `limit`.
     pub fn requests(&self, filter: &RequestFilter) -> (Vec<RequestRecord>, usize) {
         self.control.log.list(filter)
@@ -236,7 +249,7 @@ impl Server {
         self.control.clear_responses()
     }
 
-    /// Stops accepting connections. Requests already in flight finish on their own.
+    /// Closes the listener and every open connection, then waits for the accept task to end.
     pub async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -279,7 +292,7 @@ pub(crate) fn json_response(status: u16, body: &serde_json::Value) -> Response {
 
 pub(crate) fn full_body(bytes: Bytes) -> Body {
     use http_body_util::BodyExt;
-    http_body_util::Full::new(bytes).boxed()
+    http_body_util::Full::new(bytes).map_err(|e| match e {}).boxed()
 }
 
 /// Status, headers and `body` for `err`; shared by every protocol, which only differ in `body`.

@@ -107,11 +107,9 @@ pub fn wire(target: &str, endpoint: &str) -> Result<WireOutput, String> {
             WireOutput {
                 env: env(&[("OPENCODE_CONFIG_CONTENT", &config.to_string())]),
                 files: vec![("opencode.json".into(), pretty(&config))],
-                snippet: format!(
-                    "# opencode.json (project root or ~/.config/opencode/):\n{}\
-                     # Or pass the same JSON without a file: export OPENCODE_CONFIG_CONTENT='<compact JSON>'\n",
-                    pretty(&config)
-                ),
+                snippet: "# Save opencode.json in the project root or ~/.config/opencode/, or use the \
+                          OPENCODE_CONFIG_CONTENT variable above (the same JSON, compact).\n"
+                    .to_owned(),
             }
         }
         "pi" => {
@@ -169,7 +167,9 @@ fn codex_toml(e: &str) -> String {
          [model_providers.fakellm]\n\
          name = \"fakellm\"\n\
          base_url = \"{e}/v1\"\n\
-         env_key = \"FAKELLM_API_KEY\"\n\
+         # env_key is optional: with it codex sends that variable as the bearer token and refuses to\n\
+         # start when it is unset. Only needed when fakellm runs with --api-key.\n\
+         # env_key = \"FAKELLM_API_KEY\"\n\
          wire_api = \"responses\"\n\
          request_max_retries = 0\n\
          stream_max_retries = 0\n\
@@ -198,6 +198,22 @@ fn pretty(v: &Value) -> String {
 
 fn shell_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', r"'\''"))
+}
+
+/// The raw contents of the generated file called `name` (`--file`); the error lists the names.
+pub fn file<'a>(out: &'a WireOutput, name: &str) -> Result<&'a str, String> {
+    out.files
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, text)| text.as_str())
+        .ok_or_else(|| {
+            let names: Vec<&str> = out.files.iter().map(|(n, _)| n.as_str()).collect();
+            if names.is_empty() {
+                format!("this target has no files, so there is no {name:?}")
+            } else {
+                format!("no file {name:?}, expected one of: {}", names.join(", "))
+            }
+        })
 }
 
 /// Renders `out` for the CLI in `format`.
@@ -267,7 +283,8 @@ mod tests {
             vec![(
                 "config.toml".to_owned(),
                 "model = \"gpt-5.5\"\nmodel_provider = \"fakellm\"\n\n[model_providers.fakellm]\nname = \"fakellm\"\n\
-                 base_url = \"http://127.0.0.1:4010/v1\"\nenv_key = \"FAKELLM_API_KEY\"\nwire_api = \"responses\"\n\
+                 base_url = \"http://127.0.0.1:4010/v1\"\n# env_key is optional: with it codex sends that variable as the bearer token and refuses to\n\
+                 # start when it is unset. Only needed when fakellm runs with --api-key.\n# env_key = \"FAKELLM_API_KEY\"\nwire_api = \"responses\"\n\
                  request_max_retries = 0\nstream_max_retries = 0\nstream_idle_timeout_ms = 5000\n"
                     .to_owned()
             )]

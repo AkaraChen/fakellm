@@ -1,2 +1,6 @@
 /target
-/sdk/node/node_modules
+node_modules/
+dist/
+target/
+*.node
+*.tgz

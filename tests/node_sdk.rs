@@ -1,5 +1,5 @@
 //! Runs the official-SDK suite in `sdk/node` (openai, Anthropic and Vercel AI SDK suites: chat, Responses, Messages) against the freshly built binary.
-//! Skipped when `node_modules` is missing or `node` is not installed.
+//! Skipped when `node_modules` or the built `sdk/js/dist` is missing, or `node` is not installed.
 
 use std::path::Path;
 use std::process::Command;
@@ -9,6 +9,10 @@ fn official_node_sdks() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk/node");
     if !dir.join("node_modules").exists() {
         eprintln!("skip: sdk/node/node_modules missing (run `npm ci` in sdk/node)");
+        return;
+    }
+    if !Path::new(env!("CARGO_MANIFEST_DIR")).join("sdk/js/dist/index.js").exists() {
+        eprintln!("skip: sdk/js/dist missing (run `npm ci && npm run build` in sdk/js)");
         return;
     }
     if Command::new("node").arg("--version").output().is_err() {

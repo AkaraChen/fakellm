@@ -6,7 +6,6 @@
 //! writes them. That keeps ttft, token interval and `cut_after_chunks` identical for Chat,
 //! Responses and Messages. See docs/m1-spec.md ("Shared SSE writer").
 
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -15,9 +14,9 @@ use http_body_util::{BodyExt, StreamBody};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::Response;
 use crate::clock::Clock;
 use crate::ir::Delivery;
+use crate::{BoxError, Response};
 
 /// How a frame is paced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,10 +73,16 @@ impl Frame {
 /// Messages and Responses pass `None`).
 ///
 /// `delivery.cut_after_chunks == Some(n)`: after `n` content frames have been written, stop at
-/// the next non-`Head` frame: no more frames, no sentinel, a clean end of the chunked body (not a
-/// socket reset). If the frames hold fewer than `n` content frames the cut never fires and
+/// the next non-`Head` frame: no more frames, no sentinel, a clean end of the chunked body (not an
+/// aborted connection). If the frames hold fewer than `n` content frames the cut never fires and
 /// everything including the sentinel is sent; with exactly `n`, the frames after the last content
 /// frame (finish chunk, sentinel) are dropped. Same rule as the old `openai::stream::respond`.
+///
+/// `delivery.reset_after_chunks == Some(n)` fires at the same point as the cut, but instead of ending
+/// the body the stream yields an error, which makes hyper drop the connection without the
+/// terminating chunk. The socket is closed with a FIN, not an RST, so clients see "premature close" /
+/// "terminated" / "unexpected EOF" / an incomplete chunked body, usually not ECONNRESET. If both
+/// are set, whichever threshold is lower wins (reset on a tie).
 ///
 /// Writing stops as soon as the client disconnects, even while parked on the clock. Deadlines are
 /// absolute server-clock times fixed when this is called.
@@ -91,18 +96,20 @@ pub fn respond(
     headers: Vec<(String, String)>,
     done_sentinel: Option<&'static str>,
 ) -> Response {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<Bytes, BoxError>>();
     let start = clock.now();
     tokio::spawn(async move {
         tokio::select! {
             () = tx.closed() => {}
-            () = run(&clock, start, &delivery, &frames, done_sentinel, |bytes| tx.send(bytes).is_ok()) => {}
+            reset = run(&clock, start, &delivery, &frames, done_sentinel, |bytes| tx.send(Ok(bytes)).is_ok()) => {
+                if reset {
+                    settle().await;
+                    let _ = tx.send(Err("fakellm: connection dropped".into()));
+                }
+            }
         }
     });
-    let stream = futures::stream::poll_fn(move |cx| {
-        rx.poll_recv(cx)
-            .map(|o| o.map(|b| Ok::<_, Infallible>(hyper::body::Frame::data(b))))
-    });
+    let stream = futures::stream::poll_fn(move |cx| rx.poll_recv(cx).map(|o| o.map(|r| r.map(hyper::body::Frame::data))));
     let mut builder = http::Response::builder()
         .status(200)
         .header(http::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
@@ -116,6 +123,7 @@ pub fn respond(
 }
 
 /// Walks the frames on the clock, handing each to `send`; stops when `send` returns false.
+/// Returns true when the stream must now be reset instead of ended.
 async fn run(
     clock: &Clock,
     start: SystemTime,
@@ -123,15 +131,28 @@ async fn run(
     frames: &[Frame],
     done_sentinel: Option<&str>,
     mut send: impl FnMut(Bytes) -> bool,
-) {
+) -> bool {
     // The deadline of the previous content frame, or the first deadline until one was sent.
     let mut deadline = start.checked_add(delivery.ttft).unwrap_or(start);
     clock.wait_until(deadline).await;
-    let cut = delivery.cut_after_chunks;
+    // `reset: true` on a stream resets at the first non-Head frame, like `reset_after_chunks: 0`.
+    let (cut, reset) = (
+        delivery.cut_after_chunks,
+        delivery.reset_after_chunks.or(delivery.reset.then_some(0)),
+    );
+    let limit = match (cut, reset) {
+        (Some(c), Some(r)) => Some((c.min(r), r <= c)),
+        (Some(c), None) => Some((c, false)),
+        (None, Some(r)) => Some((r, true)),
+        (None, None) => None,
+    };
     let mut content_sent = 0usize;
     for frame in frames {
-        if frame.kind != FrameKind::Head && cut.is_some_and(|n| content_sent >= n) {
-            return;
+        if let Some((n, is_reset)) = limit
+            && frame.kind != FrameKind::Head
+            && content_sent >= n
+        {
+            return is_reset;
         }
         if frame.kind == FrameKind::Content {
             if content_sent > 0 {
@@ -143,12 +164,35 @@ async fn run(
             content_sent += 1;
         }
         if !send(frame.encode()) {
-            return;
+            return false;
         }
     }
     if let Some(s) = done_sentinel {
         send(Bytes::from(format!("data: {s}\n\n")));
     }
+    false
+}
+
+/// Turns a finished sync response into one whose headers go out and whose body then fails: half
+/// of the bytes are written, then the connection is closed under the declared `content-length`.
+/// Headers (200) are already on the wire by then, so clients see a transport error mid-body, never
+/// an HTTP error status.
+pub async fn reset_body(resp: Response) -> Response {
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
+    let head = bytes.slice(..bytes.len() / 2);
+    let stream = futures::stream::once(async move { Ok::<_, BoxError>(hyper::body::Frame::data(head)) });
+    let failure = futures::stream::once(async {
+        settle().await;
+        Err::<hyper::body::Frame<Bytes>, BoxError>("fakellm: connection dropped".into())
+    });
+    http::Response::from_parts(parts, StreamBody::new(futures::StreamExt::chain(stream, failure)).boxed())
+}
+
+/// hyper only flushes written bytes when the body is pending; failing the body in the same poll
+/// would discard the headers and frames still in its buffer. A short real sleep lets them out.
+async fn settle() {
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 }
 
 #[cfg(test)]

@@ -60,6 +60,9 @@ pub struct Match {
     /// Regex over the text of the trailing tool results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result_contains: Option<Pattern>,
+    /// The trailing tool results include one answering the tool call with exactly this id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_call_id: Option<String>,
     /// Streaming requests only (`true`) or sync only (`false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
@@ -132,6 +135,27 @@ pub struct StreamSpec {
     /// Drop the connection after this many content chunks, without finishing the stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cut_after_chunks: Option<usize>,
+    /// Like `cut_after_chunks`, but the TCP connection dies without the terminating chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_after_chunks: Option<usize>,
+}
+
+/// Token counts that replace the tokenizer's for the fields given; the others are still computed.
+/// Both providers' spellings are accepted.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "input_tokens")]
+    pub prompt_tokens: Option<u32>,
+    /// Total output, reasoning included.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "output_tokens")]
+    pub completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "cache_read_tokens")]
+    pub cached_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "cache_creation_input_tokens")]
+    pub cache_creation_tokens: Option<u32>,
 }
 
 /// What to answer. Exactly one of `text`/`tool_calls` (together is fine) or `error` must be set.
@@ -166,6 +190,12 @@ pub struct ReplySpec {
     /// The thinking `signature` / reasoning `encrypted_content` to send with `reasoning`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_opaque: Option<String>,
+    /// Token counts reported instead of the tokenizer's, for the fields given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageSpec>,
+    /// Sync responses: headers, half the body, then the connection dies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -421,6 +451,11 @@ impl Compiled {
         {
             return false;
         }
+        if let Some(id) = &m.last_tool_call_id
+            && !req.trailing_tool_results().iter().any(|r| r.tool_call_id == Some(id.as_str()))
+        {
+            return false;
+        }
         if let Some(b) = m.stream
             && b != req.stream
         {
@@ -510,10 +545,16 @@ impl Scripts {
     /// The first unexhausted rule matching `req`, counting the hit. Returns the rule's index and a
     /// clone of its reply spec.
     pub fn resolve(&self, req: &Request) -> Option<(usize, Option<String>, ReplySpec)> {
+        self.resolve_where(req, |_| true)
+    }
+
+    /// Like [`Scripts::resolve`], but rules whose reply fails `accept` are skipped entirely: they
+    /// are not reached and keep their hit budget.
+    pub fn resolve_where(&self, req: &Request, accept: impl Fn(&ReplySpec) -> bool) -> Option<(usize, Option<String>, ReplySpec)> {
         let mut inner = self.inner.lock();
         let mut found = None;
         for (index, c) in inner.iter_mut().enumerate() {
-            if !c.exhausted() && c.matches(req) {
+            if !c.exhausted() && accept(&c.rule.reply) && c.matches(req) {
                 found = Some((index, c));
                 break;
             }
@@ -566,6 +607,9 @@ impl Engine {
             if s.cut_after_chunks.is_some() {
                 delivery.cut_after_chunks = s.cut_after_chunks;
             }
+            if s.reset_after_chunks.is_some() {
+                delivery.reset_after_chunks = s.reset_after_chunks;
+            }
         } else if let Some(ms) = spec.delay_ms {
             delivery.ttft = Duration::from_millis(ms);
         }
@@ -575,6 +619,7 @@ impl Engine {
             (Some(true), None) => Some(None),
             _ => None,
         };
+        delivery.reset = spec.reset.unwrap_or(false);
         let outcome = Self::answer(req, spec, delivery, source);
         match hang {
             Some(until) => Outcome::Hang {
@@ -585,9 +630,26 @@ impl Engine {
         }
     }
 
+    /// The `input_tokens` of `POST /v1/messages/count_tokens`: the first rule that matches and
+    /// sets `usage.prompt_tokens` (counting its hit), else the tokenizer's count. Rules without
+    /// that field are skipped so a count call never eats the budget of the rule meant for the
+    /// real request.
+    pub fn count_input_tokens(&self, req: &Request) -> u32 {
+        self.scripts
+            .resolve_where(req, |r| r.usage.as_ref().is_some_and(|u| u.prompt_tokens.is_some()))
+            .and_then(|(_, _, spec)| spec.usage?.prompt_tokens)
+            .unwrap_or_else(|| tokenizer::count_request(req))
+    }
+
     fn answer(req: &Request, spec: ReplySpec, mut delivery: Delivery, source: Source) -> Outcome {
         if let Some(e) = spec.error {
             let mut error = ApiError::for_status_in(req.protocol, e.status);
+            if e.status == 404 {
+                error = match req.protocol {
+                    Protocol::AnthropicMessages => error.with_message(format!("model: {}", req.model)),
+                    _ => ApiError::model_not_found(&req.model),
+                };
+            }
             if let Some(k) = e.kind {
                 error.kind = k;
             }
@@ -650,10 +712,15 @@ impl Engine {
         } else {
             FinishReason::Stop
         });
-        let reasoning_tokens = spec.reasoning.as_deref().map_or(0, tokenizer::count);
-        let completion_tokens = text.as_deref().map_or(0, tokenizer::count)
-            + tool_calls.iter().map(|c| tokenizer::count(&c.arguments)).sum::<u32>()
-            + reasoning_tokens;
+        let over = spec.usage.unwrap_or_default();
+        let reasoning_tokens = over
+            .reasoning_tokens
+            .unwrap_or_else(|| spec.reasoning.as_deref().map_or(0, tokenizer::count));
+        let completion_tokens = over.completion_tokens.unwrap_or_else(|| {
+            text.as_deref().map_or(0, tokenizer::count)
+                + tool_calls.iter().map(|c| tokenizer::count(&c.arguments)).sum::<u32>()
+                + reasoning_tokens
+        });
         let reply = Reply {
             text,
             tool_calls,
@@ -662,11 +729,11 @@ impl Engine {
             refusal: None,
             finish,
             usage: Usage {
-                prompt_tokens: tokenizer::count_request(req),
+                prompt_tokens: over.prompt_tokens.unwrap_or_else(|| tokenizer::count_request(req)),
                 completion_tokens,
                 reasoning_tokens,
-                cached_tokens: 0,
-                cache_creation_tokens: 0,
+                cached_tokens: over.cached_tokens.unwrap_or(0),
+                cache_creation_tokens: over.cache_creation_tokens.unwrap_or(0),
             },
         };
         Outcome::Reply { reply, delivery, source }

@@ -1,0 +1,168 @@
+name: node
+
+# Builds the Node.js addon (bindings/node) for four Linux targets and tests each build with
+# the openai and Anthropic SDKs. Runs on changes to the binding or the library.
+#
+# npm publishing only happens on an explicit trigger: a `v*` tag push, or a manual dispatch with
+# `publish: true`. Otherwise the publish job runs `npm publish --dry-run`, which checks the package
+# layout without uploading anything. Without an NPM_TOKEN secret it falls back to the dry run too.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: &paths
+      - "bindings/node/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/node.yml"
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to npm (dry run when false)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on 22.04 so the glibc requirement stays at 2.35.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            alpine: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            alpine: true
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: bindings/node
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        if: ${{ !matrix.alpine }}
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.alpine }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.alpine }}
+        with:
+          workspaces: bindings/node
+
+      - name: Build and test
+        if: ${{ !matrix.alpine }}
+        run: |
+          npm ci
+          npx napi build --platform --release -- --locked
+          npm test
+
+      # musl builds and runs inside Alpine so the test exercises the addon on the libc it targets.
+      - name: Build and test (Alpine)
+        if: ${{ matrix.alpine }}
+        run: |
+          # napi defaults to a cross linker name on aarch64 musl; Alpine's native cc is the right one.
+          docker run --rm -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            -v "$PWD/../..:/work" -w /work/bindings/node node:24-alpine sh -euxc '
+            apk add --no-cache build-base perl linux-headers rustup
+            rustup-init -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+            export RUSTFLAGS="-C target-feature=-crt-static"
+            npm ci
+            npx napi build --platform --release -- --locked
+            npm test
+          '
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: addon-${{ matrix.target }}
+          path: bindings/node/*.node
+          if-no-files-found: error
+
+      # The generated loader and type declarations are the same for every target.
+      - uses: actions/upload-artifact@v7
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        with:
+          name: js
+          path: |
+            bindings/node/index.js
+            bindings/node/index.d.ts
+          if-no-files-found: error
+
+      - name: Show generated types
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cat index.d.ts
+
+  publish:
+    needs: build
+    if: github.event_name != 'pull_request' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: bindings/node
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci --ignore-scripts
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: bindings/node/artifacts
+          pattern: addon-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: js
+          path: bindings/node
+
+      - name: Tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+
+      - name: Lay out the platform packages
+        run: |
+          npx napi create-npm-dirs
+          npx napi artifacts -d artifacts
+          find npm -name '*.node'
+
+      - name: Publish (or dry run)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          REAL: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.publish) && secrets.NPM_TOKEN != '' }}
+        run: |
+          flag=--dry-run
+          if [ "$REAL" = true ]; then
+            flag=
+            export NPM_CONFIG_PROVENANCE=true NPM_CONFIG_ACCESS=public
+          fi
+          echo "publishing with flags: ${flag:-<none>}"
+          # Platform packages first; this also pins them as optionalDependencies of the main one.
+          # (Not a prepublishOnly script: npm runs those for --dry-run too.)
+          npx napi prepublish -t npm $flag --no-gh-release
+          npm publish $flag

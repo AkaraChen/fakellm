@@ -109,7 +109,8 @@ $ curl -X POST "$E/_fakellm/reset?clock=false&requests=false"
 
 默认清空四样东西：剧本（包括命中计数）、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项。
 
-- 挂起（`hang`）、错误延迟或同步回复延迟期间客户端断开的请求，会以 `status: 0` 记入日志；如果期间发生过清空请求日志的 `reset`，这条记录会被丢弃，不会污染新的日志。`reset` 不会唤醒已挂起的请求（它们按旧时钟算的截止时间继续等待）。
+- 挂起（`hang`）的请求一被挂住就以 `status: 0`、`hung: true` 记入日志，放行或客户端放弃时原地更新；错误延迟或同步回复延迟期间客户端断开的请求，以 `status: 0` 记入日志。如果期间发生过清空请求日志的 `reset`，这些记录会被丢弃，不会污染新的日志。
+- `reset` 会唤醒所有挂起的请求：有 `hang_ms` 的按规则的其余部分回答，只写 `hang: true` 的回 503。
 - 只有 `requests` 和 `responses` 同时清空时，响应 id 的计数才归零；否则重放同一个请求会得到相同的 `resp_` id，覆盖旧对象。
 - 请求日志的序号 `seq` 不会因为清空而归零，`dropped` 计数也不清。
 - 不会清空的东西：启动时的配置（`--strict`、`--models`、`--fallback-tokens`、`--ttft` 等），以及日志的 `enabled` / `capacity` 设置。
@@ -144,7 +145,7 @@ $ curl $E/v1/responses -d '{"model":"m","input":"x","previous_response_id":"resp
 
 ### 剧本
 
-`PUT` 替换全部规则（默认命中计数清零，加 `?keep_hits=true` 则按位置保留已有规则的计数），`POST` 追加到末尾，请求体是规则数组或 `{"rules": [...]}`。`Content-Type` 是 `application/yaml`、`text/yaml` 或 `application/x-yaml` 时按 YAML 解析，否则看内容：以 `[` 或 `{` 开头按 JSON，其他按 YAML。规则格式见 [scripts.md](scripts.md)。
+`PUT` 替换全部规则（默认命中计数清零，加 `?keep_hits=true` 则按位置保留已有规则的计数），`POST` 追加到末尾，请求体是规则数组或 `{"rules": [...]}`。`Content-Type` 是 `application/yaml`、`text/yaml` 或 `application/x-yaml` 时按 YAML 解析，否则看内容：以 `[` 或 `{` 开头按 JSON，其他按 YAML。规则格式见 [scripts.md](scripts.md)。响应是 `{"added": n, "count": m}`。`GET /_fakellm/responses` 返回 `{"responses": [...], "count": n}`，`count` 等于数组长度。
 
 ```
 $ curl -X PUT $E/_fakellm/scripts -d '[{"name":"x","match":{"last_user":"ping"},"reply":{"text":"pong"}}]'
@@ -166,7 +167,7 @@ $ curl -X DELETE $E/_fakellm/scripts
 $ curl -X PUT $E/_fakellm/scripts -d '[{"reply":{}}]'
 {"error":{"code":"BadRequest","message":"rule 0: reply needs `text`, `tool_calls` or `error`"}}
 $ curl -X PUT $E/_fakellm/scripts -d '[{"match":{"bogus":1},"reply":{"text":"x"}}]'
-{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`"}}
+{"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `last_tool_call_id`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`"}}
 ```
 
 ### 时钟
@@ -229,7 +230,8 @@ $ curl "$E/_fakellm/requests?full=true&limit=1"
 | `seq` | 到达顺序，从 1 开始，`reset` / 清空后继续增长 |
 | `time` | 请求到达时的服务器时间 |
 | `method`、`path` | 方法，和带查询串的路径（原样） |
-| `status` | 响应状态码；`0` 表示没有发出任何响应：请求被 `hang` / `hang_ms` 挂住，客户端先放弃了。这样的记录在客户端断开时才写入，`reply` 里有 `hang` 字段 |
+| `status` | 响应状态码；`0` 表示还没有（或永远不会有）响应：请求正被 `hang` / `hang_ms` 挂住，或客户端先放弃了。`reply` 里有 `hang` 字段 |
+| `hung` | `true`：请求此刻正被 `hang` / `hang_ms` 挂住。放行或客户端断开后变回 `false`，`status` 和 `latency_us` 随之更新 |
 | `latency_us` | 从到达到响应头就绪，微秒（真实时间；流的 body 不计，被时钟挂住的同步响应要等放行后才记录，包含等待） |
 | `protocol` | `openai.chat`、`openai.responses` 或 `anthropic.messages`；body 解析失败时为 `null` |
 | `model`、`stream` | 请求的模型名和是否流式；没有解析出请求时为 `null` / `false` |

@@ -11,7 +11,7 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -22,33 +22,67 @@ jobs:
 
   node:
     runs-on: ubuntu-24.04
+    env:
+      FAKELLM_BIN: ${{ github.workspace }}/target/debug/fakellm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      - uses: oven-sh/setup-bun@v2
       - run: cargo build
+      - run: npm ci && npm run build
+        working-directory: sdk/js
       - run: npm ci
         working-directory: sdk/node
       - run: npm test
+        working-directory: sdk/js
+      - run: bun test
+        working-directory: sdk/js
+      - run: npm test
         working-directory: sdk/node
+      # bun runs the node:test files unchanged
+      - run: bun test
+        working-directory: sdk/node
+
+  go:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go/go.mod
+      - run: cargo build
+      - run: go vet ./...
+        working-directory: go
+      - run: go test ./...
+        working-directory: go
         env:
           FAKELLM_BIN: ${{ github.workspace }}/target/debug/fakellm
 
-  bun:
+  napi-bun:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/node
       - uses: oven-sh/setup-bun@v2
-      - run: cargo build
+      # the Node build and test matrix is in node.yml; this checks the addon loads under Bun
       - run: bun install
-        working-directory: sdk/node
-      # bun test runs the node:test files unchanged
-      - run: bun test
-        working-directory: sdk/node
-        env:
-          FAKELLM_BIN: ${{ github.workspace }}/target/debug/fakellm
+        working-directory: bindings/node
+      - run: bun run build:debug
+        working-directory: bindings/node
+      - run: bun test __test__/openai.test.mjs
+        working-directory: bindings/node
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./e2e/docker.sh

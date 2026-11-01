@@ -1,0 +1,253 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import { createRequire } from 'node:module'
+import OpenAI from 'openai'
+import Anthropic from '@anthropic-ai/sdk'
+
+const { start } = createRequire(import.meta.url)('../index.js')
+
+async function withServer(options, fn) {
+  const server = await start(options)
+  try {
+    await fn(server)
+  } finally {
+    await server.stop()
+  }
+}
+
+const openai = (server) => new OpenAI({ baseURL: server.baseUrl, apiKey: 'test', maxRetries: 0 })
+const anthropic = (server) => new Anthropic({ baseURL: server.anthropicBaseUrl, apiKey: 'test', maxRetries: 0 })
+
+test('addresses', () =>
+  withServer(undefined, (s) => {
+    assert.match(s.endpoint, /^http:\/\/127\.0\.0\.1:\d+$/)
+    assert.equal(s.baseUrl, `${s.endpoint}/v1`)
+    assert.equal(s.anthropicBaseUrl, s.endpoint)
+    assert.equal(s.host, '127.0.0.1')
+    assert.notEqual(s.port, 0)
+  }))
+
+test('openai sync and stream with a scripted rule', () =>
+  withServer({ scripts: [{ match: { last_user: 'ping' }, reply: { text: 'pong' } }] }, async (s) => {
+    const c = openai(s)
+    const r = await c.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'ping' }] })
+    assert.equal(r.choices[0].message.content, 'pong')
+
+    const stream = await c.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'ping' }],
+      stream: true,
+    })
+    let text = ''
+    for await (const chunk of stream) text += chunk.choices[0]?.delta?.content ?? ''
+    assert.equal(text, 'pong')
+  }))
+
+test('openai responses', () =>
+  withServer(undefined, async (s) => {
+    await s.scripts.put([{ reply: { text: 'from responses' } }])
+    const r = await openai(s).responses.create({ model: 'gpt-4o', input: 'hi' })
+    assert.equal(r.output_text, 'from responses')
+    assert.equal(s.requests.list({ protocol: 'openai.responses' }).length, 1)
+  }))
+
+test('anthropic sync and stream', () =>
+  withServer({ scripts: '- reply: {text: "claude says hi"}' }, async (s) => {
+    const c = anthropic(s)
+    const m = await c.messages.create({ model: 'claude-sonnet-4-5', max_tokens: 64, messages: [{ role: 'user', content: 'x' }] })
+    assert.equal(m.content[0].text, 'claude says hi')
+
+    const stream = c.messages.stream({ model: 'claude-sonnet-4-5', max_tokens: 64, messages: [{ role: 'user', content: 'x' }] })
+    assert.equal((await stream.finalMessage()).content[0].text, 'claude says hi')
+  }))
+
+test('scripts put / add / list / clear, with hit counts and times', () =>
+  withServer(undefined, async (s) => {
+    assert.deepEqual(s.scripts.put([{ name: 'once', times: 1, reply: { text: 'first' } }]), { added: 1, count: 1 })
+    assert.deepEqual(s.scripts.add('[{"name":"rest","reply":{"text":"later"}}]'), { added: 1, count: 2 })
+    const c = openai(s)
+    const ask = async () => (await c.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'q' }] })).choices[0].message.content
+    assert.equal(await ask(), 'first')
+    assert.equal(await ask(), 'later')
+    const rules = s.scripts.list()
+    assert.deepEqual(rules.map((r) => [r.name, r.hits, r.exhausted]), [['once', 1, true], ['rest', 1, false]])
+    s.scripts.clear()
+    assert.deepEqual(s.scripts.list(), [])
+    assert.throws(() => s.scripts.put([{ reply: {} }]), /./)
+  }))
+
+test('scripted error becomes an SDK error', () =>
+  withServer(undefined, async (s) => {
+    s.scripts.put([{ reply: { error: { status: 429, message: 'slow down' } } }])
+    await assert.rejects(
+      openai(s).chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x' }] }),
+      (e) => e instanceof OpenAI.APIError && e.status === 429,
+    )
+    assert.equal(s.requests.count({ status: '4xx' }), 1)
+  }))
+
+test('request log: list, filter, count, clear', () =>
+  withServer(undefined, async (s) => {
+    const c = openai(s)
+    await c.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'one' }] })
+    await c.chat.completions.create({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'two' }], stream: true }).then(async (st) => {
+      for await (const _ of st);
+    })
+    const all = s.requests.list()
+    assert.equal(all.length, 2)
+    assert.equal(all[0].path, '/v1/chat/completions')
+    assert.equal(all[0].protocol, 'openai.chat')
+    assert.equal(all[0].request.messages.at(-1).content[0].text, 'one')
+    assert.equal(s.requests.count({ stream: true }), 1)
+    assert.deepEqual(s.requests.list({ model: 'gpt-4o-mini' }).map((r) => r.model), ['gpt-4o-mini'])
+    assert.equal(s.requests.list({ limit: 1 })[0].seq, all[1].seq)
+    assert.ok(s.requests.list({ full: true })[0].headers.length > 0)
+    s.requests.clear()
+    assert.equal(s.requests.count(), 0)
+  }))
+
+test('clock gating: a frozen clock holds the reply until advanced', () =>
+  withServer({ scripts: [{ reply: { text: 'late', delay_ms: 60000 } }] }, async (s) => {
+    const start = s.clock.now()
+    s.clock.freeze()
+    assert.equal(s.clock.isFrozen(), true)
+    const pending = openai(s).chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x' }] })
+    let done = false
+    pending.then(() => (done = true), () => (done = true))
+    await new Promise((r) => setTimeout(r, 300))
+    assert.equal(done, false)
+    s.clock.advance('61s')
+    assert.equal((await pending).choices[0].message.content, 'late')
+    assert.ok(s.clock.now() - start >= 60000)
+
+    s.clock.set(new Date('2030-01-01T00:00:00Z'))
+    assert.equal(s.clock.now().toISOString(), '2030-01-01T00:00:00.000Z')
+    s.clock.unfreeze()
+    assert.equal(s.clock.isFrozen(), false)
+    s.clock.reset()
+    assert.equal(s.clock.isShifted(), false)
+    const st = s.clock.freeze(new Date('2031-01-01T00:00:00Z'))
+    assert.deepEqual({ ...st, now: st.now.toISOString() }, { now: '2031-01-01T00:00:00.000Z', frozen: true, shifted: true })
+    assert.equal(s.clock.advance(1000).now.toISOString(), '2031-01-01T00:00:01.000Z')
+    assert.equal(s.clock.state().frozen, true)
+    assert.equal(s.clock.reset().shifted, false)
+  }))
+
+test('responses list / clear and reset options', () =>
+  withServer(undefined, async (s) => {
+    const c = openai(s)
+    await c.responses.create({ model: 'gpt-4o', input: 'hi' })
+    assert.equal(s.responses.list().length, 1)
+    assert.equal(s.responses.clear(), 1)
+    assert.equal(s.responses.list().length, 0)
+
+    s.scripts.put([{ reply: { text: 'kept' } }])
+    await c.responses.create({ model: 'gpt-4o', input: 'hi' })
+    s.reset({ scripts: false })
+    assert.equal(s.scripts.list().length, 1)
+    assert.equal(s.requests.count(), 0)
+    assert.equal(s.responses.list().length, 0)
+    s.reset()
+    assert.equal(s.scripts.list().length, 0)
+  }))
+
+test('options: apiKey, strict, models, redactAuth', () =>
+  withServer({ apiKey: 'secret', strict: true, models: ['m1', 'm2'], redactAuth: true }, async (s) => {
+    await assert.rejects(
+      new OpenAI({ baseURL: s.baseUrl, apiKey: 'wrong', maxRetries: 0 }).models.list(),
+      (e) => e.status === 401,
+    )
+    const c = new OpenAI({ baseURL: s.baseUrl, apiKey: 'secret', maxRetries: 0 })
+    const ids = []
+    for await (const m of c.models.list()) ids.push(m.id)
+    assert.deepEqual(ids, ['m1', 'm2'])
+    await assert.rejects(
+      c.chat.completions.create({ model: 'm1', messages: [{ role: 'user', content: 'x' }] }),
+      (e) => e.status === 400 && e.code === 'fakellm_no_matching_rule',
+    )
+    const rec = s.requests.list({ full: true }).at(-1)
+    assert.ok(rec.headers.some(([k, v]) => k === 'authorization' && v === '<redacted>'))
+  }))
+
+test('options: ttft delays the first token on the server clock', () =>
+  withServer({ ttft: '300ms', tokensPerSec: 1000 }, async (s) => {
+    const t0 = Date.now()
+    await openai(s).chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x' }] })
+    assert.ok(Date.now() - t0 >= 250)
+  }))
+
+test('wire', () =>
+  withServer(undefined, (s) => {
+    const w = s.wire('claude')
+    assert.equal(w.env.ANTHROPIC_BASE_URL, s.endpoint)
+    assert.throws(() => s.wire('nope'), /unknown target/)
+  }))
+
+test('requestLog: false records nothing; stop is idempotent and makes calls fail', async () => {
+  const s = await start({ requestLog: false })
+  await openai(s).chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x' }] })
+  assert.equal(s.requests.count(), 0)
+  await s.stop()
+  await s.stop()
+  assert.throws(() => s.scripts.list(), /stopped/)
+})
+
+test('servers are independent', async () => {
+  const [a, b] = await Promise.all([start(), start()])
+  try {
+    assert.notEqual(a.port, b.port)
+    a.scripts.put([{ reply: { text: 'a' } }])
+    assert.equal(b.scripts.list().length, 0)
+  } finally {
+    await Promise.all([a.stop(), b.stop()])
+  }
+})
+
+test('status, requests.config and wire format', () =>
+  withServer(undefined, async (s) => {
+    assert.equal(s.status().request_log.enabled, true)
+    assert.deepEqual(s.requests.config({ capacity: 5, enabled: false }).enabled, false)
+    assert.equal(s.requests.config().capacity, 5)
+    assert.throws(() => s.requests.config({ capacity: 0 }), /capacity/)
+    s.requests.config({ enabled: true })
+    await openai(s).chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x' }] })
+    assert.equal(s.requests.config().stored, 1)
+    assert.match(s.wire('claude', 'shell'), /export ANTHROPIC_BASE_URL=/)
+  }))
+
+test('stop closes open connections and hung requests', async () => {
+  const s = await start({ scripts: [{ reply: { text: 'x', hang: true } }] })
+  const pending = fetch(`${s.baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-4o', messages: [{ role: 'user', content: 'x' }] }),
+  }).then(
+    () => 'answered',
+    () => 'failed',
+  )
+  await new Promise((r) => setTimeout(r, 100))
+  await s.stop()
+  assert.ok(['answered', 'failed'].includes(await pending))
+})
+
+test('options: fallbackTokens, chunkTokens and argsChunkBytes reach the config', () =>
+  withServer({ fallbackTokens: 3, chunkTokens: 2 }, async (s) => {
+    const r = await openai(s).chat.completions.create({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
+    assert.equal(r.usage.completion_tokens, 3)
+    let chunks = 0
+    for await (const c of await openai(s).chat.completions.create({ model: 'm', stream: true, messages: [{ role: 'user', content: 'hi' }] })) {
+      if (c.choices[0]?.delta?.content) chunks++
+    }
+    assert.equal(chunks, 2)
+  }))
+
+test('a server that is garbage-collected stops listening', async (t) => {
+  if (typeof globalThis.gc !== 'function') return t.skip('needs node --expose-gc')
+  const url = await (async () => (await start()).baseUrl)()
+  for (let i = 0; i < 20; i++) {
+    globalThis.gc()
+    await new Promise((r) => setTimeout(r, 20))
+    if (await fetch(`${url}/models`).then(() => false, () => true)) return
+  }
+  assert.fail('server still listening after GC')
+})

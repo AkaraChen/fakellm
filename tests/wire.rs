@@ -51,3 +51,27 @@ fn errors() {
     assert!(wire::format(&wire::wire("claude", E).unwrap(), Format::Toml).is_err());
     assert!("xml".parse::<Format>().is_err());
 }
+
+#[test]
+fn file_prints_one_generated_file_and_opencode_is_not_duplicated() {
+    let pi = wire::wire("pi", E).unwrap();
+    let models: Value = serde_json::from_str(wire::file(&pi, "models.json").unwrap()).unwrap();
+    assert_eq!(models["providers"]["fakellm"]["baseUrl"], "http://127.0.0.1:4010/v1");
+    let err = wire::file(&pi, "x.json").unwrap_err();
+    assert!(err.contains("models.json"), "{err}");
+    assert!(wire::file(&wire::wire("claude", E).unwrap(), "a").is_err());
+    let codex = wire::wire("codex", E).unwrap();
+    assert!(wire::file(&codex, "config.toml").unwrap().contains("[model_providers.fakellm]"));
+
+    let oc = wire::wire("opencode", E).unwrap();
+    let shell = wire::format(&oc, Format::Shell).unwrap();
+    assert_eq!(shell.matches("\"$schema\"").count(), 2, "env value plus the file, not three times");
+    assert_eq!(shell.matches("# opencode.json\n").count(), 1);
+}
+
+#[test]
+fn codex_env_key_is_a_comment() {
+    let toml = wire::format(&wire::wire("codex", E).unwrap(), Format::Toml).unwrap();
+    assert!(toml.lines().any(|l| l == "# env_key = \"FAKELLM_API_KEY\""));
+    assert!(!toml.lines().any(|l| l.starts_with("env_key")));
+}

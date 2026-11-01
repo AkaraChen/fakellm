@@ -98,3 +98,102 @@ async fn error_headers_reach_the_response() {
     assert_eq!(r.header("x-should-retry"), Some("true"));
     assert_eq!(r.header("retry-after-ms"), Some("1500"));
 }
+
+/// Raw TCP reader: what a client sees when the connection is reset mid-stream.
+async fn raw_post(s: &fakellm::Server, body: &serde_json::Value) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(s.addr()).await.unwrap();
+    let b = body.to_string();
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{b}",
+        b.len()
+    );
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut out = vec![];
+    // EOF or an error, whichever the abort produces; both end the read.
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut out))
+        .await
+        .expect("connection stayed open");
+    out
+}
+
+#[tokio::test]
+async fn reset_after_chunks_has_no_terminating_chunk() {
+    let s = start().await;
+    put_rules(
+        &s,
+        json!([{"reply": {"text": "one two three four", "stream": {"reset_after_chunks": 2}}}]),
+    )
+    .await;
+    let mut body = chat_body("gpt-4o", "hi");
+    body["stream"] = json!(true);
+    let raw = String::from_utf8_lossy(&raw_post(&s, &body).await).into_owned();
+    assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    assert!(raw.contains("one"), "{raw}");
+    assert!(!raw.contains("[DONE]") && !raw.contains("finish_reason\":\"stop"), "{raw}");
+    assert!(!raw.ends_with("0\r\n\r\n"), "clean chunked end: {raw:?}");
+
+    // The clean cut, for contrast, does end with the terminating chunk.
+    put_rules(
+        &s,
+        json!([{"reply": {"text": "one two three four", "stream": {"cut_after_chunks": 2}}}]),
+    )
+    .await;
+    let raw = String::from_utf8_lossy(&raw_post(&s, &body).await).into_owned();
+    assert!(raw.ends_with("0\r\n\r\n"), "{raw:?}");
+}
+
+#[tokio::test]
+async fn reset_true_also_aborts_streams() {
+    let s = start().await;
+    put_rules(&s, json!([{"reply": {"text": "one two three four", "reset": true}}])).await;
+    let mut body = chat_body("gpt-4o", "hi");
+    body["stream"] = json!(true);
+    let raw = String::from_utf8_lossy(&raw_post(&s, &body).await).into_owned();
+    assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    assert!(!raw.contains("[DONE]") && !raw.ends_with("0\r\n\r\n"), "{raw:?}");
+}
+
+#[tokio::test]
+async fn reset_streams_are_still_logged() {
+    let s = start().await;
+    put_rules(
+        &s,
+        json!([{"reply": {"text": "one two three four", "stream": {"reset_after_chunks": 1}}}]),
+    )
+    .await;
+    let mut body = chat_body("gpt-4o", "hi");
+    body["stream"] = json!(true);
+    raw_post(&s, &body).await;
+    let log = get(&s, "/_fakellm/requests").await.json();
+    assert_eq!(log["requests"].as_array().unwrap().len(), 1, "{log}");
+}
+
+#[tokio::test]
+async fn sync_reset_sends_headers_then_dies() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = start().await;
+    put_rules(&s, json!([{"reply": {"text": "hello there", "reset": true}}])).await;
+    let mut sock = tokio::net::TcpStream::connect(s.addr()).await.unwrap();
+    let b = chat_body("gpt-4o", "hi").to_string();
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: x\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{b}",
+        b.len()
+    );
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut out = vec![];
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut out))
+        .await
+        .expect("connection stayed open");
+    let raw = String::from_utf8_lossy(&out).into_owned();
+    let (head, rest) = raw.split_once("\r\n\r\n").unwrap_or_else(|| panic!("no headers: {raw:?}"));
+    let declared: usize = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length: ")
+                .map(|v| v.trim().parse().unwrap())
+        })
+        .expect("content-length");
+    assert!(head.starts_with("HTTP/1.1 200") && rest.len() < declared, "{raw:?}");
+}

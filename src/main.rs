@@ -99,6 +99,9 @@ enum Cmd {
         /// env, json, toml or shell (default: shell, or toml/json for targets without env vars).
         #[arg(long)]
         format: Option<fakellm::wire::Format>,
+        /// Print one generated file raw (e.g. models.json, config.toml, opencode.json) instead.
+        #[arg(long, conflicts_with = "format", value_name = "NAME")]
+        file: Option<String>,
     },
 }
 
@@ -111,7 +114,12 @@ fn main() -> std::io::Result<std::process::ExitCode> {
                 .build()?
                 .block_on(ctl::run(c)));
         }
-        Some(Cmd::Wire { target, endpoint, format }) => return Ok(run_wire(&target, &endpoint, format)),
+        Some(Cmd::Wire {
+            target,
+            endpoint,
+            format,
+            file,
+        }) => return Ok(run_wire(&target, &endpoint, format, file.as_deref())),
         None => {}
     }
     tracing_subscriber::fmt()
@@ -169,8 +177,11 @@ fn main() -> std::io::Result<std::process::ExitCode> {
 }
 
 /// Prints the client configuration; usage errors exit with 2.
-fn run_wire(target: &str, endpoint: &str, format: Option<fakellm::wire::Format>) -> std::process::ExitCode {
+fn run_wire(target: &str, endpoint: &str, format: Option<fakellm::wire::Format>, file: Option<&str>) -> std::process::ExitCode {
     let result = fakellm::wire::wire(target, endpoint).and_then(|out| {
+        if let Some(name) = file {
+            return fakellm::wire::file(&out, name).map(str::to_owned);
+        }
         let format = format.unwrap_or_else(|| fakellm::wire::default_format(&out));
         fakellm::wire::format(&out, format)
     });

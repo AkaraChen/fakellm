@@ -35,6 +35,8 @@ pub struct Control {
     counter: AtomicU64,
     /// Bumped by every reset; requests parked across one must not write into the cleared log.
     generation: AtomicU64,
+    /// Woken by every reset so that hung requests finish.
+    pub(crate) release: tokio::sync::Notify,
 }
 
 /// What [`Control::reset_with`] clears. Everything is cleared by default.
@@ -103,6 +105,7 @@ impl Control {
             responses: ResponseStore::default(),
             counter: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            release: tokio::sync::Notify::new(),
         })
     }
 
@@ -125,11 +128,64 @@ impl Control {
         if opts.responses {
             self.responses.clear();
         }
+        self.release.notify_waiters();
         // Response ids derive from the counter; restarting it while stored responses survive
         // would let a replayed request overwrite an old entry with the same id.
         if opts.requests && opts.responses {
             self.counter.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// What `GET /_fakellm` returns: version, clock, rule and response counts, strict flag, log settings.
+    pub fn status(&self) -> Value {
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "clock": clock_json(&self.clock),
+            "scripts": { "count": self.engine.scripts.len() },
+            "responses": { "count": self.responses.len() },
+            "strict": self.engine.strict,
+            "request_log": log_config_json(&self.log),
+        })
+    }
+
+    /// What `GET /_fakellm/requests?<query>` returns, for query pairs such as `("status", "4xx")`.
+    pub fn requests_json(&self, query: &[(String, String)]) -> Result<Value, ControlError> {
+        let full = query_flag(query, "full", false)?;
+        let filter = request_filter(query)?;
+        let (rows, total) = self.requests(&filter);
+        Ok(json!({
+            "requests": rows.iter().map(|r| record_json(r, full)).collect::<Vec<_>>(),
+            "total": total,
+            "dropped": self.log.dropped(),
+        }))
+    }
+
+    /// What `GET /_fakellm/responses` returns.
+    pub fn responses_json(&self) -> Value {
+        let items = self.response_ids();
+        json!({
+            "responses": items.iter().map(|(id, at)| json!({ "id": id, "created_at": fmt_unix(*at) })).collect::<Vec<_>>(),
+            "count": items.len(),
+        })
+    }
+
+    /// The request log's `{enabled, capacity, stored, dropped}`.
+    pub fn log_config(&self) -> Value {
+        log_config_json(&self.log)
+    }
+
+    /// Switches the request log on or off and/or resizes it (at least 1), then returns [`Control::log_config`].
+    pub fn set_log_config(&self, enabled: Option<bool>, capacity: Option<usize>) -> Result<Value, ControlError> {
+        if capacity == Some(0) {
+            return Err(ControlError::BadRequest("capacity must be at least 1".into()));
+        }
+        if let Some(on) = enabled {
+            self.log.set_enabled(on);
+        }
+        if let Some(c) = capacity {
+            self.log.set_capacity(c);
+        }
+        Ok(log_config_json(&self.log))
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -217,17 +273,7 @@ impl Control {
         let not_allowed = || Ok(error(405, "MethodNotAllowed", format!("{method} is not allowed on {path}")));
         match segs.as_slice() {
             [""] | [] => match *method {
-                M::GET => Ok(reply(
-                    200,
-                    json!({
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "clock": clock_json(&self.clock),
-                        "scripts": { "count": self.engine.scripts.len() },
-                        "responses": { "count": self.responses.len() },
-                        "strict": self.engine.strict,
-                        "request_log": log_config_json(&self.log),
-                    }),
-                )),
+                M::GET => Ok(reply(200, self.status())),
                 _ => not_allowed(),
             },
             ["reset"] => match *method {
@@ -267,16 +313,7 @@ impl Control {
                 _ => not_allowed(),
             },
             ["responses"] => match *method {
-                M::GET => {
-                    let items = self.response_ids();
-                    Ok(reply(
-                        200,
-                        json!({
-                            "responses": items.iter().map(|(id, at)| json!({ "id": id, "created_at": fmt_unix(*at) })).collect::<Vec<_>>(),
-                            "count": items.len(),
-                        }),
-                    ))
-                }
+                M::GET => Ok(reply(200, self.responses_json())),
                 M::DELETE => Ok(reply(200, json!({ "deleted": self.clear_responses() }))),
                 _ => not_allowed(),
             },
@@ -312,19 +349,7 @@ impl Control {
                 Ok(reply(200, clock_json(&self.clock)))
             }
             ["requests"] => match *method {
-                M::GET => {
-                    let full = query_flag(q, "full", false)?;
-                    let filter = request_filter(q)?;
-                    let (rows, total) = self.requests(&filter);
-                    Ok(reply(
-                        200,
-                        json!({
-                            "requests": rows.iter().map(|r| record_json(r, full)).collect::<Vec<_>>(),
-                            "total": total,
-                            "dropped": self.log.dropped(),
-                        }),
-                    ))
-                }
+                M::GET => Ok(reply(200, self.requests_json(q)?)),
                 M::DELETE => {
                     self.clear_requests();
                     Ok(reply(200, json!({ "cleared": true })))
@@ -332,19 +357,10 @@ impl Control {
                 _ => not_allowed(),
             },
             ["requests", "config"] => match *method {
-                M::GET => Ok(reply(200, log_config_json(&self.log))),
+                M::GET => Ok(reply(200, self.log_config())),
                 M::PUT => {
                     let b: LogConfigBody = parse_body(body)?;
-                    if b.capacity == Some(0) {
-                        return Err(ControlError::BadRequest("capacity must be at least 1".into()));
-                    }
-                    if let Some(on) = b.enabled {
-                        self.log.set_enabled(on);
-                    }
-                    if let Some(c) = b.capacity {
-                        self.log.set_capacity(c);
-                    }
-                    Ok(reply(200, log_config_json(&self.log)))
+                    Ok(reply(200, self.set_log_config(b.enabled, b.capacity)?))
                 }
                 _ => not_allowed(),
             },
@@ -381,7 +397,7 @@ impl From<ControlError> for Response {
     }
 }
 
-fn query_flag(q: &Query, name: &str, default: bool) -> Result<bool, ControlError> {
+fn query_flag(q: &[(String, String)], name: &str, default: bool) -> Result<bool, ControlError> {
     match q.iter().find(|(k, _)| k == name) {
         None => Ok(default),
         Some((_, v)) => parse_flag(name, v),
@@ -422,7 +438,7 @@ struct LogConfigBody {
     capacity: Option<usize>,
 }
 
-fn request_filter(q: &Query) -> Result<RequestFilter, ControlError> {
+fn request_filter(q: &[(String, String)]) -> Result<RequestFilter, ControlError> {
     let mut f = RequestFilter::default();
     for (k, v) in q {
         let bad = |what: &str| ControlError::BadRequest(format!("invalid {k} {v:?}: {what}"));
@@ -537,6 +553,7 @@ pub(crate) fn record_json(r: &RequestRecord, full: bool) -> Value {
         "method": r.method.as_str(),
         "path": r.path,
         "status": r.status,
+        "hung": r.hung,
         "latency_us": r.latency.as_micros() as u64,
         "protocol": r.protocol().map(|p| p.as_str()),
         "model": r.model(),
@@ -575,6 +592,7 @@ mod tests {
             method: http::Method::POST,
             path: "/v1/chat/completions".into(),
             status: 200,
+            hung: false,
             latency: Duration::from_micros(42),
             headers: vec![("x-a".into(), "b".into())],
             raw: Some(Arc::new(json!({"model": "m"}))),

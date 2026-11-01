@@ -468,6 +468,13 @@ pub struct Delivery {
     /// to test stream-recovery code. `None` delivers everything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cut_after_chunks: Option<usize>,
+    /// Like `cut_after_chunks`, but the connection dies abruptly (no terminating chunk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_after_chunks: Option<usize>,
+    /// Abort the connection mid-body: sync responses send headers and half the body; streams reset at
+    /// the first non-head frame (like `reset_after_chunks: 0`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset: bool,
 }
 
 impl Default for Delivery {
@@ -478,6 +485,8 @@ impl Default for Delivery {
             chunk_tokens: 1,
             args_chunk_bytes: 16,
             cut_after_chunks: None,
+            reset_after_chunks: None,
+            reset: false,
         }
     }
 }

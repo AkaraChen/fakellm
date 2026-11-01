@@ -47,10 +47,10 @@ fn model(id: &str) -> Value {
 }
 
 /// The body of `POST /v1/messages/count_tokens`: `{"input_tokens": n}` with `n` from
-/// `tokenizer::count_request(req)`, so it agrees with the `usage.input_tokens` a real call on
-/// the same body would report.
-pub fn count_tokens(req: &Request) -> Value {
-    json!({"input_tokens": crate::tokenizer::count_request(req)})
+/// `Engine::count_input_tokens` (a matching rule's `usage.input_tokens`, else the tokenizer),
+/// so it agrees with the `usage.input_tokens` a real call on the same body would report.
+pub fn count_tokens(engine: &crate::script::Engine, req: &Request) -> Value {
+    json!({"input_tokens": engine.count_input_tokens(req)})
 }
 
 #[cfg(test)]
