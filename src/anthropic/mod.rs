@@ -47,8 +47,9 @@ fn model(id: &str) -> Value {
 }
 
 /// The body of `POST /v1/messages/count_tokens`: `{"input_tokens": n}` with `n` from
-/// `Engine::count_input_tokens` (a matching rule's `usage.input_tokens`, else the tokenizer),
-/// so it agrees with the `usage.input_tokens` a real call on the same body would report.
+/// `Engine::count_input_tokens` (a matching rule's `usage.input_tokens`, else the tokenizer total).
+/// The real API's `count_tokens` counts the whole input, cache included, while a message's
+/// `usage.input_tokens` excludes cache reads and writes; a rule's value is literal in both.
 pub fn count_tokens(engine: &crate::script::Engine, req: &Request) -> Value {
     json!({"input_tokens": engine.count_input_tokens(req)})
 }

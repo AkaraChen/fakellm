@@ -3,7 +3,7 @@
  * (docs/control-plane.md). Field names are exactly the server's; unknown fields are rejected by it.
  */
 
-export type Protocol = 'openai.chat' | 'openai.responses' | 'anthropic.messages';
+export type Protocol = 'openai.chat' | 'openai.responses' | 'anthropic.messages' | 'openai.embeddings';
 
 /** A regex-or-literal pattern string as understood by the server (see docs/scripts.md). */
 export type Pattern = string;
@@ -81,6 +81,10 @@ export interface Reply {
   usage?: UsageSpec;
   /** Abort the connection mid-body instead of replying (FIN, no terminating chunk; headers and 200 are already sent). */
   reset?: boolean;
+  /** Answer with the next step of this registered trajectory. Excludes the content fields. */
+  trajectory?: string;
+  /** Let this registered policy decide the reply. Excludes the content fields. */
+  policy?: string;
 }
 
 export interface Rule {
@@ -98,6 +102,82 @@ export interface RuleInfo extends Rule {
   exhausted: boolean;
 }
 
+/** What a step requires of the tool results the client sent back. Every set field must hold on the same result. */
+export interface ToolResultExpect {
+  /** Tool name in trajectory terms (the tool map is applied before comparing). */
+  name?: string;
+  id?: string;
+  /** Regex over the result text. */
+  contains?: Pattern;
+  equals?: string;
+  is_error?: boolean;
+}
+
+export interface Expect {
+  tool_results?: ToolResultExpect[];
+  /** Regex over the text of any user message. */
+  any_user?: Pattern;
+}
+
+/** One model turn: a leaf reply (no `trajectory` / `policy`) and what the request asking for it must look like. */
+export interface Step {
+  reply: Reply;
+  expect?: Expect;
+}
+
+/** `{ "<trajectory tool>": { name, args?, keep_rest? } }`; an arg template `"$cmd"` copies, `"${cmd}"` interpolates. */
+export type ToolMap = Record<string, { name: string; args?: Record<string, unknown>; keep_rest?: boolean }>;
+
+export interface Trajectory {
+  kind?: 'trajectory';
+  /** Unique, no `/`. */
+  name: string;
+  steps: Step[];
+  /** Default `strict` (400 on mismatch). */
+  on_divergence?: 'strict' | 'lenient' | 'stop';
+  stop_text?: string;
+  /** `by_turn` (default) follows the replayed assistant messages; `by_hits` counts requests. */
+  cursor?: 'by_turn' | 'by_hits';
+  tool_map?: ToolMap;
+  /** What to do with a step whose tool the client did not offer. Default `error`. */
+  unknown_tool?: 'stop' | 'error' | 'pass';
+  check_pairing?: boolean;
+  meta?: Record<string, unknown>;
+}
+
+/** A trajectory as returned by `trajectories.list()`. */
+export interface TrajectoryInfo {
+  name: string;
+  steps: number;
+  on_divergence: 'strict' | 'lenient' | 'stop';
+  cursor: 'by_turn' | 'by_hits';
+  unknown_tool: 'stop' | 'error' | 'pass';
+  hits: number;
+  last_step: number | null;
+}
+
+export type PolicyRuntime = 'tjs' | 'node' | 'bun' | (string & {});
+
+/** A policy script: an ES module whose default export is `decide(request, context)`. */
+export interface Policy {
+  /** Letters, digits, `.`, `_`, `-`. */
+  name: string;
+  source: string;
+  /** Overrides the server's policy runtime for this policy. */
+  runtime?: PolicyRuntime;
+}
+
+/** A policy as returned by `policies.list()`. */
+export interface PolicyInfo {
+  name: string;
+  runtime: string;
+  running: boolean;
+  hits: number;
+  restarts: number;
+  state: unknown;
+  log: string[];
+}
+
 export interface ClockState {
   /** RFC 3339, millisecond precision, server time. */
   now: string;
@@ -109,6 +189,8 @@ export interface Status {
   version: string;
   clock: ClockState;
   scripts: { count: number };
+  trajectories: { count: number };
+  policies: { count: number };
   responses: { count: number };
   strict: boolean;
   request_log: LogConfig;
@@ -207,6 +289,14 @@ export interface StartOptions {
   strict?: boolean;
   /** Rules to load at start, or the path of a JSON/YAML script file. */
   scripts?: Rule[] | string;
+  /** Trajectories registered at start. */
+  trajectories?: Trajectory[];
+  /** Policies registered at start; a module that does not load makes `start()` reject. */
+  policies?: Policy[];
+  /** Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: tjs, node, bun, whichever is on PATH first. */
+  policyRuntime?: PolicyRuntime;
+  /** Also serve the API under this prefix, e.g. `/anthropic`. */
+  pathPrefix?: string;
   /** Default time to first token: milliseconds, or text such as `'300ms'`. */
   ttft?: number | string;
   tokensPerSec?: number;

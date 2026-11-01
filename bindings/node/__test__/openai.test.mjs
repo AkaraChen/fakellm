@@ -251,3 +251,77 @@ test('a server that is garbage-collected stops listening', async (t) => {
   }
   assert.fail('server still listening after GC')
 })
+
+const policySource = "export default () => ({ text: 'from policy' });"
+
+test('trajectories: put/add/list/clear and replay through a rule', () =>
+  withServer({ scripts: [{ reply: { trajectory: 't1' } }] }, async (s) => {
+    const traj = {
+      name: 't1',
+      tool_map: { shell: { name: 'Bash', args: { command: '$cmd' } } },
+      steps: [
+        { reply: { tool_calls: [{ name: 'shell', arguments: { cmd: 'echo hi' }, id: 'c1' }] } },
+        { reply: { text: 'all done' }, expect: { tool_results: [{ contains: 'hi' }] } },
+      ],
+    }
+    assert.deepEqual(s.trajectories.put([traj]), { added: 1, count: 1 })
+    const c = openai(s)
+    const tools = [{ type: 'function', function: { name: 'Bash', parameters: {} } }]
+    const user = { role: 'user', content: 'go' }
+    const r1 = await c.chat.completions.create({ model: 'm', messages: [user], tools })
+    const call = r1.choices[0].message.tool_calls[0]
+    assert.equal(call.function.name, 'Bash')
+    assert.deepEqual(JSON.parse(call.function.arguments), { command: 'echo hi' })
+    const r2 = await c.chat.completions.create({
+      model: 'm',
+      messages: [user, r1.choices[0].message, { role: 'tool', tool_call_id: 'c1', content: 'hi' }],
+      tools,
+    })
+    assert.equal(r2.choices[0].message.content, 'all done')
+    const [info] = s.trajectories.list()
+    assert.equal(info.hits, 2)
+    assert.equal(s.status().trajectories.count, 1)
+    assert.deepEqual(s.trajectories.add(JSON.stringify([{ ...traj, name: 't2' }])), { added: 1, count: 2 })
+    assert.throws(() => s.trajectories.put([{ name: 'a/b', steps: [{ reply: { text: 'x' } }] }]), /name/)
+    s.trajectories.clear()
+    assert.equal(s.trajectories.list().length, 0)
+  }))
+
+test('policies: put/add/list/clear and a load error', () =>
+  withServer({ scripts: [{ reply: { policy: 'p1' } }] }, async (s) => {
+    assert.deepEqual(s.policies.put([{ name: 'p1', source: policySource, runtime: 'node' }]), { added: 1, count: 1 })
+    const r = await openai(s).chat.completions.create({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
+    assert.equal(r.choices[0].message.content, 'from policy')
+    const [info] = s.policies.list()
+    assert.equal(info.runtime, 'node')
+    assert.equal(info.hits, 1)
+    assert.equal(s.policies.add([{ name: 'p2', source: policySource, runtime: 'node' }]).count, 2)
+    assert.throws(() => s.policies.put([{ name: 'bad', source: 'export default 1 +', runtime: 'node' }]))
+    assert.equal(s.policies.list().length, 2)
+    s.policies.clear()
+    assert.equal(s.policies.list().length, 0)
+  }))
+
+test('start: trajectories, policies, policyRuntime and pathPrefix', async () => {
+  await withServer(
+    {
+      trajectories: [{ name: 'boot', steps: [{ reply: { text: 'from trajectory' } }] }],
+      policies: [{ name: 'pol', source: policySource }],
+      policyRuntime: 'node',
+      pathPrefix: '/anthropic',
+      scripts: [
+        { match: { last_user: 'traj' }, reply: { trajectory: 'boot' } },
+        { match: { last_user: 'pol' }, reply: { policy: 'pol' } },
+      ],
+    },
+    async (s) => {
+      const say = async (content) =>
+        (await openai(s).chat.completions.create({ model: 'm', messages: [{ role: 'user', content }] })).choices[0].message.content
+      assert.equal(await say('traj'), 'from trajectory')
+      assert.equal(await say('pol'), 'from policy')
+      assert.equal(s.policies.list()[0].runtime, 'node')
+      assert.equal((await fetch(`${s.endpoint}/anthropic/v1/models`)).status, 200)
+    },
+  )
+  await assert.rejects(start({ policyRuntime: 'node', policies: [{ name: 'bad', source: 'export default 1 +' }] }))
+})

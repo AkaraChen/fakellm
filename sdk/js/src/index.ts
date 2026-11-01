@@ -21,6 +21,10 @@ import type {
   Reply,
   ErrorSpec,
   LogConfig,
+  Policy,
+  PolicyInfo,
+  Trajectory,
+  TrajectoryInfo,
 } from './types.js';
 
 export * from './types.js';
@@ -120,6 +124,23 @@ export class FakeLLM {
     add: async (rules: Rule[]): Promise<{ added: number; count: number }> => this.ctl('POST', '/scripts', rules),
     list: async (): Promise<RuleInfo[]> => (await this.ctl('GET', '/scripts')).rules,
     clear: async (): Promise<void> => void (await this.ctl('DELETE', '/scripts')),
+  };
+
+  readonly trajectories = {
+    /** Replaces all trajectories; hit counters restart. */
+    put: async (items: Trajectory[]): Promise<{ added: number; count: number }> => this.ctl('PUT', '/trajectories', items),
+    /** Adds trajectories; one with a registered name replaces it in place. */
+    add: async (items: Trajectory[]): Promise<{ added: number; count: number }> => this.ctl('POST', '/trajectories', items),
+    list: async (): Promise<TrajectoryInfo[]> => (await this.ctl('GET', '/trajectories')).trajectories,
+    clear: async (): Promise<void> => void (await this.ctl('DELETE', '/trajectories')),
+  };
+
+  readonly policies = {
+    /** Replaces all policies; each module is loaded first and a load error rejects without changing anything. */
+    put: async (items: Policy[]): Promise<{ added: number; count: number }> => this.ctl('PUT', '/policies', items),
+    add: async (items: Policy[]): Promise<{ added: number; count: number }> => this.ctl('POST', '/policies', items),
+    list: async (): Promise<PolicyInfo[]> => (await this.ctl('GET', '/policies')).policies,
+    clear: async (): Promise<void> => void (await this.ctl('DELETE', '/policies')),
   };
 
   readonly requests = {
@@ -225,6 +246,8 @@ export async function start(opts: StartOptions = {}): Promise<FakeLLM> {
   if (opts.requestLog === false) args.push('--no-request-log');
   if (opts.requestLogCapacity !== undefined) args.push('--request-log-capacity', String(opts.requestLogCapacity));
   if (opts.redactAuth) args.push('--redact-auth');
+  if (opts.policyRuntime) args.push('--policy-runtime', opts.policyRuntime);
+  if (opts.pathPrefix) args.push('--path-prefix', opts.pathPrefix);
   if (typeof opts.scripts === 'string') {
     args.push('--scripts', opts.scripts);
   } else if (opts.scripts) {
@@ -238,7 +261,18 @@ export async function start(opts: StartOptions = {}): Promise<FakeLLM> {
   const { bin, how } = resolveBin(opts);
   const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, ...opts.env } });
   const outcome = await ready(child, opts.readyTimeoutMs ?? 10_000);
-  if (outcome.kind === 'ok') return new FakeLLM(reachable(outcome.url), child, bin, tmp);
+  if (outcome.kind === 'ok') {
+    const srv = new FakeLLM(reachable(outcome.url), child, bin, tmp);
+    try {
+      // Through the control plane rather than flags: policies carry per-policy runtimes, and a load error comes back readable.
+      if (opts.trajectories?.length) await srv.trajectories.put(opts.trajectories);
+      if (opts.policies?.length) await srv.policies.put(opts.policies);
+    } catch (e) {
+      await srv.stop();
+      throw e;
+    }
+    return srv;
+  }
   if (tmp) rmSync(tmp, { recursive: true, force: true });
   if (outcome.kind === 'enoent') {
     throw new FakeLLMError(

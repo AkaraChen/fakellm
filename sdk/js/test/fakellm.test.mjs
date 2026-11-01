@@ -162,3 +162,83 @@ test('requests.config, responses.clear count, fractional advance, 0.0.0.0 host',
     await any.stop();
   }
 });
+
+const askTools = (messages) =>
+  client.chat.completions.create({
+    model: 'm1',
+    messages,
+    tools: [{ type: 'function', function: { name: 'Bash', parameters: {} } }],
+  });
+
+const traj = {
+  name: 't1',
+  tool_map: { shell: { name: 'Bash', args: { command: '$cmd' } } },
+  steps: [
+    { reply: { tool_calls: [{ name: 'shell', arguments: { cmd: 'echo hi' }, id: 'c1' }] } },
+    { reply: { text: 'all done' }, expect: { tool_results: [{ contains: 'hi' }] } },
+  ],
+};
+
+test('trajectories: put/add/list/clear and replay through a rule', async () => {
+  assert.deepEqual(await srv.trajectories.put([traj]), { added: 1, count: 1 });
+  await srv.scripts.put([{ reply: { trajectory: 't1' } }]);
+  const user = { role: 'user', content: 'go' };
+  const r1 = await askTools([user]);
+  const call = r1.choices[0].message.tool_calls[0];
+  assert.equal(call.function.name, 'Bash');
+  assert.deepEqual(JSON.parse(call.function.arguments), { command: 'echo hi' });
+  const r2 = await askTools([user, r1.choices[0].message, { role: 'tool', tool_call_id: 'c1', content: 'hi' }]);
+  assert.equal(r2.choices[0].message.content, 'all done');
+  const [info] = await srv.trajectories.list();
+  assert.equal(info.name, 't1');
+  assert.equal(info.steps, 2);
+  assert.equal(info.hits, 2);
+  assert.equal((await srv.status()).trajectories.count, 1);
+  assert.deepEqual(await srv.trajectories.add([{ ...traj, name: 't2' }]), { added: 1, count: 2 });
+  await srv.trajectories.clear();
+  assert.equal((await srv.trajectories.list()).length, 0);
+});
+
+test('trajectories: an invalid one throws FakeLLMError', async () => {
+  await assert.rejects(srv.trajectories.put([{ name: 'a/b', steps: [{ reply: { text: 'x' } }] }]), (e) => e instanceof FakeLLMError && e.status === 400);
+});
+
+const policySource = "export default () => ({ text: 'from policy' });";
+
+test('policies: put/add/list/clear and a load error', async () => {
+  assert.deepEqual(await srv.policies.put([{ name: 'p1', source: policySource, runtime: 'node' }]), { added: 1, count: 1 });
+  await srv.scripts.put([{ reply: { policy: 'p1' } }]);
+  assert.equal((await ask()).choices[0].message.content, 'from policy');
+  const [info] = await srv.policies.list();
+  assert.equal(info.name, 'p1');
+  assert.equal(info.runtime, 'node');
+  assert.equal(info.hits, 1);
+  assert.equal((await srv.policies.add([{ name: 'p2', source: policySource, runtime: 'node' }])).count, 2);
+  await assert.rejects(srv.policies.put([{ name: 'bad', source: 'export default 1 +', runtime: 'node' }]), (e) => e instanceof FakeLLMError && e.status === 400);
+  assert.equal((await srv.policies.list()).length, 2);
+  await srv.policies.clear();
+  assert.equal((await srv.policies.list()).length, 0);
+});
+
+test('start: trajectories, policies, policyRuntime and pathPrefix', async () => {
+  const s = await start({
+    bin,
+    trajectories: [{ name: 'boot', steps: [{ reply: { text: 'from trajectory' } }] }],
+    policies: [{ name: 'pol', source: policySource }],
+    policyRuntime: 'node',
+    pathPrefix: '/anthropic',
+    scripts: [{ match: { last_user: 'traj' }, reply: { trajectory: 'boot' } }, { match: { last_user: 'pol' }, reply: { policy: 'pol' } }],
+  });
+  try {
+    const c = new OpenAI({ baseURL: s.baseURL, apiKey: 'k', maxRetries: 0 });
+    const say = async (content) => (await c.chat.completions.create({ model: 'm', messages: [{ role: 'user', content }] })).choices[0].message.content;
+    assert.equal(await say('traj'), 'from trajectory');
+    assert.equal(await say('pol'), 'from policy');
+    assert.equal((await s.policies.list())[0].runtime, 'node');
+    const res = await fetch(`${s.url}/anthropic/v1/models`);
+    assert.equal(res.status, 200);
+  } finally {
+    await s.stop();
+  }
+  await assert.rejects(start({ bin, policyRuntime: 'node', policies: [{ name: 'bad', source: 'export default 1 +' }] }), (e) => e instanceof FakeLLMError);
+});

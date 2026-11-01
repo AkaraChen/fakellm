@@ -265,7 +265,7 @@ pub fn toolu_id(seed: u64) -> String {
 pub fn tool_call_id(protocol: Protocol, seed: u64) -> String {
     match protocol {
         Protocol::AnthropicMessages => toolu_id(seed),
-        Protocol::OpenaiChat | Protocol::OpenaiResponses => call_id(seed),
+        Protocol::OpenaiChat | Protocol::OpenaiResponses | Protocol::OpenaiEmbeddings => call_id(seed),
     }
 }
 

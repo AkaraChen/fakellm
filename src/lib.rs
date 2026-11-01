@@ -21,6 +21,7 @@
 // `ApiError` carries headers now and is returned by every parser; errors are the cold path.
 #![allow(clippy::result_large_err)]
 
+mod agent;
 mod anthropic;
 mod blocking;
 mod clock;
@@ -28,6 +29,7 @@ mod control;
 mod fallback;
 pub mod ir;
 mod openai;
+mod policy;
 mod reqlog;
 mod script;
 mod sse;
@@ -47,11 +49,17 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+pub use agent::tool_map::{ToolMap, ToolMapping};
+pub use agent::trajectory::{
+    Cursor, Divergence, Expect, Step, ToolResultExpect, Trajectories, Trajectory, TrajectoryError, TrajectoryFormat, TrajectoryInfo,
+    UnknownTool,
+};
 pub use blocking::BlockingServer;
 pub use clock::{Clock, OutOfRange, parse_duration};
 pub use control::{Control, ControlError, ResetOptions};
 pub use fallback::FallbackConfig;
 pub use ir::{ApiError, Delivery, FinishReason, Outcome, Reply, Request, Source, Usage};
+pub use policy::{Policies, PolicyError, PolicyInfo, PolicySpec, Runtime};
 pub use reqlog::{DEFAULT_CAPACITY as DEFAULT_REQUEST_LOG_CAPACITY, RequestFilter, RequestLog, RequestRecord, StatusFilter};
 pub use script::{Engine, Match, ReplySpec, Rule, RuleInfo, ScriptError, ScriptFormat, Scripts};
 
@@ -76,6 +84,8 @@ pub const DEFAULT_MODELS: &[&str] = &[
     "o3",
     "o4-mini",
     "gpt-5.5",
+    "text-embedding-3-small",
+    "text-embedding-3-large",
     "claude-sonnet-4-5",
     "claude-opus-4-1",
     "claude-haiku-4-5",
@@ -110,6 +120,19 @@ pub struct Config {
     /// Store `"<redacted>"` instead of the values of `authorization`, `proxy-authorization` and
     /// `x-api-key` in the request log, so the log can be shared.
     pub redact_auth: bool,
+    /// A path the API is also served under, e.g. `/anthropic` makes `/anthropic/v1/messages` work.
+    /// Paths that end in a known route (`/v1/messages`, ...) after any leading segments are
+    /// accepted regardless; this exists for prefixes in front of routes without `/v1`.
+    pub path_prefix: Option<String>,
+    /// Trajectories registered at start (`--trajectory FILE`, repeatable); the control plane can replace them.
+    pub trajectories: Vec<Trajectory>,
+    /// Policy scripts registered at start (`--policy FILE`; the name is the file stem). Starting fails
+    /// when a module does not load.
+    pub policies: Vec<PolicySpec>,
+    /// Runtime for policies that name none; `None` picks `tjs`, `node` or `bun`, in that order, from `PATH`.
+    pub policy_runtime: Option<Runtime>,
+    /// How long a policy may take to decide, in host-clock milliseconds.
+    pub policy_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -126,6 +149,11 @@ impl Default for Config {
             request_log: true,
             request_log_capacity: DEFAULT_REQUEST_LOG_CAPACITY,
             redact_auth: false,
+            path_prefix: None,
+            trajectories: Vec::new(),
+            policies: Vec::new(),
+            policy_runtime: None,
+            policy_timeout_ms: policy::DEFAULT_TIMEOUT_MS,
         }
     }
 }
@@ -146,10 +174,19 @@ impl Server {
         let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
         let addr = listener.local_addr()?;
         let control = Arc::new(Control::new(&config).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?);
+        if !config.policies.is_empty() {
+            control
+                .engine
+                .policies
+                .replace(config.policies.clone())
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        }
         let (stop, mut stopped) = oneshot::channel();
         let shared = Arc::new(Shared {
             control: control.clone(),
             api_key: config.api_key.clone(),
+            path_prefix: config.path_prefix.clone(),
             models: if config.models.is_empty() {
                 DEFAULT_MODELS.iter().map(|s| (*s).to_owned()).collect()
             } else {
@@ -174,9 +211,11 @@ impl Server {
                 };
                 let _ = socket.set_nodelay(true);
                 let shared = shared.clone();
+                let rst = reset_handle(&socket);
                 let service = hyper::service::service_fn(move |req| {
                     let shared = shared.clone();
-                    async move { Ok::<_, Infallible>(shared.handle(req).await) }
+                    let rst = rst.clone();
+                    async move { Ok::<_, Infallible>(rst_on_body_error(shared.handle(req).await, rst)) }
                 });
                 let conn = http.serve_connection_with_upgrades(TokioIo::new(socket), service).into_owned();
                 conns.spawn(async move {
@@ -224,6 +263,16 @@ impl Server {
         &self.control.engine.scripts
     }
 
+    /// The registered trajectories.
+    pub fn trajectories(&self) -> &Trajectories {
+        &self.control.engine.trajectories
+    }
+
+    /// The registered policy scripts.
+    pub fn policies(&self) -> &Policies {
+        &self.control.engine.policies
+    }
+
     /// Clears scripts, the request log, the clock and stored responses.
     pub fn reset(&self) {
         self.control.reset();
@@ -255,6 +304,12 @@ impl Server {
             let _ = stop.send(());
         }
         let _ = (&mut self.task).await;
+        self.control.engine.policies.clear();
+    }
+
+    /// Like [`Server::wait`] but keeps the server, so the caller can still `shutdown` it.
+    pub async fn wait_ref(&mut self) {
+        let _ = (&mut self.task).await;
     }
 
     /// Serves until the process exits.
@@ -267,6 +322,7 @@ impl Server {
 pub(crate) struct Shared {
     pub(crate) control: Arc<Control>,
     pub(crate) api_key: Option<String>,
+    pub(crate) path_prefix: Option<String>,
     pub(crate) models: Vec<String>,
 }
 
@@ -280,6 +336,40 @@ impl Shared {
 }
 
 /// Builds a JSON response with `Content-Length`.
+/// A second handle on the connection's socket, kept to turn the close into an RST: the socket
+/// itself belongs to hyper, which gives no way back to it. `None` when duplicating fails.
+type ResetHandle = Arc<std::sync::Mutex<Option<tokio::net::TcpStream>>>;
+
+#[cfg(unix)]
+fn reset_handle(socket: &tokio::net::TcpStream) -> Option<ResetHandle> {
+    use std::os::fd::AsFd;
+    let std = socket.as_fd().try_clone_to_owned().ok()?;
+    let std = std::net::TcpStream::from(std);
+    let dup = tokio::net::TcpStream::from_std(std).ok()?;
+    Some(Arc::new(std::sync::Mutex::new(Some(dup))))
+}
+
+#[cfg(not(unix))]
+fn reset_handle(_: &tokio::net::TcpStream) -> Option<ResetHandle> {
+    None
+}
+
+/// The faults that drop a connection fail the response body. When that happens, `SO_LINGER{on, 0}`
+/// is set (on the shared socket) and the duplicate closed, so hyper's close of the original is the
+/// last one and sends RST instead of FIN: clients see `ECONNRESET`, not a clean EOF. Linger is
+/// never set on connections that end normally, which would lose unsent data.
+fn rst_on_body_error(resp: Response, handle: Option<ResetHandle>) -> Response {
+    let Some(handle) = handle else { return resp };
+    let (parts, body) = resp.into_parts();
+    let body = http_body_util::BodyExt::map_err(body, move |e| {
+        if let Some(dup) = handle.lock().ok().and_then(|mut g| g.take()) {
+            let _ = dup.set_zero_linger();
+        }
+        e
+    });
+    http::Response::from_parts(parts, http_body_util::BodyExt::boxed(body))
+}
+
 pub(crate) fn json_response(status: u16, body: &serde_json::Value) -> Response {
     let bytes = serde_json::to_vec(body).unwrap_or_default();
     http::Response::builder()

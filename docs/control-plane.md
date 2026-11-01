@@ -1,6 +1,6 @@
 # 测试控制面
 
-fakellm 在 API 所在的同一个端口上提供一组 HTTP API，前缀是 `/_fakellm/`，用来在测试之间重置状态、注册剧本、控制服务器时间、检查收到过哪些请求。
+fakellm 在 API 所在的同一个端口上提供一组 HTTP API，前缀是 `/_fakellm/`，用来在测试之间重置状态、注册剧本、轨迹和策略脚本、控制服务器时间、检查收到过哪些请求。
 真实的 OpenAI 和 Anthropic 路径（`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 等）都不以 `/_fakellm` 开头，所以不会冲突。三种协议的请求共用同一份剧本、同一个请求日志、同一个时钟。
 
 不需要写客户端库：用命令行 `fakellm ctl`，或者任何能发 HTTP 请求的工具（`curl`）。
@@ -21,6 +21,9 @@ fakellm ctl requests list --rule step-1 --status 4xx
 
 **控制面没有认证**，包括配了 `--api-key` 的时候（`--api-key` 只管 API 路径）。任何连得上端口的人都能清空剧本、改时钟。
 这是一个测试服务，默认只监听 `127.0.0.1`；改成 `--host 0.0.0.0` 之前请想清楚。
+
+**注册策略脚本等于远程代码执行。** `PUT|POST /_fakellm/policies` 的 `source` 会作为 JS 在子进程里运行，`runtime` 还可以是任意可执行文件的路径；
+控制面没有认证，所以任何连得上端口的人都能以 fakellm 进程的用户身份执行代码。这是不要绑定 `0.0.0.0` 的又一个理由；需要远程访问时请放在受信任的网络里，或不要注册策略（不要用 `--policy`，也不要让不可信的调用方访问控制面）。
 
 唯一的防护：带 `Origin` 头的非 GET 请求会被拒绝（403），防止用户浏览器里打开的网页向 `localhost` 发跨站 POST 把服务清空。
 curl、`fakellm ctl` 和测试框架的 HTTP 客户端不会发 `Origin`。注意在浏览器环境里跑的测试（比如 Playwright 页面里的 `fetch`）会带 `Origin`，要把控制面请求放到测试进程（Node 侧）发。
@@ -80,6 +83,10 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `PUT /_fakellm/scripts` | 替换全部规则；`?keep_hits=true` 保留同一位置规则的命中计数 |
 | `POST /_fakellm/scripts` | 追加规则 |
 | `DELETE /_fakellm/scripts` | 清空规则 |
+| `GET` / `PUT` / `POST` / `DELETE /_fakellm/trajectories` | 轨迹的列出、替换、追加、清空，见 [fake agent](agent.md) |
+| `GET` / `DELETE /_fakellm/trajectories/{name}` | 读（`?format=jsonl` 导出 JSONL）/ 删一条轨迹 |
+| `GET` / `PUT` / `POST` / `DELETE /_fakellm/policies` | 策略脚本的列出、替换、追加、清空（会运行代码，见上面的[安全](#安全)） |
+| `GET` / `DELETE /_fakellm/policies/{name}` | 读 / 删一个策略 |
 | `GET /_fakellm/responses` | 列出保存的 Responses API 对象（只有 id 和创建时间） |
 | `DELETE /_fakellm/responses` | 清空这些对象 |
 | `GET` / `DELETE /v1/responses/{id}` | 这不是控制面路由，是 API：读取、删除一个保存的对象，见[下面](#responses-对象) |
@@ -89,13 +96,15 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `DELETE /_fakellm/requests` | 清空请求日志 |
 | `GET` / `PUT /_fakellm/requests/config` | 读 / 改日志设置 |
 
+`fakellm ctl` 没有 trajectories 和 policies 子命令：这两组端点只能用 HTTP（curl）、`sdk/js` 或 Go helper 访问；启动时可用 `--trajectory`、`--policy` 加载文件。
+
 方法不对返回 405（`MethodNotAllowed`），路径不存在返回 404。
 
 ### 状态
 
 ```
 $ curl $E/_fakellm
-{"version":"0.1.0","clock":{"now":"2026-10-31T15:29:38.658Z","frozen":false,"shifted":false},"scripts":{"count":0},"responses":{"count":0},"strict":false,"request_log":{"enabled":true,"capacity":10000,"stored":0,"dropped":0}}
+{"version":"0.1.0","clock":{"now":"2026-10-31T15:29:38.658Z","frozen":false,"shifted":false},"scripts":{"count":0},"trajectories":{"count":0},"policies":{"count":0},"responses":{"count":0},"strict":false,"request_log":{"enabled":true,"capacity":10000,"stored":0,"dropped":0}}
 ```
 
 ### 重置
@@ -107,7 +116,7 @@ $ curl -X POST "$E/_fakellm/reset?clock=false&requests=false"
 {"reset":true}
 ```
 
-默认清空四样东西：剧本（包括命中计数）、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项。
+默认清空四样东西：剧本（包括命中计数，同时清掉全部轨迹和策略脚本并杀掉它们的子进程）、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项。
 
 - 挂起（`hang`）的请求一被挂住就以 `status: 0`、`hung: true` 记入日志，放行或客户端放弃时原地更新；错误延迟或同步回复延迟期间客户端断开的请求，以 `status: 0` 记入日志。如果期间发生过清空请求日志的 `reset`，这些记录会被丢弃，不会污染新的日志。
 - `reset` 会唤醒所有挂起的请求：有 `hang_ms` 的按规则的其余部分回答，只写 `hang: true` 的回 503。
@@ -165,7 +174,7 @@ $ curl -X DELETE $E/_fakellm/scripts
 
 ```
 $ curl -X PUT $E/_fakellm/scripts -d '[{"reply":{}}]'
-{"error":{"code":"BadRequest","message":"rule 0: reply needs `text`, `tool_calls` or `error`"}}
+{"error":{"code":"BadRequest","message":"rule 0: reply needs `text`, `tool_calls`, `error`, `trajectory` or `policy`"}}
 $ curl -X PUT $E/_fakellm/scripts -d '[{"match":{"bogus":1},"reply":{"text":"x"}}]'
 {"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `last_tool_call_id`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`"}}
 ```
@@ -233,9 +242,9 @@ $ curl "$E/_fakellm/requests?full=true&limit=1"
 | `status` | 响应状态码；`0` 表示还没有（或永远不会有）响应：请求正被 `hang` / `hang_ms` 挂住，或客户端先放弃了。`reply` 里有 `hang` 字段 |
 | `hung` | `true`：请求此刻正被 `hang` / `hang_ms` 挂住。放行或客户端断开后变回 `false`，`status` 和 `latency_us` 随之更新 |
 | `latency_us` | 从到达到响应头就绪，微秒（真实时间；流的 body 不计，被时钟挂住的同步响应要等放行后才记录，包含等待） |
-| `protocol` | `openai.chat`、`openai.responses` 或 `anthropic.messages`；body 解析失败时为 `null` |
+| `protocol` | `openai.chat`、`openai.responses`、`openai.embeddings` 或 `anthropic.messages`；body 解析失败时为 `null` |
 | `model`、`stream` | 请求的模型名和是否流式；没有解析出请求时为 `null` / `false` |
-| `source` | 谁回答的：`{"kind": "script", "index", "name"}`、`{"kind": "fallback"}`、`{"kind": "strict"}`、`{"kind": "rejected"}`（在匹配之前就被拒绝：认证失败、JSON 不合法、校验失败、404） |
+| `source` | 谁回答的：`{"kind": "script", "index", "name"}`、`{"kind": "trajectory", "index", "name", "trajectory", "step"}`、`{"kind": "policy", "index", "name", "policy"}`、`{"kind": "fallback"}`、`{"kind": "strict"}`、`{"kind": "rejected"}`（在匹配之前就被拒绝：认证失败、JSON 不合法、校验失败、404） |
 | `rule` | 命中规则的 `name`；没有名字或不是规则回答时为 `null` |
 | `request` | 解析后的结构化请求（IR）：完整的 messages、tools、`tool_choice`、参数、`extra`（不认识的字段）。不截断文本；解析失败时 `null` |
 | `reply` | `{"finish", "text", "tool_calls": [{id, name, arguments}], "reasoning", "usage": {prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cached_tokens}}`，或 `{"status", "error", "retry_after", "in_stream", "headers"}`（`error` 是该协议的线上格式，Anthropic 请求用 Anthropic 的错误体）；被 `hang` 挂住的请求还有 `hang: {"until_ms": n \| null}`；没有决定时 `null` |
@@ -259,9 +268,9 @@ Anthropic 请求和 Responses 请求的 `request`（解析后的结构）与 Cha
 | `model` | 模型名 glob（`*` 和 `?`，区分大小写） |
 | `has_tool` | 请求里提供了这个名字的工具 |
 | `stream` | `true` / `false` |
-| `protocol` | `openai.chat` / `openai.responses` / `anthropic.messages`（body 解析失败的请求没有协议，匹配不到任何一个） |
+| `protocol` | `openai.chat` / `openai.responses` / `openai.embeddings` / `anthropic.messages`（body 解析失败的请求没有协议，匹配不到任何一个） |
 | `status` | 精确（`404`，挂起后放弃的是 `0`）、类别（`4xx`）、或 `error`（>= 400） |
-| `source` | `script` / `fallback` / `strict` / `rejected` |
+| `source` | `script`（也包含轨迹和策略的回答）/ `fallback` / `strict` / `rejected` |
 | `rule` | 规则名（精确） |
 | `path` | 路径前缀，如 `/v1/chat/completions` |
 | `since` | RFC 3339，只要这个服务器时间或之后的 |

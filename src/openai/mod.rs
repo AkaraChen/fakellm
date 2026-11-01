@@ -5,6 +5,7 @@
 //! errors, the Responses store hand-off, and the request log. See docs/m1-spec.md.
 
 pub mod chat;
+pub mod embeddings;
 pub mod error;
 pub mod models;
 pub mod responses;
@@ -94,6 +95,8 @@ enum Route<'a> {
     CountTokens,
     /// `POST /v1/responses`
     Responses,
+    /// `POST /v1/embeddings`
+    Embeddings,
     /// `GET /v1/responses/{id}`
     ResponseGet(&'a str),
     /// `DELETE /v1/responses/{id}`
@@ -125,6 +128,7 @@ fn route<'a>(method: &http::Method, path: &'a str) -> Route<'a> {
         (&http::Method::POST, "/messages") => Route::Messages,
         (&http::Method::POST, "/messages/count_tokens") => Route::CountTokens,
         (&http::Method::POST, "/responses") => Route::Responses,
+        (&http::Method::POST, "/embeddings") => Route::Embeddings,
         (&http::Method::GET, "/models") => Route::Models,
         (&http::Method::GET, p) => match (p.strip_prefix("/models/"), p.strip_prefix("/responses/")) {
             (Some(id), _) if !id.is_empty() => Route::Model(id),
@@ -139,10 +143,48 @@ fn route<'a>(method: &http::Method, path: &'a str) -> Route<'a> {
     }
 }
 
+/// The part of `path` the router sees. Clients behind a gateway or a base URL with a path
+/// (`/anthropic/v1/messages`) reach the same routes: the configured `prefix` (`Config::path_prefix`,
+/// compared on segment boundaries, `/anthropic` or `/anthropic/`) is removed, and so is any run of
+/// leading segments in front of a known route suffix (`/v1/messages`, `/v1/messages/count_tokens`,
+/// `/v1/chat/completions`, `/v1/responses[/...]`, `/v1/models[/...]`, `/v1/embeddings`), whatever they are.
+/// Anything else, `/_fakellm` included, comes back unchanged. The request log keeps the full path.
+///
+fn api_path<'a>(path: &'a str, prefix: Option<&str>) -> &'a str {
+    if path.starts_with("/_fakellm") {
+        return path;
+    }
+    let mut path = path;
+    if let Some(prefix) = prefix.map(|p| p.trim_matches('/')).filter(|p| !p.is_empty())
+        && let Some(rest) = path.strip_prefix('/').and_then(|p| p.strip_prefix(prefix))
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        path = if rest.is_empty() { "/" } else { rest };
+    }
+    if is_known_path(path) {
+        return path;
+    }
+    for (i, _) in path.match_indices('/').skip(1) {
+        if is_known_path(&path[i..]) {
+            return &path[i..];
+        }
+    }
+    path
+}
+
+fn is_known_path(path: &str) -> bool {
+    let p = path.strip_prefix("/v1").unwrap_or(path);
+    let single = |rest: &str| !rest.is_empty() && !rest.contains('/');
+    match p {
+        "/messages" | "/messages/count_tokens" | "/chat/completions" | "/responses" | "/models" | "/embeddings" => true,
+        _ => p.strip_prefix("/responses/").is_some_and(single) || p.strip_prefix("/models/").is_some_and(|r| !r.is_empty()),
+    }
+}
+
 fn is_api_path(path: &str) -> bool {
     path == "/v1"
         || path.starts_with("/v1/")
-        || ["/chat/completions", "/messages", "/responses", "/models"]
+        || ["/chat/completions", "/messages", "/responses", "/models", "/embeddings"]
             .iter()
             .any(|p| path == *p || path.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
 }
@@ -184,7 +226,7 @@ pub(crate) async fn handle(shared: &Shared, req: http::Request<hyper::body::Inco
     let arrived = shared.control.clock.now();
     let generation = shared.control.generation();
     let (parts, body) = req.into_parts();
-    let path = parts.uri.path().to_owned();
+    let path = api_path(parts.uri.path(), shared.path_prefix.as_deref()).to_owned();
     let logged = is_api_path(&path) && shared.control.log.is_enabled();
     let mut trace = Trace::default();
     if logged {
@@ -280,7 +322,10 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
     }
 
     let mut body_bytes = None;
-    if matches!(route, Route::Chat | Route::Messages | Route::CountTokens | Route::Responses) {
+    if matches!(
+        route,
+        Route::Chat | Route::Messages | Route::CountTokens | Route::Responses | Route::Embeddings
+    ) {
         match Limited::new(body, MAX_BODY).collect().await {
             Ok(b) => body_bytes = Some(b.to_bytes()),
             Err(e) => {
@@ -337,6 +382,7 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
         Route::Messages => complete(shared, Api::Messages, &bytes, trace).await,
         Route::Responses => complete(shared, Api::Responses, &bytes, trace).await,
         Route::CountTokens => count_tokens(shared, &bytes, trace),
+        Route::Embeddings => embeddings::respond(shared, &bytes, trace).await,
         Route::ResponseGet(id) => match shared.control.responses.get(id) {
             Some(r) => json_response(200, &r.response),
             None => reject(trace, style, responses::not_found(id)),
@@ -432,7 +478,7 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
     };
     let seed = fallback::request_seed(&req);
     trace.seed = Some(seed);
-    let mut outcome = control.engine.resolve(&req);
+    let mut outcome = control.engine.resolve_async(&req).await;
     let req = Arc::new(req);
     trace.request = Some(req.clone());
     trace.outcome = Some(Arc::new(outcome.clone()));
@@ -639,7 +685,8 @@ mod tests {
         assert!(matches!(route(&M::GET, "/v1/models/gpt-4o"), Route::Model("gpt-4o")));
         assert!(matches!(route(&M::GET, "/v1/models/"), Route::Unknown));
         assert!(matches!(route(&M::GET, "/v1/chat/completions"), Route::Unknown));
-        assert!(matches!(route(&M::POST, "/v1/embeddings"), Route::Unknown));
+        assert!(matches!(route(&M::POST, "/v1/embeddings"), Route::Embeddings));
+        assert!(matches!(route(&M::GET, "/v1/embeddings"), Route::Unknown));
         assert!(matches!(route(&M::POST, "/v1/messages"), Route::Messages));
         assert!(matches!(route(&M::POST, "/messages"), Route::Messages));
         assert!(matches!(route(&M::POST, "/v1/messages/count_tokens"), Route::CountTokens));
@@ -668,11 +715,32 @@ mod tests {
     }
 
     #[test]
+    fn api_path_tolerates_prefixes() {
+        let p = |path, prefix| api_path(path, prefix);
+        assert_eq!(p("/v1/messages", None), "/v1/messages");
+        assert_eq!(p("/anthropic/v1/messages", None), "/v1/messages");
+        assert_eq!(p("/gateway/v2/proxy/v1/chat/completions", None), "/v1/chat/completions");
+        assert_eq!(p("/x/v1/models", None), "/v1/models");
+        assert_eq!(p("/x/v1/models/a/b", None), "/v1/models/a/b");
+        assert_eq!(p("/foo/embeddings", None), "/embeddings");
+        assert_eq!(p("/foo/v1/responses/resp_1", None), "/v1/responses/resp_1");
+        assert_eq!(p("/foo/bar", None), "/foo/bar");
+        assert_eq!(p("/foo/v1/responses/a/b", None), "/foo/v1/responses/a/b");
+        assert_eq!(p("/_fakellm/requests", None), "/_fakellm/requests");
+        assert_eq!(p("/v1/chat/completions", None), "/v1/chat/completions");
+        assert_eq!(p("/anthropic/v1/messages", Some("/anthropic/")), "/v1/messages");
+        assert_eq!(p("/anthropic", Some("anthropic")), "/");
+        assert_eq!(p("/anthropicx/v1/x", Some("/anthropic")), "/anthropicx/v1/x");
+        assert_eq!(p("/anthropic/custom", Some("/anthropic")), "/custom");
+    }
+
+    #[test]
     fn api_paths() {
         assert!(is_api_path("/v1/anything"));
         assert!(is_api_path("/chat/completions"));
         assert!(is_api_path("/messages/count_tokens"));
         assert!(is_api_path("/responses/resp_1"));
+        assert!(is_api_path("/embeddings"));
         assert!(!is_api_path("/responses_x"));
         assert!(!is_api_path("/favicon.ico"));
         assert!(!is_api_path("/v10"));

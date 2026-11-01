@@ -5,15 +5,17 @@
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use http_body_util::{BodyExt, Limited};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::agent::trajectory::{Trajectory, TrajectoryFormat};
 use crate::clock::{self, Clock};
 use crate::ir::{Outcome, Protocol, Source};
 use crate::openai::responses_store::ResponseStore;
+use crate::policy::{Policies, PolicySpec};
 use crate::reqlog::{RequestFilter, RequestLog, RequestRecord, StatusFilter};
 use crate::script::{Engine, Rule, ScriptFormat};
 use crate::{Config, Response, json_response};
@@ -46,7 +48,7 @@ pub struct ResetOptions {
     pub clock: bool,
     /// Empty the request log.
     pub requests: bool,
-    /// Remove all script rules.
+    /// Remove all script rules, trajectories and policies (policy subprocesses are stopped).
     pub scripts: bool,
     /// Forget stored Responses API objects.
     pub responses: bool,
@@ -85,6 +87,18 @@ impl From<crate::clock::OutOfRange> for ControlError {
     }
 }
 
+impl From<crate::agent::trajectory::TrajectoryError> for ControlError {
+    fn from(e: crate::agent::trajectory::TrajectoryError) -> Self {
+        Self::BadRequest(e.to_string())
+    }
+}
+
+impl From<crate::policy::PolicyError> for ControlError {
+    fn from(e: crate::policy::PolicyError) -> Self {
+        Self::BadRequest(e.to_string())
+    }
+}
+
 impl From<crate::script::ScriptError> for ControlError {
     fn from(e: crate::script::ScriptError) -> Self {
         Self::BadRequest(e.to_string())
@@ -94,8 +108,12 @@ impl From<crate::script::ScriptError> for ControlError {
 impl Control {
     /// Builds the state for a server; fails if `config.scripts` has an invalid rule.
     pub(crate) fn new(config: &Config) -> Result<Self, ControlError> {
-        let engine = Engine::new(config.fallback.clone(), config.strict, config.delivery.clone());
+        let policies = Policies::new(config.policy_runtime.clone(), Duration::from_millis(config.policy_timeout_ms));
+        let engine = Engine::new(config.fallback.clone(), config.strict, config.delivery.clone()).with_policies(policies);
         engine.scripts.replace(config.scripts.clone())?;
+        if !config.trajectories.is_empty() {
+            engine.trajectories.replace(config.trajectories.clone())?;
+        }
         let log = RequestLog::new(config.request_log, config.request_log_capacity);
         log.set_redact_auth(config.redact_auth);
         Ok(Self {
@@ -117,6 +135,8 @@ impl Control {
     pub fn reset_with(&self, opts: ResetOptions) {
         if opts.scripts {
             self.engine.scripts.clear();
+            self.engine.trajectories.clear();
+            self.engine.policies.clear();
         }
         if opts.clock {
             self.clock.reset();
@@ -142,6 +162,8 @@ impl Control {
             "version": env!("CARGO_PKG_VERSION"),
             "clock": clock_json(&self.clock),
             "scripts": { "count": self.engine.scripts.len() },
+            "trajectories": { "count": self.engine.trajectories.len() },
+            "policies": { "count": self.engine.policies.len() },
             "responses": { "count": self.responses.len() },
             "strict": self.engine.strict,
             "request_log": log_config_json(&self.log),
@@ -205,6 +227,14 @@ impl Control {
         &self.engine.scripts
     }
 
+    pub fn trajectories(&self) -> &crate::agent::trajectory::Trajectories {
+        &self.engine.trajectories
+    }
+
+    pub fn policies(&self) -> &Policies {
+        &self.engine.policies
+    }
+
     /// Logged requests matching `filter`, oldest first, and the match count before `limit`.
     pub fn requests(&self, filter: &RequestFilter) -> (Vec<RequestRecord>, usize) {
         self.log.list(filter)
@@ -235,6 +265,16 @@ impl Control {
     ///   or YAML when `Content-Type` is `application/yaml` or `text/yaml`
     /// - `POST /_fakellm/scripts`              append, same body
     /// - `DELETE /_fakellm/scripts`            clear
+    /// - `GET  /_fakellm/trajectories`         `{"trajectories": [TrajectoryInfo...]}`
+    /// - `PUT  /_fakellm/trajectories`         replace; body is a trajectory object, a JSON/YAML array of them,
+    ///   `{"trajectories":[...]}`, or JSONL (`Content-Type: application/x-ndjson`)
+    /// - `POST /_fakellm/trajectories`         add, a same-named trajectory is replaced in place
+    /// - `DELETE /_fakellm/trajectories`       clear
+    /// - `GET  /_fakellm/trajectories/{name}[?format=jsonl]`, `DELETE /_fakellm/trajectories/{name}`
+    /// - `GET  /_fakellm/policies`             `{"policies": [PolicyInfo...]}`
+    /// - `PUT|POST /_fakellm/policies`         body is `{name, source, runtime?}`, an array of them or
+    ///   `{"policies":[...]}` (JSON or YAML); every module is dry-run loaded first, a load error is a 400
+    /// - `DELETE /_fakellm/policies`, `GET|DELETE /_fakellm/policies/{name}`
     /// - `GET  /_fakellm/clock`, `POST /_fakellm/clock/{freeze,unfreeze,set,advance,reset}`
     ///   bodies `{"at": "<RFC 3339>"}` / `{"by": "<duration>"}`, same as fakes3
     /// - `GET  /_fakellm/responses`, `DELETE /_fakellm/responses`  stored Responses API objects
@@ -262,11 +302,21 @@ impl Control {
             .into_owned()
             .collect();
         let format = script_format(&parts.headers);
-        self.route(&parts.method, parts.uri.path(), &query, &body, format)
+        let tformat = trajectory_format(&parts.headers);
+        self.route(&parts.method, parts.uri.path(), &query, &body, format, tformat)
+            .await
             .unwrap_or_else(Response::from)
     }
 
-    fn route(&self, method: &http::Method, path: &str, q: &Query, body: &[u8], format: ScriptFormat) -> Result<Response, ControlError> {
+    async fn route(
+        &self,
+        method: &http::Method,
+        path: &str,
+        q: &Query,
+        body: &[u8],
+        format: ScriptFormat,
+        tformat: TrajectoryFormat,
+    ) -> Result<Response, ControlError> {
         use http::Method as M;
         let rest = path.strip_prefix(PREFIX).unwrap_or("").trim_end_matches('/');
         let segs: Vec<&str> = rest.split('/').skip(1).collect();
@@ -312,6 +362,80 @@ impl Control {
                 }
                 _ => not_allowed(),
             },
+            ["trajectories"] => match *method {
+                M::GET => Ok(reply(200, json!({ "trajectories": self.engine.trajectories.list() }))),
+                M::PUT | M::POST => {
+                    let text = std::str::from_utf8(body).map_err(|_| ControlError::BadRequest("body must be UTF-8".into()))?;
+                    let items = Trajectory::parse_many(text, tformat)?;
+                    let count = items.len();
+                    if *method == M::PUT {
+                        self.engine.trajectories.replace(items)?;
+                    } else {
+                        self.engine.trajectories.upsert(items)?;
+                    }
+                    Ok(reply(200, json!({ "added": count, "count": self.engine.trajectories.len() })))
+                }
+                M::DELETE => {
+                    self.engine.trajectories.clear();
+                    Ok(reply(200, json!({ "cleared": true })))
+                }
+                _ => not_allowed(),
+            },
+            ["trajectories", name] => {
+                let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
+                match *method {
+                    M::GET => {
+                        let t = self
+                            .engine
+                            .trajectories
+                            .get(&name)
+                            .ok_or_else(|| ControlError::NotFound(format!("no trajectory named {name:?}")))?;
+                        match q.iter().find(|(k, _)| k == "format").map(|(_, v)| v.as_str()) {
+                            None | Some("json") => Ok(reply(200, t.to_json())),
+                            Some("jsonl") => Ok(text_response(200, "application/x-ndjson", t.to_jsonl())),
+                            Some(_) => Err(ControlError::BadRequest("format must be json or jsonl".into())),
+                        }
+                    }
+                    M::DELETE if self.engine.trajectories.remove(&name) => Ok(reply(200, json!({ "deleted": true }))),
+                    M::DELETE => Err(ControlError::NotFound(format!("no trajectory named {name:?}"))),
+                    _ => not_allowed(),
+                }
+            }
+            ["policies"] => match *method {
+                M::GET => Ok(reply(200, json!({ "policies": self.engine.policies.list() }))),
+                M::PUT | M::POST => {
+                    let text = std::str::from_utf8(body).map_err(|_| ControlError::BadRequest("body must be UTF-8".into()))?;
+                    let specs = PolicySpec::parse_many(text, format)?;
+                    let count = specs.len();
+                    if *method == M::PUT {
+                        self.engine.policies.replace(specs).await?;
+                    } else {
+                        self.engine.policies.upsert(specs).await?;
+                    }
+                    Ok(reply(200, json!({ "added": count, "count": self.engine.policies.len() })))
+                }
+                M::DELETE => {
+                    self.engine.policies.clear();
+                    Ok(reply(200, json!({ "cleared": true })))
+                }
+                _ => not_allowed(),
+            },
+            ["policies", name] => {
+                let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
+                match *method {
+                    M::GET => {
+                        let p = self
+                            .engine
+                            .policies
+                            .get(&name)
+                            .ok_or_else(|| ControlError::NotFound(format!("no policy named {name:?}")))?;
+                        Ok(reply(200, serde_json::to_value(p).unwrap_or(Value::Null)))
+                    }
+                    M::DELETE if self.engine.policies.remove(&name) => Ok(reply(200, json!({ "deleted": true }))),
+                    M::DELETE => Err(ControlError::NotFound(format!("no policy named {name:?}"))),
+                    _ => not_allowed(),
+                }
+            }
             ["responses"] => match *method {
                 M::GET => Ok(reply(200, self.responses_json())),
                 M::DELETE => Ok(reply(200, json!({ "deleted": self.clear_responses() }))),
@@ -378,6 +502,26 @@ fn script_format(headers: &http::HeaderMap) -> ScriptFormat {
         "application/yaml" | "text/yaml" | "application/x-yaml" => ScriptFormat::Yaml,
         _ => ScriptFormat::Auto,
     }
+}
+
+/// Content types that mean "one JSON object per line" for trajectory uploads; YAML types mean YAML.
+fn trajectory_format(headers: &http::HeaderMap) -> TrajectoryFormat {
+    let ct = headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let essence = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match essence.as_str() {
+        "application/x-ndjson" | "application/jsonl" | "application/json-lines" | "text/jsonl" => TrajectoryFormat::Jsonl,
+        "application/yaml" | "text/yaml" | "application/x-yaml" => TrajectoryFormat::Yaml,
+        _ => TrajectoryFormat::Auto,
+    }
+}
+
+fn text_response(status: u16, content_type: &str, body: String) -> Response {
+    http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .header(http::header::CONTENT_LENGTH, body.len())
+        .body(crate::full_body(bytes::Bytes::from(body)))
+        .expect("static response parts are valid")
 }
 
 fn reply(status: u16, body: Value) -> Response {
@@ -459,7 +603,12 @@ fn request_filter(q: &[(String, String)]) -> Result<RequestFilter, ControlError>
                     "openai.chat" => Protocol::OpenaiChat,
                     "openai.responses" => Protocol::OpenaiResponses,
                     "anthropic.messages" => Protocol::AnthropicMessages,
-                    _ => return Err(bad("expected openai.chat, openai.responses or anthropic.messages")),
+                    "openai.embeddings" => Protocol::OpenaiEmbeddings,
+                    _ => {
+                        return Err(bad(
+                            "expected openai.chat, openai.responses, openai.embeddings or anthropic.messages",
+                        ));
+                    }
                 })
             }
             "path" => f.path_prefix = Some(v.clone()),
@@ -506,10 +655,7 @@ fn log_config_json(l: &RequestLog) -> Value {
 /// The JSON view of one log record, as returned by `GET /_fakellm/requests`.
 pub(crate) fn record_json(r: &RequestRecord, full: bool) -> Value {
     let source = r.outcome.as_deref().map(Outcome::source);
-    let rule = match source {
-        Some(Source::Script { name, .. }) => name.clone(),
-        _ => None,
-    };
+    let rule = source.and_then(Source::rule).and_then(|(_, name)| name.map(str::to_owned));
     let reply = match r.outcome.as_deref().map(Outcome::inner) {
         Some(Outcome::Reply { reply, .. }) => json!({
             "finish": reply.finish.as_str(),

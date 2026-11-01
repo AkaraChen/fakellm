@@ -54,6 +54,9 @@ type ReplySpec struct {
 	ReasoningOpaque *string        `json:"reasoning_opaque,omitempty"`
 	Usage           *UsageSpec     `json:"usage,omitempty"`
 	Reset           *bool          `json:"reset,omitempty"`
+	// Trajectory and Policy delegate the reply to a registered trajectory or policy by name.
+	Trajectory string `json:"trajectory,omitempty"`
+	Policy     string `json:"policy,omitempty"`
 }
 
 // ToolCallSpec is a tool call to emit. Arguments is any JSON value; a string is sent verbatim.

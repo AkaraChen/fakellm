@@ -3,7 +3,7 @@
 //! A thin shell over [`fakellm::Server`]. Everything calls the library directly, in process; the
 //! request and response logs use the same JSON builders as the control plane's HTTP API
 //! (`Control::requests_json`), so the JS objects are exactly the JSON it serves. [`control`] holds
-//! the sub-objects `scripts`, `requests`, `responses` and `clock`.
+//! the sub-objects `scripts`, `trajectories`, `policies`, `requests`, `responses` and `clock`.
 
 mod control;
 
@@ -28,6 +28,16 @@ pub struct StartOptions {
     pub strict: Option<bool>,
     /// Rules loaded at start: an array of rule objects, or a JSON / YAML document as a string.
     pub scripts: Option<serde_json::Value>,
+    /// Trajectories registered at start: an array of trajectory objects, or a JSON / YAML / JSONL string.
+    pub trajectories: Option<serde_json::Value>,
+    /// Policies registered at start: an array of `{ name, source, runtime? }`, or a JSON / YAML string.
+    /// A module that does not load rejects `start()`.
+    pub policies: Option<serde_json::Value>,
+    /// Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: whichever of
+    /// tjs, node, bun is on PATH first.
+    pub policy_runtime: Option<String>,
+    /// Also serve the API under this path prefix, e.g. `/anthropic`.
+    pub path_prefix: Option<String>,
     /// Delay before the first token: milliseconds, or a string such as `"200ms"`. Default 0.
     pub ttft: Option<Either<f64, String>>,
     /// Streaming speed for replies that do not set their own; 0 (default) means no pacing.
@@ -101,6 +111,18 @@ impl FakeLlmServer {
     #[napi(getter)]
     pub fn scripts(&self) -> control::ScriptsControl {
         control::ScriptsControl::new(self.server.clone())
+    }
+
+    /// Trajectories: scripted agent runs replayed one step per request.
+    #[napi(getter)]
+    pub fn trajectories(&self) -> control::TrajectoriesControl {
+        control::TrajectoriesControl::new(self.server.clone())
+    }
+
+    /// Policy scripts: JS modules that decide each reply.
+    #[napi(getter)]
+    pub fn policies(&self) -> control::PoliciesControl {
+        control::PoliciesControl::new(self.server.clone())
     }
 
     /// The log of API requests the server has received.
@@ -223,6 +245,16 @@ pub async fn start(options: Option<StartOptions>) -> Result<FakeLlmServer> {
         if let Some(v) = o.scripts {
             config.scripts = control::rules(v)?;
         }
+        if let Some(v) = o.trajectories {
+            config.trajectories = control::trajectories(v)?;
+        }
+        if let Some(v) = o.policies {
+            config.policies = control::policies(v)?;
+        }
+        if let Some(r) = o.policy_runtime {
+            config.policy_runtime = Some(r.parse().map_err(control_error)?);
+        }
+        config.path_prefix = o.path_prefix.or(config.path_prefix);
         if let Some(t) = o.ttft {
             let n = nanos(t)?;
             if n < 0 {

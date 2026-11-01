@@ -40,6 +40,27 @@ struct Opt {
     #[arg(long, env = "FAKELLM_SCRIPTS")]
     scripts: Option<std::path::PathBuf>,
 
+    /// Trajectories to load at start (repeatable): a JSON, YAML or JSONL file, see docs/agent.md.
+    #[arg(long = "trajectory", env = "FAKELLM_TRAJECTORIES", value_delimiter = ',', value_name = "FILE")]
+    trajectories: Vec<std::path::PathBuf>,
+
+    /// Policy scripts to load at start (repeatable): an ES module exporting `decide(request, context)`;
+    /// the policy is named after the file stem.
+    #[arg(long = "policy", env = "FAKELLM_POLICIES", value_delimiter = ',', value_name = "FILE")]
+    policies: Vec<std::path::PathBuf>,
+
+    /// Runtime for policy scripts: tjs, node, bun or a path. Default: tjs if on PATH, else node, else bun.
+    #[arg(long, env = "FAKELLM_POLICY_RUNTIME")]
+    policy_runtime: Option<fakellm::Runtime>,
+
+    /// How long a policy may take to decide, in milliseconds (host clock).
+    #[arg(long, default_value_t = 5000, env = "FAKELLM_POLICY_TIMEOUT_MS")]
+    policy_timeout_ms: u64,
+
+    /// Also serve the API under this path prefix, e.g. /anthropic for /anthropic/v1/messages.
+    #[arg(long, env = "FAKELLM_PATH_PREFIX")]
+    path_prefix: Option<String>,
+
     /// Length of the default reply, in tokens.
     #[arg(long, default_value_t = 32, env = "FAKELLM_FALLBACK_TOKENS")]
     fallback_tokens: u32,
@@ -138,6 +159,22 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         }
         None => Vec::new(),
     };
+    let mut trajectories = Vec::new();
+    for path in &opt.trajectories {
+        let text = std::fs::read_to_string(path).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+        let format = match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => fakellm::TrajectoryFormat::Json,
+            Some("jsonl" | "ndjson") => fakellm::TrajectoryFormat::Jsonl,
+            Some("yaml" | "yml") => fakellm::TrajectoryFormat::Yaml,
+            _ => fakellm::TrajectoryFormat::Auto,
+        };
+        trajectories.extend(fakellm::Trajectory::parse_many(&text, format).map_err(|e| invalid(format!("{}: {e}", path.display())))?);
+    }
+    let policies = opt
+        .policies
+        .iter()
+        .map(|path| fakellm::PolicySpec::from_path(path).map_err(|e| invalid(format!("{}: {e}", path.display()))))
+        .collect::<Result<Vec<_>, _>>()?;
     let ttft = fakellm::parse_duration(&opt.ttft).map_err(invalid)?;
     if ttft < 0 {
         return Err(invalid("--ttft must not be negative".into()));
@@ -166,14 +203,45 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         request_log: !opt.no_request_log,
         request_log_capacity: opt.request_log_capacity,
         redact_auth: opt.redact_auth,
+        path_prefix: opt.path_prefix,
+        trajectories,
+        policies,
+        policy_runtime: opt.policy_runtime,
+        policy_timeout_ms: opt.policy_timeout_ms,
     };
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
-        let server = fakellm::Server::start(config).await?;
+        let mut server = fakellm::Server::start(config).await?;
         println!("{}", server.endpoint());
         std::io::stdout().flush()?;
-        server.wait().await;
+        tokio::select! {
+            () = server.wait_ref() => {}
+            () = shutdown_signal() => server.shutdown().await,
+        }
         Ok(std::process::ExitCode::SUCCESS)
     })
+}
+
+/// Resolves on SIGINT or SIGTERM, so policy subprocesses are killed and their temp dirs removed on the way out.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Prints the client configuration; usage errors exit with 2.

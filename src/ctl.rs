@@ -458,7 +458,11 @@ fn request_line(r: &Value) -> String {
         "{:>6}  {}  {:<4} {:<6} {}  {}  stream={}  {}  {}",
         r["seq"],
         text(r, "time"),
-        r["status"],
+        if r["hung"] == true {
+            "hung".to_owned()
+        } else {
+            r["status"].to_string()
+        },
         text(r, "method"),
         text(r, "path"),
         text(r, "model"),
@@ -582,6 +586,14 @@ mod tests {
         assert!(request_line(&r).contains("script/greet"));
         let r = json!({"seq": 2, "source": {"kind": "fallback"}, "rule": null});
         assert!(request_line(&r).contains("fallback"));
+    }
+
+    #[test]
+    fn request_line_marks_hung() {
+        let hung = request_line(&json!({"seq": 1, "status": 0, "hung": true, "method": "POST", "path": "/v1/messages"}));
+        assert!(hung.contains(" hung "), "{hung}");
+        let ok = request_line(&json!({"seq": 2, "status": 200, "hung": false, "method": "POST", "path": "/v1/messages"}));
+        assert!(ok.contains(" 200 ") && !ok.contains("hung"), "{ok}");
     }
 
     fn plan_of(args: &[&str]) -> Call {

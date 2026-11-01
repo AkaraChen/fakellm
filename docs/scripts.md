@@ -41,7 +41,8 @@
 | 字段 | 类型 | 语义 |
 |---|---|---|
 | `model` | glob | 对请求的 `model` 做 glob，`*` 任意串，`?` 一个字符，区分大小写。`gpt-*`、`*-mini` |
-| `last_user` | 正则 | 匹配**最近一条** user 消息的文本（后面即使跟着 assistant / tool 消息也算）。没有 user 消息则不匹配 |
+| `last_user` | 正则 | 匹配**最近一条** user 消息的文本（后面即使跟着 assistant / tool 消息也算）；文本先去掉 `<system-reminder>` 块，去完是空的消息跳过。没有这样的 user 消息则不匹配 |
+| `last_user_raw` | 正则 | 同上，但匹配最近一条 user 消息的原文，不做任何处理（Claude Code 的第一条 user 消息是 reminder 块时用它） |
 | `system` | 正则 | 匹配所有 system 和 developer 消息拼起来的文本（用换行连接） |
 | `any_message` | 正则 | 任何一条消息（任何角色）的文本匹配即可 |
 | `has_tool` | 字符串 | `tools` 里提供了这个名字的工具 |
@@ -53,7 +54,7 @@
 | `stream` | 布尔 | `true` 只匹配流式请求，`false` 只匹配非流式 |
 | `turn` | 整数 | 请求里已有多少条 assistant 消息；第一次请求是 `0` |
 | `any` | 布尔 | 显式的“全部匹配”，只为可读，`{}` 等价 |
-| `protocol` | 字符串 | 只匹配某个协议：`openai.chat`、`openai.responses`、`anthropic.messages`。写别的值是 400 |
+| `protocol` | 字符串 | 只匹配某个协议：`openai.chat`、`openai.responses`、`openai.embeddings`、`anthropic.messages`。写别的值是 400 |
 | `probability` | 数字 | 0 到 1。其他条件都满足后，以这个概率命中。不在范围内（包括 NaN）是 400 |
 | `every_nth` | 整数 | 至少为 1。其他条件都满足的请求里，每第 N 个命中：`every_nth: 3` 命中第 3、6、9 个 |
 
@@ -89,7 +90,7 @@
 
 ## Reply
 
-`text`、`tool_calls`、`error`、`hang` / `hang_ms` 至少要有一个；`error` 不能和 `text` / `tool_calls` 同时出现；`text` 和 `tool_calls` 可以同时出现（先发文本，再发工具调用）。空的 `tool_calls: []` 不算。违反的规则注册时 400。只写 `hang: true` 的规则是合法的。
+`text`、`tool_calls`、`error`、`hang` / `hang_ms`、`trajectory`、`policy` 至少要有一个；`error` 不能和 `text` / `tool_calls` 同时出现；`text` 和 `tool_calls` 可以同时出现（先发文本，再发工具调用）。空的 `tool_calls: []` 不算。违反的规则注册时 400。只写 `hang: true` 的规则是合法的。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -104,8 +105,10 @@
 | `finish_reason` | `stop` / `length` / `tool_calls` / `content_filter` | 覆盖自动推断的结束原因。默认：被 `max_tokens` 截断为 `length`，有工具调用为 `tool_calls`，否则 `stop` |
 | `stream` | 对象 | 流式节奏，见下 |
 | `delay_ms` | 整数 | 同步响应或错误响应发出前的等待，毫秒，服务端时钟。流式请求里等同 `stream.ttft_ms`（`stream.ttft_ms` 优先） |
+| `trajectory` | 字符串 | 把请求交给这条已注册的[轨迹](agent.md#轨迹)，由它按请求里的历史选一步来回答。不能和 `text`、`tool_calls`、`reasoning`、`finish_reason`、`error`、`policy` 同时写；`stream`、`delay_ms`、`hang*`、`reset`、`usage` 是步骤的默认值。名字在请求到来时才查，找不到是 400 `fakellm_trajectory_not_found` |
+| `policy` | 字符串 | 把请求交给这个已注册的[策略脚本](agent.md#策略脚本)，由 JS 模块决定回复。同样不能和内容、`error`、`trajectory` 同时写，规则上的 `stream`、`delay_ms`、`hang*`、`reset`、`usage` 是策略回复的默认值。找不到是 400 `fakellm_policy_not_found` |
 
-`usage` 总是由服务端用内置 tokenizer 算出，不能在规则里写。`prompt_tokens` 来自整个请求，`completion_tokens` 是文本、工具调用参数和推理文本的 token 之和。
+没有被覆盖的 `usage` 字段由服务端用内置 tokenizer 算出：`prompt_tokens` 来自整个请求，`completion_tokens` 是文本、工具调用参数和推理文本的 token 之和。
 
 ### ToolCall
 
@@ -137,7 +140,7 @@
 
 ### Usage
 
-`usage` 的字段同时接受 OpenAI 和 Anthropic 的写法：`prompt_tokens` / `input_tokens`、`completion_tokens` / `output_tokens`（含推理）、`cached_tokens`（`cache_read_tokens`）、`reasoning_tokens`、`cache_creation_tokens`（`cache_creation_input_tokens`）。写了的字段原样出现在响应的 usage 里（流式也是），没写的照常用 tokenizer 计算（唯一的例外：Anthropic 协议的 `usage.input_tokens` 是扣掉缓存读写之后的值，所以规则里写 `input_tokens: 20236` 又写 `cached_tokens: 5` 时，Anthropic 响应里是 `input_tokens: 20231`、`cache_read_input_tokens: 5`；`count_tokens` 返回的仍是 20236）；`completion_tokens` 没写时，会用你给的 `reasoning_tokens` 重新累加。
+`usage` 的字段同时接受 OpenAI 和 Anthropic 的写法：`prompt_tokens` / `input_tokens`、`completion_tokens` / `output_tokens`（含推理）、`cached_tokens`（`cache_read_tokens`）、`reasoning_tokens`、`cache_creation_tokens`（`cache_creation_input_tokens`）。写了的字段原样出现在响应的 usage 里（流式也是），没写的照常用 tokenizer 计算（Anthropic 协议下 `input_tokens` 同样原样输出：规则里写 `input_tokens: 20236` 又写 `cached_tokens: 5`，响应里是 `input_tokens: 20236`、`cache_read_input_tokens: 5`，请求日志里的 `prompt_tokens` 是 20241。真实 API 的 `input_tokens` 不含缓存读写、`count_tokens` 返回总数；没有写 `input_tokens` 的规则时，fakellm 按真实语义由 tokenizer 总数扣减缓存得出。`count_tokens` 返回规则里写的值）；`completion_tokens` 没写时，会用你给的 `reasoning_tokens` 重新累加。
 
 `POST /v1/messages/count_tokens` 也会查剧本：第一条匹配且写了 `usage.input_tokens` 的规则，它的值就是返回的 `input_tokens`，并**算一次命中**（受 `times` 约束）；没有这样的规则时返回 tokenizer 的计数。没写 `input_tokens` 的规则在 count_tokens 里被整条跳过，不会被消耗。
 
@@ -155,6 +158,7 @@
 | `ttft_ms` | 整数 | 首 token 延迟：从请求开始到发出第一个 chunk（role chunk），毫秒 |
 | `tokens_per_sec` | 数字 | 流式速度，必须大于 0。chunk 之间等待 `chunk_tokens / tokens_per_sec` 秒；不写则 chunk 之间不等待 |
 | `chunk_tokens` | 整数 | 每个 content chunk 含几个 token，默认 1（真实 API 的行为）；0 按 1 处理 |
+| `args_chunk_bytes` | 整数 | 流式工具调用的参数每个分片的字节数，至少 1（0 是 400），覆盖 `--args-chunk-bytes`（默认 16），三个协议都生效。配合 `tokens_per_sec` 可以模拟缓慢的工具参数，如 `args_chunk_bytes: 5` 把 20 字节的参数分成 4 片 |
 | `cut_after_chunks` | 整数 | 发完这么多个 content chunk 后结束 body，**不发 finish chunk 和 `[DONE]`**（Anthropic 没有 `message_delta` / `message_stop`，Responses 没有 `response.completed`），用来测客户端的流中断处理。结束是干净的 chunked 结尾，不是连接中断（要中断用 `reset_after_chunks`） |
 | `reset_after_chunks` | 整数 | 和 `cut_after_chunks` 同一个位置，但连接被**异常中断**（没有结尾的 `0\r\n\r\n`）：连接以 FIN 关闭（不是 RST），客户端看到 `premature close` / `terminated` / `unexpected EOF` / 不完整的 chunked body（通常不是 ECONNRESET），而不是干净的流结束。两者都写时取较小的那个 |
 
@@ -482,3 +486,8 @@ data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_...",
 ```
 
 `retry_after` 在 `response.failed` 里变成 `response.error.headers` 的 `retry-after`。
+
+### 路径前缀与其他（M3）
+
+- 路径前缀：`--path-prefix /anthropic`（`Config.path_prefix`）会先被剥掉；此外，任何前置若干段后恰好是 `/v1/messages`、`/v1/messages/count_tokens`、`/v1/chat/completions`、`/v1/responses[/id]`、`/v1/models[/id]`、`/v1/embeddings`（或不带 `/v1` 的写法）的路径都会路由到对应接口，例如 `/gateway/v2/proxy/v1/chat/completions`。请求日志保留完整路径；其余路径仍是 404。
+- `fakellm ctl requests list` 对挂起（`hung`）的请求在状态列显示 `hung`。

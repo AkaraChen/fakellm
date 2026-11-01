@@ -45,6 +45,10 @@ func (s *Server) do(ctx context.Context, method, path, contentType string, body 
 		}
 		return &Error{Status: res.StatusCode, Code: e.Error.Code, Message: e.Error.Message}
 	}
+	if r, ok := out.(rawString); ok {
+		*r.p = string(data)
+		return nil
+	}
 	if out == nil || len(data) == 0 {
 		return nil
 	}

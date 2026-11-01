@@ -135,7 +135,7 @@ impl RequestFilter {
         }
         if let Some(want) = &self.source {
             let kind = match r.outcome.as_deref().map(Outcome::source) {
-                Some(Source::Script { .. }) => "script",
+                Some(Source::Script { .. } | Source::Trajectory { .. } | Source::Policy { .. }) => "script",
                 Some(Source::Fallback) => "fallback",
                 Some(Source::Strict) => "strict",
                 Some(Source::Rejected) => "rejected",
@@ -149,8 +149,8 @@ impl RequestFilter {
             return false;
         }
         if let Some(want) = &self.rule {
-            match r.outcome.as_deref().map(Outcome::source) {
-                Some(Source::Script { name: Some(n), .. }) if n == want => {}
+            match r.outcome.as_deref().map(Outcome::source).and_then(Source::rule) {
+                Some((_, Some(n))) if n == want => {}
                 _ => return false,
             }
         }

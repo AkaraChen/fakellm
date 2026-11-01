@@ -56,10 +56,12 @@ await llm.clock.advance('500ms');   // 现在首个 chunk 到达
 
 | 名字 | 说明 |
 |---|---|
-| `start(options?)` | 启动二进制，返回 `FakeLLM`。选项：`bin`、`host`、`port`（默认 0）、`apiKey`、`models`、`strict`、`scripts`（规则数组，或剧本文件路径）、`ttft`、`tokensPerSec`、`args`、`env`、`readyTimeoutMs` |
+| `start(options?)` | 启动二进制，返回 `FakeLLM`。选项：`bin`、`host`、`port`（默认 0）、`apiKey`、`models`、`strict`、`scripts`（规则数组，或剧本文件路径）、`trajectories`、`policies`、`policyRuntime`、`pathPrefix`、`ttft`、`tokensPerSec`、`args`、`env`、`readyTimeoutMs` |
 | `connect(url)` | 连接已运行的服务；`stop()` 和 `wire()` 对它无效 |
 | `llm.url` / `baseURL` / `anthropicBaseURL` / `port` | 地址；`baseURL` 是 `url + '/v1'`（OpenAI SDK），`anthropicBaseURL` 是 `url`（Anthropic SDK 自己加 `/v1`） |
 | `llm.scripts` | `put(rules, { keepHits })` 替换，`add(rules)` 追加，`list()`（带 `hits`、`reached`、`exhausted`），`clear()` |
+| `llm.trajectories` | `put(items)` 替换，`add(items)` 追加（同名则原位替换），`list()`（带 `hits`、`last_step`），`clear()`；轨迹 `Trajectory` 由 `steps`（`reply` + 可选 `expect`）、`on_divergence`、`cursor`、`tool_map` 等组成，规则里用 `reply: { trajectory: name }` 引用 |
+| `llm.policies` | `put(items)` 替换，`add(items)` 追加，`list()`，`clear()`；`Policy` 是 `{ name, source, runtime? }`，`source` 是导出 `decide(request, context)` 的 ES 模块，规则里用 `reply: { policy: name }` 引用；模块加载失败时抛 `FakeLLMError`（400）。`start()` 的 `trajectories` / `policies` 选项在启动后经控制面注册，失败时先停掉子进程再抛错 |
 | `llm.requests` | `list(filter?)`、`count(filter?)`、`clear()`、`config(set?)`（读 / 改日志的 `enabled`、`capacity`，返回 `LogConfig`）、`dropped()`；过滤字段与 `GET /_fakellm/requests` 的查询参数同名（`model`、`has_tool`、`stream`、`protocol`、`status`、`source`、`rule`、`path`、`since`、`after`、`limit`、`full`） |
 | `llm.clock` | `now()`、`state()`、`freeze(at?)`、`unfreeze()`、`set(at)`、`advance(by)`（`'500ms'`、`'1h30m'` 或毫秒数，可以带小数）、`reset()` |
 | `llm.responses` | `list()`、`clear()`（返回删除的个数）：保存的 Responses API 对象 |
@@ -70,7 +72,7 @@ await llm.clock.advance('500ms');   // 现在首个 chunk 到达
 | `llm.stop()` | 结束子进程并等它退出，可重复调用；也支持 `await using`。进程退出时（包括测试崩溃）会自动杀掉子进程；子进程不会阻止 Node 退出 |
 | `text(t, extra?)`、`toolCall(name, args, extra?)`、`error(status, opts?)` | 构造 `Rule` 的小工具 |
 
-类型 `Rule`、`Match`、`Reply`、`ErrorSpec`、`StreamSpec`、`RequestRecord`、`RequestFilter` 等与[剧本格式](../../docs/scripts.md)的字段一一对应。
+类型 `Trajectory`、`Step`、`Expect`、`ToolMap`、`Policy` 对应 [fake agent](../../docs/agent.md) 的 JSON；`Rule`、`Match`、`Reply`、`ErrorSpec`、`StreamSpec`、`RequestRecord`、`RequestFilter` 等与[剧本格式](../../docs/scripts.md)的字段一一对应。
 控制面出错时抛 `FakeLLMError`，带 `status` 和服务器的错误信息。
 
 注意：控制面会拒绝带 `Origin` 头的非 GET 请求，所以不要在浏览器页面里调用这个包，在测试进程里调用。

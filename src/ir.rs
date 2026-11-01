@@ -26,6 +26,10 @@ pub enum Protocol {
     /// `POST /v1/messages`.
     #[serde(rename = "anthropic.messages")]
     AnthropicMessages,
+    /// `POST /v1/embeddings`. The request is logged with one user message per input element;
+    /// nothing is generated, so scripts only ever contribute errors.
+    #[serde(rename = "openai.embeddings")]
+    OpenaiEmbeddings,
 }
 
 impl Protocol {
@@ -34,6 +38,7 @@ impl Protocol {
             Self::OpenaiChat => "openai.chat",
             Self::OpenaiResponses => "openai.responses",
             Self::AnthropicMessages => "anthropic.messages",
+            Self::OpenaiEmbeddings => "openai.embeddings",
         }
     }
 }
@@ -255,6 +260,25 @@ fn one() -> u32 {
     1
 }
 
+/// `text` without its `<system-reminder>...</system-reminder>` blocks (non-greedy, across lines), trimmed.
+/// An opening tag with no closing tag is left as it is.
+pub fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    if !text.contains(OPEN) {
+        return text.trim().to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        let Some(len) = rest[start + OPEN.len()..].find(CLOSE) else { break };
+        out.push_str(&rest[..start]);
+        rest = &rest[start + OPEN.len() + len + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
+}
+
 impl Request {
     /// A request with just a model and messages, for tests and seeds.
     pub fn new(model: impl Into<String>, messages: Vec<Message>) -> Self {
@@ -305,15 +329,32 @@ impl Request {
         self.messages.last()
     }
 
-    /// Text of the most recent user message.
-    pub fn last_user_text(&self) -> Option<String> {
+    /// Text of the most recent user message, exactly as sent. This is what `Match.last_user_raw`
+    /// matches; [`Request::last_user_text`] is the one for ordinary use.
+    pub fn last_user_text_raw(&self) -> Option<String> {
         self.messages.iter().rev().find(|m| m.role == Role::User).map(Message::text_content)
+    }
+
+    /// Text of the most recent user message that still has text once `<system-reminder>...</system-reminder>`
+    /// blocks are removed (Claude Code wraps environment notes and skill lists in them and may send a
+    /// user message that is nothing but reminders). The IR keeps the raw text; only this view strips.
+    /// The stripped text is trimmed. `Match.last_user` matches this.
+    pub fn last_user_text(&self) -> Option<String> {
+        self.messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == Role::User)
+            .map(|m| strip_system_reminders(&m.text_content()))
+            .find(|t| !t.is_empty())
     }
 
     /// Text of the most recent user message, only if nothing followed it (the usual shape of a
     /// fresh turn). `None` when the last message is a tool result or an assistant message.
     pub fn last_message_user_text(&self) -> Option<String> {
-        self.last_message().filter(|m| m.role == Role::User).map(Message::text_content)
+        self.last_message()
+            .filter(|m| m.role == Role::User)
+            .map(|m| strip_system_reminders(&m.text_content()))
+            .filter(|t| !t.is_empty())
     }
 
     pub fn tool_names(&self) -> impl Iterator<Item = &str> {
@@ -642,6 +683,73 @@ impl ApiError {
         .code("fakellm_no_matching_rule")
     }
 
+    // The fake agent's errors. All are `fakellm_error` with a `fakellm_*` code; 400 unless noted
+    // so SDKs do not retry them and the test fails at the first wrong step.
+
+    /// 400 `fakellm_trajectory_diverged`: a strict trajectory step's `expect` did not hold.
+    /// `detail` lists expected against got.
+    pub fn trajectory_diverged(trajectory: &str, step: &str, detail: &str) -> Self {
+        Self::new(
+            400,
+            "fakellm_error",
+            format!("fakellm: trajectory {trajectory:?} diverged at step {step}: {detail}"),
+        )
+        .code("fakellm_trajectory_diverged")
+    }
+
+    /// 400 `fakellm_trajectory_exhausted`: a strict trajectory was asked for a step past its end.
+    pub fn trajectory_exhausted(trajectory: &str, steps: usize, asked: &str) -> Self {
+        Self::new(
+            400,
+            "fakellm_error",
+            format!("fakellm: trajectory {trajectory:?} is exhausted: it has {steps} steps and the client asked for {asked}"),
+        )
+        .code("fakellm_trajectory_exhausted")
+    }
+
+    /// 400 `fakellm_unknown_tool`: a step calls a tool the client did not offer.
+    pub fn unknown_tool(trajectory: &str, step: usize, tool: &str, offered: &[&str]) -> Self {
+        Self::new(
+            400,
+            "fakellm_error",
+            format!(
+                "fakellm: trajectory {trajectory:?} step {step} calls tool {tool:?}, which the client did not offer (offered: [{}])",
+                offered.join(", ")
+            ),
+        )
+        .code("fakellm_unknown_tool")
+    }
+
+    /// 400 `fakellm_trajectory_not_found`: a rule names a trajectory that is not registered.
+    pub fn trajectory_not_found(name: &str) -> Self {
+        Self::new(400, "fakellm_error", format!("fakellm: no trajectory named {name:?} is registered")).code("fakellm_trajectory_not_found")
+    }
+
+    /// 400 `fakellm_policy_not_found`: a rule names a policy that is not registered.
+    pub fn policy_not_found(name: &str) -> Self {
+        Self::new(400, "fakellm_error", format!("fakellm: no policy named {name:?} is registered")).code("fakellm_policy_not_found")
+    }
+
+    /// 400 `fakellm_policy_error`: the policy threw, returned an unusable reply, or answered with garbage.
+    pub fn policy_error(policy: &str, message: &str) -> Self {
+        Self::new(400, "fakellm_error", format!("fakellm: policy {policy:?} failed: {message}")).code("fakellm_policy_error")
+    }
+
+    /// 500 `fakellm_policy_timeout`: no decision within the policy timeout (host clock).
+    pub fn policy_timeout(policy: &str, millis: u64) -> Self {
+        Self::new(
+            500,
+            "fakellm_error",
+            format!("fakellm: policy {policy:?} did not decide within {millis} ms"),
+        )
+        .code("fakellm_policy_timeout")
+    }
+
+    /// 500 `fakellm_policy_crashed`: the policy process died while deciding; the next request starts a new one.
+    pub fn policy_crashed(policy: &str) -> Self {
+        Self::new(500, "fakellm_error", format!("fakellm: policy {policy:?} exited while deciding")).code("fakellm_policy_crashed")
+    }
+
     /// Replaces the status, keeping everything else.
     pub fn with_status(mut self, status: u16) -> Self {
         self.status = status;
@@ -704,6 +812,19 @@ impl ApiError {
 pub enum Source {
     /// A script rule matched.
     Script { index: usize, name: Option<String> },
+    /// A script rule matched and its reply came from step `step` (0-based) of a trajectory.
+    Trajectory {
+        index: usize,
+        name: Option<String>,
+        trajectory: String,
+        step: usize,
+    },
+    /// A script rule matched and a policy script decided the reply.
+    Policy {
+        index: usize,
+        name: Option<String>,
+        policy: String,
+    },
     /// Nothing matched; the deterministic default answered.
     Fallback,
     /// Nothing matched and strict mode is on.
@@ -734,6 +855,18 @@ pub enum Outcome {
         until: Option<Duration>,
         then: Box<Outcome>,
     },
+}
+
+impl Source {
+    /// `(index, name)` of the script rule behind this source, for `Script`, `Trajectory` and `Policy`.
+    pub fn rule(&self) -> Option<(usize, Option<&str>)> {
+        match self {
+            Self::Script { index, name } | Self::Trajectory { index, name, .. } | Self::Policy { index, name, .. } => {
+                Some((*index, name.as_deref()))
+            }
+            Self::Fallback | Self::Strict | Self::Rejected => None,
+        }
+    }
 }
 
 impl Outcome {
@@ -793,6 +926,36 @@ mod tests {
         assert_eq!(req.last_user_text().as_deref(), Some("hi"));
         assert_eq!(req.last_message_user_text(), None);
         assert_eq!(req.assistant_turns(), 1);
+    }
+
+    #[test]
+    fn last_user_text_skips_system_reminders() {
+        assert_eq!(
+            strip_system_reminders("a <system-reminder>x\ny</system-reminder> b<system-reminder>z</system-reminder>"),
+            "a  b"
+        );
+        assert_eq!(strip_system_reminders("a <system-reminder>open"), "a <system-reminder>open");
+        let req = Request::new(
+            "m",
+            vec![
+                Message::text(Role::User, "fix the bug"),
+                Message::text(Role::Assistant, "ok"),
+                Message::text(Role::User, "<system-reminder>\nnote\n</system-reminder>"),
+            ],
+        );
+        assert_eq!(req.last_user_text().as_deref(), Some("fix the bug"));
+        assert_eq!(req.last_message_user_text(), None);
+        assert_eq!(
+            req.last_user_text_raw().as_deref(),
+            Some("<system-reminder>\nnote\n</system-reminder>")
+        );
+        let req = Request::new("m", vec![Message::text(Role::User, "<system-reminder>a</system-reminder>\n hi \n")]);
+        assert_eq!(req.last_user_text().as_deref(), Some("hi"));
+        assert_eq!(req.last_message_user_text().as_deref(), Some("hi"));
+        assert_eq!(
+            Request::new("m", vec![Message::text(Role::User, "<system-reminder>a</system-reminder>")]).last_user_text(),
+            None
+        );
     }
 
     #[test]

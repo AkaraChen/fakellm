@@ -56,6 +56,14 @@ type Options struct {
 	RedactAuth bool
 	// Scripts loaded at start: a JSON or YAML document (string, []byte), or a []Rule / Rule.
 	Scripts any
+	// Trajectories registered right after start: a JSON/YAML/JSONL document (string, []byte), a Trajectory or a []Trajectory.
+	Trajectories any
+	// Policies registered right after start. Needs a policy runtime (tjs, node or bun) on the machine.
+	Policies []Policy
+	// PolicyRuntime is --policy-runtime: tjs, node, bun or a path; empty means the server default.
+	PolicyRuntime string
+	// PathPrefix also serves the API under this prefix, e.g. "/anthropic"; BaseURL and AnthropicBaseURL include it.
+	PathPrefix string
 	// Args are extra command-line arguments, appended last.
 	Args []string
 	// Env is extra environment, "KEY=value", added to the current process environment.
@@ -67,8 +75,10 @@ type Options struct {
 // Server is a running fakellm process.
 type Server struct {
 	url string
-	bin string
-	cmd *exec.Cmd
+	// prefix is Options.PathPrefix, normalised to a leading slash and none trailing.
+	prefix string
+	bin    string
+	cmd    *exec.Cmd
 	// scriptFile is the temp file holding Options.Scripts, removed once the binary has read it.
 	scriptFile string
 	rmOnce     sync.Once
@@ -123,7 +133,15 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	if opts.RedactAuth {
 		args = append(args, "--redact-auth")
 	}
-	s := &Server{bin: bin, client: &http.Client{Timeout: 30 * time.Second}, done: make(chan struct{}), logs: &tailBuffer{max: 8 << 10}}
+	if opts.PolicyRuntime != "" {
+		args = append(args, "--policy-runtime", opts.PolicyRuntime)
+	}
+	prefix := ""
+	if opts.PathPrefix != "" {
+		prefix = "/" + strings.Trim(opts.PathPrefix, "/")
+		args = append(args, "--path-prefix", prefix)
+	}
+	s := &Server{bin: bin, prefix: prefix, client: &http.Client{Timeout: 30 * time.Second}, done: make(chan struct{}), logs: &tailBuffer{max: 8 << 10}}
 	if opts.Scripts != nil {
 		file, err := writeScripts(opts.Scripts)
 		if err != nil {
@@ -184,6 +202,10 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 		}
 		s.url = reachable(line)
 		s.cleanup() // the binary read --scripts before it printed the endpoint
+		if err := s.register(ctx, opts); err != nil {
+			_ = s.Stop()
+			return nil, err
+		}
 	case <-s.done:
 		return nil, fmt.Errorf("fakellm: exited during start (%v): %s", s.werr, s.logs.String())
 	case <-timer.C:
@@ -199,11 +221,11 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 // URL is the server origin, e.g. http://127.0.0.1:40123. Anthropic clients want this as base URL.
 func (s *Server) URL() string { return s.url }
 
-// AnthropicBaseURL is the base URL for the Anthropic SDK, which appends /v1/messages itself. Same as URL.
-func (s *Server) AnthropicBaseURL() string { return s.url }
+// AnthropicBaseURL is the base URL for the Anthropic SDK, which appends /v1/messages itself: URL plus the path prefix.
+func (s *Server) AnthropicBaseURL() string { return s.url + s.prefix }
 
-// BaseURL is URL plus /v1, the base URL for OpenAI clients.
-func (s *Server) BaseURL() string { return s.url + "/v1" }
+// BaseURL is URL plus the path prefix plus /v1, the base URL for OpenAI clients.
+func (s *Server) BaseURL() string { return s.url + s.prefix + "/v1" }
 
 // Logs returns the tail of the process's stderr, for failure messages.
 func (s *Server) Logs() string { return s.logs.String() }

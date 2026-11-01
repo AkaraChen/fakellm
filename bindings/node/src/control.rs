@@ -90,6 +90,137 @@ impl ScriptsControl {
     }
 }
 
+/// Trajectories as an array of objects, or as a JSON / YAML / JSONL string.
+pub(crate) fn trajectories(input: Value) -> Result<Vec<fakellm::Trajectory>> {
+    let (text, format) = match input {
+        Value::String(s) => (s, fakellm::TrajectoryFormat::Auto),
+        v => (v.to_string(), fakellm::TrajectoryFormat::Json),
+    };
+    fakellm::Trajectory::parse_many(&text, format).map_err(control_error)
+}
+
+/// Policies as an array of `{ name, source, runtime? }`, a single one, or a JSON / YAML string.
+pub(crate) fn policies(input: Value) -> Result<Vec<fakellm::PolicySpec>> {
+    let (text, format) = match input {
+        Value::String(s) => (s, fakellm::ScriptFormat::Auto),
+        v => (v.to_string(), fakellm::ScriptFormat::Json),
+    };
+    fakellm::PolicySpec::parse_many(&text, format).map_err(control_error)
+}
+
+/// The registered trajectories. Obtained from `server.trajectories`.
+#[napi(js_name = "TrajectoriesControl")]
+pub struct TrajectoriesControl {
+    server: Slot,
+}
+
+impl TrajectoriesControl {
+    pub(crate) fn new(server: Slot) -> Self {
+        Self { server }
+    }
+}
+
+#[napi]
+impl TrajectoriesControl {
+    /// Replaces all trajectories (hit counters restart). Takes an array of trajectory objects, or a
+    /// JSON / YAML / JSONL document as a string. Returns `{ added, count }`.
+    #[napi]
+    pub fn put(&self, input: Value) -> Result<ScriptsLoaded> {
+        let items = trajectories(input)?;
+        let added = items.len() as u32;
+        with_server(&self.server, |s| {
+            s.trajectories().replace(items).map(|()| ScriptsLoaded {
+                added,
+                count: s.trajectories().len() as u32,
+            })
+        })?
+        .map_err(control_error)
+    }
+
+    /// Adds trajectories, same input as `put`; one with a registered name replaces it in place.
+    #[napi]
+    pub fn add(&self, input: Value) -> Result<ScriptsLoaded> {
+        let items = trajectories(input)?;
+        let added = items.len() as u32;
+        with_server(&self.server, |s| {
+            s.trajectories().upsert(items).map(|()| ScriptsLoaded {
+                added,
+                count: s.trajectories().len() as u32,
+            })
+        })?
+        .map_err(control_error)
+    }
+
+    /// `{ name, steps, on_divergence, cursor, unknown_tool, hits, last_step }` per trajectory.
+    #[napi]
+    pub fn list(&self) -> Result<Value> {
+        with_server(&self.server, |s| serde_json::to_value(s.trajectories().list()).map_err(control_error))?
+    }
+
+    /// Removes all trajectories.
+    #[napi]
+    pub fn clear(&self) -> Result<()> {
+        with_server(&self.server, |s| s.trajectories().clear())
+    }
+}
+
+/// The registered policy scripts. Obtained from `server.policies`.
+#[napi(js_name = "PoliciesControl")]
+pub struct PoliciesControl {
+    server: Slot,
+}
+
+impl PoliciesControl {
+    pub(crate) fn new(server: Slot) -> Self {
+        Self { server }
+    }
+}
+
+#[napi]
+impl PoliciesControl {
+    /// Replaces all policies. Each module is loaded first (a subprocess starts and imports it), so
+    /// this blocks the calling thread for that long and throws with the module's own error when one
+    /// does not load. Returns `{ added, count }`.
+    #[napi]
+    pub fn put(&self, input: Value) -> Result<ScriptsLoaded> {
+        let specs = policies(input)?;
+        let added = specs.len() as u32;
+        with_server(&self.server, |s| {
+            napi::bindgen_prelude::block_on(s.policies().replace(specs)).map(|()| ScriptsLoaded {
+                added,
+                count: s.policies().len() as u32,
+            })
+        })?
+        .map_err(control_error)
+    }
+
+    /// Adds policies, same input as `put`; one with a registered name replaces it (its state restarts).
+    #[napi]
+    pub fn add(&self, input: Value) -> Result<ScriptsLoaded> {
+        let specs = policies(input)?;
+        let added = specs.len() as u32;
+        with_server(&self.server, |s| {
+            napi::bindgen_prelude::block_on(s.policies().upsert(specs)).map(|()| ScriptsLoaded {
+                added,
+                count: s.policies().len() as u32,
+            })
+        })?
+        .map_err(control_error)
+    }
+
+    /// `{ name, runtime, running, hits, restarts, state, log }` per policy.
+    #[napi]
+    pub fn list(&self) -> Result<Value> {
+        with_server(&self.server, |s| serde_json::to_value(s.policies().list()).map_err(control_error))?
+    }
+
+    /// Removes all policies and stops their subprocesses.
+    #[napi]
+    pub fn clear(&self) -> Result<()> {
+        with_server(&self.server, |s| s.policies().clear())
+    }
+}
+
 /// Which logged requests to return. Unset fields match everything.
 #[napi(object)]
 pub struct RequestFilter {
@@ -104,7 +235,7 @@ pub struct RequestFilter {
     pub source: Option<String>,
     /// Name of the rule that answered.
     pub rule: Option<String>,
-    /// `openai.chat`, `openai.responses` or `anthropic.messages`.
+    /// `openai.chat`, `openai.responses`, `openai.embeddings` or `anthropic.messages`.
     pub protocol: Option<String>,
     /// Path prefix.
     pub path: Option<String>,

@@ -19,8 +19,10 @@ use serde_json::Value;
 
 use regex::Regex;
 
+use crate::agent::trajectory::Trajectories;
 use crate::fallback::{self, FallbackConfig};
 use crate::ir::{ApiError, Delivery, FinishReason, Outcome, Protocol, Reply, Request, Source, ToolCall, Usage};
+use crate::policy::Policies;
 use crate::reqlog::glob_match;
 use crate::tokenizer;
 
@@ -36,9 +38,14 @@ pub struct Match {
     /// Glob over the model name: `gpt-*`, `*-mini`, `claude-?-*`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Regex over the most recent user message (`Request::last_user_text`).
+    /// Regex over the most recent user message with `<system-reminder>` blocks removed
+    /// (`Request::last_user_text`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user: Option<Pattern>,
+    /// Regex over the most recent user message exactly as sent (`Request::last_user_text_raw`),
+    /// reminders included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_raw: Option<Pattern>,
     /// Regex over the system/developer text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<Pattern>,
@@ -138,6 +145,10 @@ pub struct StreamSpec {
     /// Like `cut_after_chunks`, but the TCP connection dies without the terminating chunk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_after_chunks: Option<usize>,
+    /// Bytes of tool call arguments per streamed fragment for this rule (aimock's `chunkSize`);
+    /// overrides the server-wide `--args-chunk-bytes`. At least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_chunk_bytes: Option<usize>,
 }
 
 /// Token counts that replace the tokenizer's for the fields given; the others are still computed.
@@ -158,7 +169,8 @@ pub struct UsageSpec {
     pub cache_creation_tokens: Option<u32>,
 }
 
-/// What to answer. Exactly one of `text`/`tool_calls` (together is fine) or `error` must be set.
+/// What to answer. Exactly one of `text`/`tool_calls` (together is fine), `error`, `trajectory` or
+/// `policy` must be set (`hang` alone is also a reply).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReplySpec {
@@ -196,6 +208,29 @@ pub struct ReplySpec {
     /// Sync responses: headers, half the body, then the connection dies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset: Option<bool>,
+    /// Answer with the next step of this registered trajectory (`/_fakellm/trajectories`, see
+    /// `crate::agent`). Excludes `text`, `tool_calls` and `error`; `stream`, `delay_ms`, `hang*`,
+    /// `reset` and `usage` here are defaults for steps that do not set their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trajectory: Option<String>,
+    /// Let this registered policy script decide the reply (`/_fakellm/policies`, see
+    /// `crate::policy`). Same exclusions and defaults as `trajectory`; a policy may itself return
+    /// `trajectory`, never `policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+}
+
+impl ReplySpec {
+    /// Fills every delivery field this spec leaves unset from `base` (the rule's own spec, when
+    /// the content came from a trajectory step or a policy): `stream`, `delay_ms`, `hang`,
+    /// `hang_ms`, `reset`, `usage`. Fields set here win; `stream` is replaced as a whole.
+    pub fn with_defaults_from(mut self, base: &ReplySpec) -> ReplySpec {
+        macro_rules! fill {
+            ($($f:ident),*) => { $(if self.$f.is_none() { self.$f = base.$f.clone(); })* };
+        }
+        fill!(stream, delay_ms, hang, hang_ms, reset, usage);
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -278,7 +313,7 @@ impl Rule {
 }
 
 impl Pattern {
-    fn compile(&self) -> Result<Regex, regex::Error> {
+    pub(crate) fn compile(&self) -> Result<Regex, regex::Error> {
         let s = self.0.as_str();
         let (body, ci) = if s.len() >= 2 && s.starts_with('/') && s.ends_with('/') {
             (&s[1..s.len() - 1], false)
@@ -294,6 +329,7 @@ impl Pattern {
 #[derive(Default)]
 struct Matchers {
     last_user: Option<Regex>,
+    last_user_raw: Option<Regex>,
     system: Option<Regex>,
     any_message: Option<Regex>,
     tool_result_contains: Option<Regex>,
@@ -308,6 +344,7 @@ impl Matchers {
         };
         Ok(Self {
             last_user: one("last_user", &m.last_user)?,
+            last_user_raw: one("last_user_raw", &m.last_user_raw)?,
             system: one("system", &m.system)?,
             any_message: one("any_message", &m.any_message)?,
             tool_result_contains: one("tool_result_contains", &m.tool_result_contains)?,
@@ -316,9 +353,6 @@ impl Matchers {
 }
 
 fn validate(rule: &Rule) -> Result<(), String> {
-    let r = &rule.reply;
-    let has_content = r.text.is_some() || r.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
-    let hangs = r.hang == Some(true) || r.hang_ms.is_some();
     if let Some(p) = rule.matcher.probability
         && !(0.0..=1.0).contains(&p)
     {
@@ -327,8 +361,26 @@ fn validate(rule: &Rule) -> Result<(), String> {
     if rule.matcher.every_nth == Some(0) {
         return Err("match.every_nth must be at least 1".into());
     }
+    validate_reply(&rule.reply)
+}
+
+/// The checks every reply spec must pass, whether it sits in a rule, a trajectory step or came
+/// back from a policy. Steps and policy replies additionally must not delegate again, see
+/// [`validate_leaf_reply`].
+pub(crate) fn validate_reply(r: &ReplySpec) -> Result<(), String> {
+    let has_content = r.text.is_some() || r.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    let delegated = r.trajectory.is_some() || r.policy.is_some();
+    let hangs = r.hang == Some(true) || r.hang_ms.is_some();
+    if r.trajectory.is_some() && r.policy.is_some() {
+        return Err("reply `trajectory` and `policy` exclude each other".into());
+    }
+    if delegated && (has_content || r.error.is_some() || r.reasoning.is_some() || r.finish_reason.is_some()) {
+        return Err("reply `trajectory` / `policy` exclude `text`, `tool_calls`, `reasoning`, `finish_reason` and `error`".into());
+    }
     match (&r.error, has_content) {
-        (None, false) if !hangs => return Err("reply needs `text`, `tool_calls` or `error`".into()),
+        (None, false) if !hangs && !delegated => {
+            return Err("reply needs `text`, `tool_calls`, `error`, `trajectory` or `policy`".into());
+        }
         (Some(_), true) => return Err("reply `error` excludes `text` and `tool_calls`".into()),
         _ => {}
     }
@@ -336,6 +388,9 @@ fn validate(rule: &Rule) -> Result<(), String> {
         && !(tps > 0.0 && tps.is_finite() && Duration::try_from_secs_f64(1.0 / tps).is_ok())
     {
         return Err("reply.stream.tokens_per_sec must be greater than 0 and not vanishingly small".into());
+    }
+    if r.stream.as_ref().and_then(|s| s.args_chunk_bytes) == Some(0) {
+        return Err("reply.stream.args_chunk_bytes must be at least 1".into());
     }
     if let Some(e) = &r.error
         && !(100..=599).contains(&e.status)
@@ -348,6 +403,15 @@ fn validate(rule: &Rule) -> Result<(), String> {
         return Err("reply.error.retry_after must be a non-negative number".into());
     }
     Ok(())
+}
+
+/// [`validate_reply`] plus: no `trajectory` or `policy` (trajectory steps and policy replies are
+/// leaves; a policy may name a trajectory, which the engine handles before it validates).
+pub(crate) fn validate_leaf_reply(r: &ReplySpec) -> Result<(), String> {
+    if r.trajectory.is_some() || r.policy.is_some() {
+        return Err("`trajectory` and `policy` are not allowed here".into());
+    }
+    validate_reply(r)
 }
 
 /// The registered rules with their compiled matchers and hit counters.
@@ -413,6 +477,11 @@ impl Compiled {
         }
         if let Some(re) = &self.re.last_user
             && !req.last_user_text().is_some_and(|t| re.is_match(&t))
+        {
+            return false;
+        }
+        if let Some(re) = &self.re.last_user_raw
+            && !req.last_user_text_raw().is_some_and(|t| re.is_match(&t))
         {
             return false;
         }
@@ -566,8 +635,12 @@ impl Scripts {
 }
 
 /// Decides every request: scripts, then fallback or strict error. Owned by the control plane.
+/// A matching rule may delegate its reply to a trajectory step or a policy script, see
+/// [`Engine::resolve_async`].
 pub struct Engine {
     pub scripts: Scripts,
+    pub trajectories: Trajectories,
+    pub policies: Policies,
     pub fallback: FallbackConfig,
     pub strict: bool,
     /// Delivery used when the matching rule has no `stream`/`delay_ms`.
@@ -578,21 +651,115 @@ impl Engine {
     pub fn new(fallback: FallbackConfig, strict: bool, default_delivery: Delivery) -> Self {
         Self {
             scripts: Scripts::default(),
+            trajectories: Trajectories::default(),
+            policies: Policies::default(),
             fallback,
             strict,
             default_delivery,
         }
     }
 
+    /// Uses `policies` instead of the default (no runtime override, 5 s timeout).
+    pub fn with_policies(mut self, policies: Policies) -> Self {
+        self.policies = policies;
+        self
+    }
+
     /// Produces the outcome for a parsed request: the matching rule's reply (text truncated to
     /// `max_tokens`, tool call ids filled in, `usage` computed with the tokenizer, delivery from
     /// the rule's `stream`/`delay_ms` over `default_delivery`), or the fallback, or the strict
     /// error. Pure apart from the hit counters.
+    ///
+    /// A rule with `trajectory` answers with the trajectory's step for this request (see
+    /// [`Trajectories::step`]). A rule with `policy` cannot be decided synchronously; this entry
+    /// point answers it with a `fakellm_policy_error`. The server uses [`Engine::resolve_async`].
     pub fn resolve(&self, req: &Request) -> Outcome {
         let Some((index, name, spec)) = self.scripts.resolve(req) else {
             return self.unscripted(req);
         };
-        let source = Source::Script { index, name };
+        if let Some(p) = &spec.policy {
+            let source = Source::Policy {
+                index,
+                name,
+                policy: p.clone(),
+            };
+            let error = ApiError::policy_error(p, "policy rules need Engine::resolve_async");
+            return self.error_outcome(error, source);
+        }
+        self.resolve_matched(req, index, name, spec, None)
+    }
+
+    /// [`Engine::resolve`] for the server: a rule with `policy` is decided by that policy
+    /// ([`Policies::decide`], awaited; the reply it returns is then treated like the rule's own,
+    /// with the rule's delivery fields as defaults).
+    pub async fn resolve_async(&self, req: &Request) -> Outcome {
+        let Some((index, name, mut spec)) = self.scripts.resolve(req) else {
+            return self.unscripted(req);
+        };
+        let Some(policy) = spec.policy.take() else {
+            return self.resolve_matched(req, index, name, spec, None);
+        };
+        match self.policies.decide(&policy, req).await {
+            Ok(decided) => {
+                let decided = decided.with_defaults_from(&spec);
+                self.resolve_matched(req, index, name, decided, Some(policy))
+            }
+            Err(error) => self.error_outcome(error, Source::Policy { index, name, policy }),
+        }
+    }
+
+    /// For endpoints that generate nothing scriptable (`POST /v1/embeddings`): the first rule that
+    /// matches and answers with `error`, as an `Outcome::Error`. Rules without `error` are skipped
+    /// entirely, like in [`Engine::count_input_tokens`], so they keep their hit budget.
+    pub fn resolve_error(&self, req: &Request) -> Option<Outcome> {
+        let (index, name, spec) = self.scripts.resolve_where(req, |r| r.error.is_some())?;
+        Some(self.resolve_matched(req, index, name, spec, None))
+    }
+
+    fn error_outcome(&self, error: ApiError, source: Source) -> Outcome {
+        Outcome::Error {
+            error,
+            delivery: self.default_delivery.clone(),
+            source,
+        }
+    }
+
+    /// Everything after a rule (and its policy, if any) produced `spec`: trajectory delegation,
+    /// delivery, and rendering the spec into an outcome. `policy` names the policy that decided
+    /// `spec`, for the log.
+    fn resolve_matched(&self, req: &Request, index: usize, name: Option<String>, mut spec: ReplySpec, policy: Option<String>) -> Outcome {
+        let mut source = match policy {
+            Some(policy) => Source::Policy {
+                index,
+                name: name.clone(),
+                policy,
+            },
+            None => Source::Script { index, name: name.clone() },
+        };
+        if let Some(trajectory) = spec.trajectory.take() {
+            match self.trajectories.step(&trajectory, req) {
+                Ok(stepped) => {
+                    source = Source::Trajectory {
+                        index,
+                        name,
+                        trajectory,
+                        step: stepped.step,
+                    };
+                    spec = stepped.reply.with_defaults_from(&spec);
+                }
+                Err((error, step)) => {
+                    return self.error_outcome(
+                        error,
+                        Source::Trajectory {
+                            index,
+                            name,
+                            trajectory,
+                            step,
+                        },
+                    );
+                }
+            }
+        }
         let mut delivery = self.default_delivery.clone();
         if let Some(s) = &spec.stream {
             if let Some(ms) = s.ttft_ms.or(spec.delay_ms) {
@@ -609,6 +776,9 @@ impl Engine {
             }
             if s.reset_after_chunks.is_some() {
                 delivery.reset_after_chunks = s.reset_after_chunks;
+            }
+            if let Some(n) = s.args_chunk_bytes {
+                delivery.args_chunk_bytes = n.max(1);
             }
         } else if let Some(ms) = spec.delay_ms {
             delivery.ttft = Duration::from_millis(ms);
@@ -634,6 +804,11 @@ impl Engine {
     /// sets `usage.prompt_tokens` (counting its hit), else the tokenizer's count. Rules without
     /// that field are skipped so a count call never eats the budget of the rule meant for the
     /// real request.
+    ///
+    /// Real Anthropic semantics: `usage.input_tokens` of a message excludes cache reads and writes
+    /// (`total = input + cache_read + cache_creation`) while `count_tokens` counts the whole input.
+    /// Here a rule's `input_tokens` is literal in both places (see `Engine::answer`); without a rule
+    /// `count_tokens` is the tokenizer total and a message derives `input_tokens` from the same total.
     pub fn count_input_tokens(&self, req: &Request) -> u32 {
         self.scripts
             .resolve_where(req, |r| r.usage.as_ref().is_some_and(|u| u.prompt_tokens.is_some()))
@@ -721,6 +896,15 @@ impl Engine {
                 + tool_calls.iter().map(|c| tokenizer::count(&c.arguments)).sum::<u32>()
                 + reasoning_tokens
         });
+        let cached_tokens = over.cached_tokens.unwrap_or(0);
+        let cache_creation_tokens = over.cache_creation_tokens.unwrap_or(0);
+        // Anthropic reports `input_tokens` without cache reads and writes, so a literal override is
+        // stored as the total the frontend subtracts from again.
+        let prompt_tokens = match (over.prompt_tokens, req.protocol) {
+            (Some(n), Protocol::AnthropicMessages) => n.saturating_add(cached_tokens).saturating_add(cache_creation_tokens),
+            (Some(n), _) => n,
+            (None, _) => tokenizer::count_request(req),
+        };
         let reply = Reply {
             text,
             tool_calls,
@@ -729,11 +913,11 @@ impl Engine {
             refusal: None,
             finish,
             usage: Usage {
-                prompt_tokens: over.prompt_tokens.unwrap_or_else(|| tokenizer::count_request(req)),
+                prompt_tokens,
                 completion_tokens,
                 reasoning_tokens,
-                cached_tokens: over.cached_tokens.unwrap_or(0),
-                cache_creation_tokens: over.cache_creation_tokens.unwrap_or(0),
+                cached_tokens,
+                cache_creation_tokens,
             },
         };
         Outcome::Reply { reply, delivery, source }
@@ -772,6 +956,7 @@ pub fn interval_from_tps(tps: Option<f64>) -> Duration {
 mod tests {
     use super::*;
     use crate::ir::{Message, Role, ToolDef};
+    use serde_json::json;
 
     fn user(text: &str) -> Request {
         Request::new("gpt-4o", vec![Message::text(Role::User, text)])
@@ -1227,5 +1412,129 @@ mod tests {
         let Outcome::Reply { reply, .. } = e.resolve(&req) else { panic!() };
         assert_eq!(reply.reasoning_opaque.as_deref(), Some("sig"));
         assert!(reply.tool_calls[0].id.starts_with("toolu_"));
+    }
+
+    #[test]
+    fn trajectory_and_policy_replies_validate() {
+        let rule = |reply: serde_json::Value| Rule::parse_many(&json!([{ "reply": reply }]).to_string(), ScriptFormat::Json);
+        let ok = |reply: serde_json::Value| Scripts::default().replace(rule(reply).unwrap()).is_ok();
+        assert!(ok(json!({"trajectory": "t"})));
+        assert!(ok(json!({"policy": "p", "stream": {"tokens_per_sec": 10}, "delay_ms": 5})));
+        assert!(!ok(json!({"trajectory": "t", "text": "x"})));
+        assert!(!ok(json!({"policy": "p", "error": {"status": 500}})));
+        assert!(!ok(json!({"policy": "p", "trajectory": "t"})));
+        assert!(!ok(json!({"text": "x", "stream": {"args_chunk_bytes": 0}})));
+        assert!(
+            validate_leaf_reply(&ReplySpec {
+                text: Some("x".into()),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_leaf_reply(&ReplySpec {
+                trajectory: Some("t".into()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn delegated_replies_inherit_delivery_and_policy_needs_async() {
+        let base = ReplySpec {
+            policy: Some("p".into()),
+            delay_ms: Some(40),
+            usage: Some(UsageSpec {
+                prompt_tokens: Some(9),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let step = ReplySpec {
+            text: Some("t".into()),
+            delay_ms: Some(5),
+            ..Default::default()
+        };
+        let merged = step.with_defaults_from(&base);
+        assert_eq!((merged.delay_ms, merged.usage.and_then(|u| u.prompt_tokens)), (Some(5), Some(9)));
+        let e = engine(false);
+        e.scripts
+            .replace(vec![Rule {
+                name: None,
+                matcher: Match::default(),
+                reply: base,
+                times: None,
+            }])
+            .unwrap();
+        let Outcome::Error { error, source, .. } = e.resolve(&user("x")) else {
+            panic!()
+        };
+        assert_eq!(error.code.as_deref(), Some("fakellm_policy_error"));
+        assert!(matches!(source, Source::Policy { .. }));
+    }
+
+    #[test]
+    fn last_user_raw_and_args_chunk_bytes() {
+        let raw = Match {
+            last_user_raw: pat("hello"),
+            ..Default::default()
+        };
+        let s = Scripts::default();
+        s.replace(vec![text_rule(raw, "a", None)]).unwrap();
+        assert!(s.resolve(&user("hello there")).is_some());
+        assert!(s.resolve(&user("bye")).is_none());
+        let e = engine(false);
+        e.scripts
+            .replace(vec![Rule {
+                name: None,
+                matcher: Match::default(),
+                reply: ReplySpec {
+                    text: Some("x".into()),
+                    stream: Some(StreamSpec {
+                        args_chunk_bytes: Some(3),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                times: None,
+            }])
+            .unwrap();
+        let Outcome::Reply { delivery, .. } = e.resolve(&user("x")) else {
+            panic!()
+        };
+        assert_eq!(delivery.args_chunk_bytes, 3);
+    }
+
+    #[test]
+    fn anthropic_input_tokens_override_is_literal() {
+        let e = engine(false);
+        e.scripts
+            .replace(vec![Rule {
+                name: None,
+                matcher: Match::default(),
+                reply: ReplySpec {
+                    text: Some("x".into()),
+                    usage: Some(UsageSpec {
+                        prompt_tokens: Some(20236),
+                        cached_tokens: Some(5),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                times: None,
+            }])
+            .unwrap();
+        let mut anthropic = user("x");
+        anthropic.protocol = Protocol::AnthropicMessages;
+        let Outcome::Reply { reply, .. } = e.resolve(&anthropic) else {
+            panic!()
+        };
+        assert_eq!((reply.usage.prompt_tokens, reply.usage.cached_tokens), (20241, 5));
+        let Outcome::Reply { reply, .. } = e.resolve(&user("x")) else {
+            panic!()
+        };
+        assert_eq!(reply.usage.prompt_tokens, 20236);
+        assert_eq!(e.count_input_tokens(&anthropic), 20236);
     }
 }

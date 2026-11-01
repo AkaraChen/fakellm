@@ -94,3 +94,93 @@ fn env_vars_and_flag_errors() {
     // The failure is the missing scripts file, not a rejected boolean or duration.
     assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent/y.json"));
 }
+
+fn http_post(endpoint: &str, path: &str, body: &str) -> String {
+    use std::io::{Read, Write};
+    let addr = endpoint.trim_start_matches("http://");
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    write!(
+        conn,
+        "POST {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut out = String::new();
+    conn.read_to_string(&mut out).unwrap();
+    out
+}
+
+fn spawn_with(args: &[&str]) -> (Kill, String) {
+    let mut child = Kill(
+        Command::new(env!("CARGO_BIN_EXE_fakellm"))
+            .args(["--port", "0"])
+            .args(args)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(child.0.stdout.as_mut().unwrap()).read_line(&mut line).unwrap();
+    (child, line.trim().to_owned())
+}
+
+#[test]
+fn policy_and_trajectory_files_load_at_start() {
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("skip: node not on PATH");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("fakellm-bin-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy = dir.join("greeter.mjs");
+    std::fs::write(&policy, "export default () => ({ text: 'hello from policy file' });").unwrap();
+    let traj = dir.join("walk.json");
+    std::fs::write(
+        &traj,
+        r#"{"name": "walk", "steps": [{"reply": {"text": "hello from trajectory file"}}]}"#,
+    )
+    .unwrap();
+    let rules = dir.join("rules.json");
+    std::fs::write(
+        &rules,
+        r#"[{"match": {"last_user": "^traj"}, "reply": {"trajectory": "walk"}}, {"reply": {"policy": "greeter"}}]"#,
+    )
+    .unwrap();
+
+    let (_child, endpoint) = spawn_with(&[
+        "--policy",
+        policy.to_str().unwrap(),
+        "--policy-runtime",
+        "node",
+        "--trajectory",
+        traj.to_str().unwrap(),
+        "--scripts",
+        rules.to_str().unwrap(),
+    ]);
+    let body = |u: &str| format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{u}"}}]}}"#);
+    let r = http_post(&endpoint, "/v1/chat/completions", &body("anything"));
+    assert!(r.contains("hello from policy file"), "{r}");
+    let r = http_post(&endpoint, "/v1/chat/completions", &body("traj please"));
+    assert!(r.contains("hello from trajectory file"), "{r}");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_fakellm"))
+        .args(["ctl", "--endpoint", &endpoint, "--json", "status"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        (v["policies"]["count"].as_u64(), v["trajectories"]["count"].as_u64()),
+        (Some(1), Some(1))
+    );
+
+    let broken = dir.join("broken.mjs");
+    std::fs::write(&broken, "export default (").unwrap();
+    let out = run(&["--port", "0", "--policy", broken.to_str().unwrap(), "--policy-runtime", "node"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("broken"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

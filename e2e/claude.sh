@@ -6,7 +6,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 work=/tmp/fakellm-e2e-claude
 rm -rf "$work"; mkdir -p "$work/config" "$work/cwd"
 cargo build --manifest-path "$root/Cargo.toml" -q
-"$root/target/debug/fakellm" --port 0 >"$work/server.out" 2>"$work/server.err" &
+"${FAKELLM_BIN:-$root/target/debug/fakellm}" --port 0 >"$work/server.out" 2>"$work/server.err" &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT
 for _ in $(seq 50); do url=$(grep -Eo 'http://[0-9.]+:[0-9]+' "$work/server.out" | head -1 || true); [ -n "$url" ] && break; sleep 0.1; done

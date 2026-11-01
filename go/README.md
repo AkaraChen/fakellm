@@ -67,6 +67,10 @@ s, err := fakellm.Start(ctx, fakellm.Options{Bin: bin})
 | `Strict` | 没有规则命中的请求返回 400，而不是默认回复 |
 | `Scripts` | 启动时加载的剧本：JSON 或 YAML 字符串（`string` / `[]byte`），或 `[]Rule`。不合法则 `Start` 返回错误 |
 | `FallbackTokens` / `ChunkTokens` / `ArgsChunkBytes` | 对应 `--fallback-tokens`、`--chunk-tokens`、`--args-chunk-bytes`，0 为服务器默认值 |
+| `Trajectories` | 启动后注册的轨迹：`Trajectory`、`[]Trajectory`，或 JSON / YAML / JSONL 字符串（`string` / `[]byte`） |
+| `Policies` | 启动后注册的策略，`[]fakellm.Policy{{Name, Source, Runtime}}`；需要机器上有 node、bun 或 tjs |
+| `PolicyRuntime` | `--policy-runtime`：`tjs`、`node`、`bun` 或路径；默认由服务器探测 |
+| `PathPrefix` | `--path-prefix`：API 同时挂在这个前缀下；`BaseURL()` 和 `AnthropicBaseURL()` 会带上它（控制面不变） |
 | `Args` | 追加的命令行参数，如 `--ttft`、`--tokens-per-sec` |
 | `Env` | 追加的环境变量，`KEY=value` |
 | `StartTimeout` | 等待启动的时间，默认 10 秒 |
@@ -101,6 +105,41 @@ s.Clock().Set(ctx, at); s.Clock().Unfreeze(ctx); s.Clock().Reset(ctx); s.Clock()
 s.Responses().List(ctx)                // 保存的 Responses 对象（id 和创建时间）
 s.Responses().Clear(ctx)
 ```
+
+### 轨迹和策略
+
+轨迹是一段录好的 agent 过程，每个请求回放一步；策略是一个 JS 模块，由它按请求决定回复。规则里用 `Reply: fakellm.ReplySpec{Trajectory: "名字"}` 或 `Policy: "名字"` 引用它们，细节见 [docs/agent.md](../docs/agent.md) 和 [docs/m3-spec.md](../docs/m3-spec.md)。
+
+```go
+s, _ := fakellm.Start(ctx, fakellm.Options{
+	Trajectories: fakellm.Trajectory{
+		Name: "fix-bug",
+		Steps: []fakellm.TrajectoryStep{
+			{Reply: fakellm.ReplySpec{ToolCalls: []fakellm.ToolCallSpec{{Name: "shell", Arguments: map[string]any{"cmd": "go test"}}}}},
+			{
+				Reply:  fakellm.ReplySpec{Text: fakellm.Ptr("done")},
+				Expect: &fakellm.Expect{ToolResults: []fakellm.ToolResultExpect{{Name: "shell", Contains: "ok"}}},
+			},
+		},
+		ToolMap: map[string]fakellm.ToolMapping{"shell": {Name: "Bash", Args: map[string]any{"command": "$cmd"}}},
+	},
+	Policies: []fakellm.Policy{{Name: "p", Source: `export default (req, ctx) => ({ text: "hit " + ctx.hits })`}},
+	Scripts:  []fakellm.Rule{{Match: fakellm.Match{Any: fakellm.Ptr(true)}, Reply: fakellm.ReplySpec{Trajectory: "fix-bug"}}},
+})
+
+s.Trajectories().Put(ctx, v)           // 替换全部；v 同 Options.Trajectories，返回现有数量
+s.Trajectories().Add(ctx, v)           // 追加，同名原位替换
+s.Trajectories().List(ctx)             // []TrajectoryInfo：Steps / Hits / LastStep 等
+s.Trajectories().Get(ctx, "fix-bug")   // Trajectory；JSONL(ctx, name) 取 JSON 行
+s.Trajectories().Delete(ctx, "fix-bug"); s.Trajectories().Clear(ctx)
+
+s.Policies().Put(ctx, fakellm.Policy{Name: "p", Source: src}) // 全部先试加载，失败返回 400 的 *fakellm.Error，原状态不变
+s.Policies().Add(ctx, policies...)     // 同名替换（状态重置）
+s.Policies().List(ctx)                 // []PolicyInfo：Runtime / Running / Hits / Restarts / State / Log
+s.Policies().Get(ctx, "p"); s.Policies().Delete(ctx, "p"); s.Policies().Clear(ctx)
+```
+
+`Options.Trajectories` / `Policies` 在 `Start` 里通过控制面注册，不合法则 `Start` 返回错误并杀掉进程。`Reset` 会同时清掉轨迹和策略。
 
 写规则时可选字段用指针，`fakellm.Ptr(v)` 帮你取地址：
 
