@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { createRequire } from 'node:module'
 import OpenAI from 'openai'
 import Anthropic from '@anthropic-ai/sdk'
@@ -325,3 +328,101 @@ test('start: trajectories, policies, policyRuntime and pathPrefix', async () => 
   )
   await assert.rejects(start({ policyRuntime: 'node', policies: [{ name: 'bad', source: 'export default 1 +' }] }))
 })
+
+const tape = (name, user, answer) => ({
+  kind: 'cassette',
+  name,
+  exchanges: [
+    {
+      request: { model: 'm', messages: [{ role: 'user', content: [{ type: 'text', text: user }] }] },
+      outcome: { outcome: 'reply', reply: { text: answer, finish: 'stop', usage: { prompt_tokens: 5, completion_tokens: 2 } } },
+      protocol: 'openai.chat',
+    },
+  ],
+})
+const say = async (s, content) =>
+  (await openai(s).chat.completions.create({ model: 'm', messages: [{ role: 'user', content }] })).choices[0].message.content
+
+test('cassettes: put/add/list/clear and replay', () =>
+  withServer(undefined, async (s) => {
+    assert.deepEqual(s.cassettes.put(tape('c1', 'capital?', 'Paris')), { added: 1, count: 1 })
+    assert.equal(await say(s, 'capital?'), 'Paris')
+    assert.deepEqual(s.cassettes.add([tape('c2', 'other?', 'Rome')]), { added: 1, count: 2 })
+    const list = s.cassettes.list()
+    assert.deepEqual(list.map((c) => [c.name, c.exchanges, c.recording]), [['c1', 1, false], ['c2', 1, false]])
+    assert.equal(list[0].hits, 1)
+    assert.equal(s.status().cassettes.count, 2)
+    assert.throws(() => s.cassettes.put([tape('a/b', 'x', 'y')]), /name/)
+    assert.equal(s.cassettes.list().length, 2)
+    s.cassettes.clear()
+    assert.equal(s.cassettes.list().length, 0)
+  }))
+
+test('snapshots: create/list/restore/delete', () =>
+  withServer({ scripts: [{ reply: { text: 'one' } }] }, async (s) => {
+    s.cassettes.put(tape('c1', 'capital?', 'Paris'))
+    const snap = s.snapshots.create('base')
+    assert.equal(snap.name, 'base')
+    assert.equal(snap.scripts, 1)
+    assert.equal(snap.cassettes, 1)
+    assert.throws(() => s.snapshots.create('base'), /exists/)
+    s.scripts.put([{ reply: { text: 'two' } }])
+    s.cassettes.clear()
+    assert.equal(await say(s, 'x'), 'two')
+    assert.equal(s.snapshots.restore('base').name, 'base')
+    assert.equal(await say(s, 'x'), 'one')
+    assert.equal(s.cassettes.list().length, 1)
+    assert.ok(s.snapshots.create().name.startsWith('snapshot-'))
+    assert.equal(s.snapshots.list().length, 2)
+    assert.equal(s.status().snapshots.count, 2)
+    s.reset()
+    assert.equal(s.snapshots.list().length, 2, 'reset keeps snapshots')
+    s.snapshots.delete('base')
+    assert.throws(() => s.snapshots.restore('base'), /no snapshot/)
+    s.snapshots.delete()
+    assert.equal(s.snapshots.list().length, 0)
+    s.snapshots.create('y')
+    s.reset({ snapshots: true })
+    assert.equal(s.snapshots.list().length, 0)
+  }))
+
+test('start: cassettes, upstream and record', () =>
+  withServer({ scripts: [{ reply: { text: 'UPSTREAM_SAYS_HI' } }] }, async (up) => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'fakellm-napi-'))
+    const rec = path.join(dir, 'rec.jsonl')
+    try {
+      await withServer({ upstream: up.endpoint, record: rec, cassettes: [tape('boot', 'capital?', 'Paris')] }, async (proxy) => {
+        assert.equal(await say(proxy, 'capital?'), 'Paris')
+        assert.equal(await say(proxy, 'something new'), 'UPSTREAM_SAYS_HI')
+        const st = proxy.status()
+        assert.equal(st.upstream.recorded, 1)
+        assert.ok(proxy.cassettes.list().some((c) => c.recording))
+      })
+      await withServer({ strict: true, cassettes: readFileSync(rec, 'utf8') }, async (replay) => {
+        assert.equal(await say(replay, 'something new'), 'UPSTREAM_SAYS_HI')
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }))
+
+test('start: watch reloads a cassette file', () =>
+  withServer(undefined, async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'fakellm-napi-'))
+    const file = path.join(dir, 'tape.json')
+    writeFileSync(file, JSON.stringify([tape('t', 'q?', 'before')]))
+    try {
+      await withServer({ cassettes: readFileSync(file, 'utf8'), watch: { cassettes: [file] } }, async (s) => {
+        assert.equal(await say(s, 'q?'), 'before')
+        writeFileSync(file, JSON.stringify([tape('t', 'q?', 'after the edit')]))
+        let got
+        for (let i = 0; i < 50 && got !== 'after the edit'; i++) {
+          await new Promise((r) => setTimeout(r, 100))
+          got = await say(s, 'q?')
+        }
+        assert.equal(got, 'after the edit')
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }))

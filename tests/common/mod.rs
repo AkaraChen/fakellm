@@ -220,3 +220,83 @@ pub fn json_chunks(frames: &[String]) -> Vec<Value> {
         .map(|f| serde_json::from_str(f).unwrap())
         .collect()
 }
+
+// ---- M4 helpers (cassettes, upstream, snapshots, import) ----
+
+pub const ANTHROPIC_HEADERS: &[(&str, &str)] = &[("anthropic-version", "2023-06-01"), ("x-api-key", "k")];
+
+pub fn anthropic_body(model: &str, user: &str) -> Value {
+    json!({"model": model, "max_tokens": 256, "messages": [{"role": "user", "content": user}]})
+}
+
+pub fn responses_body(model: &str, user: &str) -> Value {
+    json!({"model": model, "input": user})
+}
+
+pub async fn anthropic(s: &Server, body: &Value) -> Reply {
+    post_json_with(s, "/v1/messages", ANTHROPIC_HEADERS, body).await
+}
+
+pub async fn responses(s: &Server, body: &Value) -> Reply {
+    post_json(s, "/v1/responses", body).await
+}
+
+pub async fn ctl_json(s: &Server, method: &str, path: &str, body: &Value) -> Reply {
+    send(s, method, path, &[("content-type", "application/json")], &body.to_string()).await
+}
+
+/// The request log as the control plane shows it (`full=true`), oldest first.
+pub async fn log(s: &Server, query: &str) -> Vec<Value> {
+    let r = get(s, &format!("/_fakellm/requests?full=true&{query}")).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    r.json()["requests"].as_array().unwrap().clone()
+}
+
+/// A Chat exchange for a hand-written cassette: `user` answered with `text`.
+pub fn exchange(user: &str, text: &str) -> Value {
+    json!({
+        "request": {"model": "gpt-4o", "messages": [{"role": "user", "content": [{"type": "text", "text": user}]}]},
+        "outcome": {"outcome": "reply", "reply": {"text": text, "finish": "stop", "usage": {"prompt_tokens": 7, "completion_tokens": 3}}},
+        "protocol": "openai.chat",
+    })
+}
+
+pub fn cassette(name: &str, exchanges: Vec<Value>) -> Value {
+    json!({"kind": "cassette", "name": name, "exchanges": exchanges})
+}
+
+pub async fn put_cassettes(s: &Server, body: &Value) {
+    let r = ctl_json(s, "PUT", "/_fakellm/cassettes", body).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+/// The text of a sync Chat reply.
+pub fn chat_text(r: &Reply) -> String {
+    r.json()["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_owned()
+}
+
+pub fn temp_path(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!("fakellm-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(tag)
+}
+
+/// Polls `f` every 50 ms until it returns `Some`, up to `secs` seconds.
+pub async fn eventually<T, F, Fut>(secs: f64, mut f: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs_f64(secs);
+    loop {
+        if let Some(v) = f().await {
+            return Some(v);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

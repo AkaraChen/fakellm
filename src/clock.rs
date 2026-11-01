@@ -94,6 +94,18 @@ impl Clock {
         self.changed.notify_waiters();
     }
 
+    /// The raw state word, for snapshots: opaque, only meaningful to [`Clock::import`] of the same build.
+    pub fn export(&self) -> i64 {
+        self.state.load(Ordering::Relaxed)
+    }
+
+    /// Restores a word from [`Clock::export`]: frozen time is the same instant again, a running clock the same
+    /// offset from the host clock. Wakes parked waiters.
+    pub fn import(&self, state: i64) {
+        self.state.store(state, Ordering::Relaxed);
+        self.changed.notify_waiters();
+    }
+
     pub fn is_frozen(&self) -> bool {
         unpack(self.state.load(Ordering::Relaxed)).1
     }

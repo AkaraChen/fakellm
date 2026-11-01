@@ -20,6 +20,7 @@ use serde_json::Value;
 use regex::Regex;
 
 use crate::agent::trajectory::Trajectories;
+use crate::cassette::Cassettes;
 use crate::fallback::{self, FallbackConfig};
 use crate::ir::{ApiError, Delivery, FinishReason, Outcome, Protocol, Reply, Request, Source, ToolCall, Usage};
 use crate::policy::Policies;
@@ -414,6 +415,14 @@ pub(crate) fn validate_leaf_reply(r: &ReplySpec) -> Result<(), String> {
     validate_reply(r)
 }
 
+/// A rule and its counters, as a snapshot keeps them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptState {
+    pub rule: Rule,
+    pub hits: u64,
+    pub reached: u64,
+}
+
 /// The registered rules with their compiled matchers and hit counters.
 #[derive(Default)]
 pub struct Scripts {
@@ -603,6 +612,32 @@ impl Scripts {
         self.inner.lock().clear();
     }
 
+    /// For snapshots: every rule with its counters.
+    pub fn export_state(&self) -> Vec<ScriptState> {
+        self.inner
+            .lock()
+            .iter()
+            .map(|c| ScriptState {
+                rule: c.rule.clone(),
+                hits: c.hits,
+                reached: c.reached,
+            })
+            .collect()
+    }
+
+    /// For snapshots: replaces all rules and counters with `state`. Fails without changing anything if a rule is invalid.
+    pub fn import_state(&self, state: Vec<ScriptState>) -> Result<(), ScriptError> {
+        let mut compiled = Vec::with_capacity(state.len());
+        for (i, s) in state.into_iter().enumerate() {
+            let mut c = Compiled::new(s.rule, i)?;
+            c.hits = s.hits;
+            c.reached = s.reached;
+            compiled.push(c);
+        }
+        *self.inner.lock() = compiled;
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().len()
     }
@@ -641,6 +676,8 @@ pub struct Engine {
     pub scripts: Scripts,
     pub trajectories: Trajectories,
     pub policies: Policies,
+    /// Consulted for requests no rule matches, before the upstream, strict mode and the default reply.
+    pub cassettes: Cassettes,
     pub fallback: FallbackConfig,
     pub strict: bool,
     /// Delivery used when the matching rule has no `stream`/`delay_ms`.
@@ -653,6 +690,7 @@ impl Engine {
             scripts: Scripts::default(),
             trajectories: Trajectories::default(),
             policies: Policies::default(),
+            cassettes: Cassettes::default(),
             fallback,
             strict,
             default_delivery,
@@ -923,7 +961,37 @@ impl Engine {
         Outcome::Reply { reply, delivery, source }
     }
 
+    /// The recorded exchange for `req`, if a cassette has one: its outcome with the engine's default delivery and
+    /// `Source::Cassette`. A recorded reply without token counts (imported conversations) gets them from the tokenizer.
+    fn replayed(&self, req: &Request) -> Option<Outcome> {
+        let hit = self.cassettes.lookup(req)?;
+        let source = Source::Cassette {
+            name: hit.cassette,
+            index: hit.index,
+        };
+        let mut outcome = hit.outcome.into_outcome(self.default_delivery.clone(), source);
+        if let Outcome::Reply { reply, .. } = &mut outcome
+            && reply.usage == Usage::default()
+        {
+            reply.usage = Self::count_usage(req, reply);
+        }
+        Some(outcome)
+    }
+
+    fn count_usage(req: &Request, reply: &Reply) -> Usage {
+        Usage {
+            prompt_tokens: tokenizer::count_request(req),
+            completion_tokens: reply.text.as_deref().map_or(0, tokenizer::count)
+                + reply.tool_calls.iter().map(|c| tokenizer::count(&c.arguments)).sum::<u32>()
+                + reply.reasoning.as_deref().map_or(0, tokenizer::count),
+            ..Usage::default()
+        }
+    }
+
     fn unscripted(&self, req: &Request) -> Outcome {
+        if let Some(outcome) = self.replayed(req) {
+            return outcome;
+        }
         if self.strict {
             return Outcome::Error {
                 error: ApiError::no_matching_rule(&req.model),
@@ -932,10 +1000,7 @@ impl Engine {
             };
         }
         let mut reply = fallback::reply(req, &self.fallback);
-        reply.usage.prompt_tokens = tokenizer::count_request(req);
-        reply.usage.completion_tokens = reply.text.as_deref().map_or(0, tokenizer::count)
-            + reply.tool_calls.iter().map(|c| tokenizer::count(&c.arguments)).sum::<u32>()
-            + reply.reasoning.as_deref().map_or(0, tokenizer::count);
+        reply.usage = Self::count_usage(req, &reply);
         Outcome::Reply {
             reply,
             delivery: self.default_delivery.clone(),

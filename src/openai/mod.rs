@@ -22,10 +22,12 @@ use crate::anthropic;
 use crate::anthropic::messages::MessageMeta;
 use crate::control::MAX_BODY;
 use crate::fallback;
-use crate::ir::{ApiError, Outcome, Reply, Request};
+use crate::ir::{ApiError, Outcome, Reply, Request, Source};
 use crate::openai::chat::ResponseMeta;
 use crate::reqlog::RequestRecord;
 use crate::sse;
+use crate::upstream::Call;
+use crate::upstream::record::Finish;
 use crate::{Response, Shared, json_response};
 
 /// Raw bodies that did not parse as JSON are logged up to this many bytes.
@@ -50,6 +52,12 @@ struct Trace {
     /// Log seq of the record written when the request was parked by a `hang` rule; the final
     /// status and latency go there instead of into a new record.
     hung_seq: Option<u64>,
+    /// Method, routed path with query and headers of the request, kept only when an upstream is configured
+    /// (for [`proxy`]).
+    incoming: Option<(http::Method, String, http::HeaderMap)>,
+    /// The request was relayed upstream: the log record is written when the relayed body ends
+    /// (`upstream::record::finish`), not by [`handle`].
+    deferred: bool,
 }
 
 /// Records a request as `status: 0` when its future is dropped while parked on the server clock
@@ -250,6 +258,11 @@ pub(crate) async fn handle(shared: &Shared, req: http::Request<hyper::body::Inco
         });
     }
 
+    if shared.control.upstream.is_some() {
+        let target = parts.uri.query().map_or(path.clone(), |q| format!("{path}?{q}"));
+        trace.incoming = Some((parts.method.clone(), target, parts.headers.clone()));
+    }
+
     let mut response = dispatch(shared, &parts, &path, body, &mut trace).await;
 
     let seed = trace.seed.unwrap_or_else(|| fallback::hash64(path.as_bytes()));
@@ -265,6 +278,9 @@ pub(crate) async fn handle(shared: &Shared, req: http::Request<hyper::body::Inco
     }
     headers.insert("openai-processing-ms", header_value(&started.elapsed().as_millis().to_string()));
 
+    if trace.deferred {
+        return response;
+    }
     if logged && shared.control.generation() == generation {
         if let Some(seq) = trace.hung_seq {
             let (status, latency) = (response.status().as_u16(), started.elapsed());
@@ -474,6 +490,14 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
     };
     let req = match parsed {
         Ok(r) => r,
+        // Upstream mode: the id may belong to a conversation the real server holds. Forward anyway, with the IR
+        // lacking the history.
+        Err(e) if api == Api::Responses && control.upstream.is_some() && e.code.as_deref() == Some("previous_response_not_found") => {
+            match parse_without_history(&value, &control.responses) {
+                Some(r) => r,
+                None => return reject(trace, style, e),
+            }
+        }
         Err(e) => return reject(trace, style, e),
     };
     let seed = fallback::request_seed(&req);
@@ -481,6 +505,9 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
     let mut outcome = control.engine.resolve_async(&req).await;
     let req = Arc::new(req);
     trace.request = Some(req.clone());
+    if control.upstream.is_some() && matches!(outcome.source(), Source::Fallback | Source::Strict) {
+        return proxy(shared, req, bytes, trace, style).await;
+    }
     trace.outcome = Some(Arc::new(outcome.clone()));
 
     let mut guard = HangGuard {
@@ -629,6 +656,66 @@ async fn complete(shared: &Shared, api: Api, bytes: &[u8], trace: &mut Trace) ->
     .await;
     guard.record = None;
     response
+}
+
+/// A Responses request whose `previous_response_id` the store does not know, parsed as if it had none; the id stays
+/// in `previous_response_id`. `None` when it still does not parse.
+fn parse_without_history(value: &Value, store: &responses_store::ResponseStore) -> Option<Request> {
+    let mut stripped = value.clone();
+    let id = stripped.as_object_mut()?.remove("previous_response_id")?;
+    let mut req = responses::parse(&stripped, store).ok()?;
+    req.previous_response_id = id.as_str().map(str::to_owned);
+    Some(req)
+}
+
+/// Relays a request that nothing local answered to the upstream (`Config::upstream`). The response goes back as it
+/// came; when its body ends, `upstream::record::finish` records the exchange and writes the log record, so [`handle`]
+/// skips the log for it (`Trace::deferred`). An upstream that cannot be reached is a local 502 in the protocol's
+/// error format, logged like any other outcome.
+async fn proxy(shared: &Shared, req: Arc<Request>, body: &[u8], trace: &mut Trace, style: Style) -> Response {
+    let control = &shared.control;
+    let upstream = control.upstream.as_ref().expect("callers check that an upstream is configured");
+    let (method, path_and_query, headers) = trace.incoming.take().expect("set in handle when an upstream is configured");
+    let finish = Finish {
+        control: control.clone(),
+        request: req.clone(),
+        head: trace.head.clone().map(|h| RequestRecord {
+            raw: trace.raw.clone(),
+            raw_text: trace.raw_text.clone(),
+            request: Some(req.clone()),
+            ..h
+        }),
+        generation: control.generation(),
+        started: Instant::now(),
+        store_response: req.store != Some(false),
+    };
+    let call = Call {
+        method,
+        path_and_query,
+        headers,
+        body: bytes::Bytes::copy_from_slice(body),
+        protocol: req.protocol,
+    };
+    match upstream
+        .forward(call, Box::new(move |done| crate::upstream::record::finish(finish, done)))
+        .await
+    {
+        Ok(response) => {
+            trace.deferred = true;
+            response
+        }
+        Err(error) => {
+            trace.outcome = Some(Arc::new(Outcome::Error {
+                error: error.clone(),
+                delivery: Default::default(),
+                source: Source::Upstream,
+            }));
+            match style {
+                Style::Openai => error::render(&error),
+                Style::Anthropic => anthropic::error::render(&error),
+            }
+        }
+    }
 }
 
 /// The empty reply `Engine::resolve` builds for a rule that only says `hang: true`.

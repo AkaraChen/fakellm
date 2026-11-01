@@ -52,11 +52,16 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | 命令 | 对应的请求 |
 |---|---|
 | `status` | `GET /_fakellm` |
-| `reset [--keep-clock] [--keep-requests] [--keep-scripts] [--keep-responses]` | `POST /_fakellm/reset?clock=&requests=&scripts=&responses=` |
+| `reset [--keep-clock] [--keep-requests] [--keep-scripts] [--keep-responses] [--drop-snapshots]` | `POST /_fakellm/reset?clock=&requests=&scripts=&responses=&snapshots=` |
 | `scripts list` | `GET /_fakellm/scripts`，文本输出每条规则一行：`#序号 名字 hits/times [exhausted] 匹配条件 -> text\|tool_calls\|error 429\|hang`，`times` 不限时写 `inf`，没有名字写 `-`；`protocol`、`probability`、`every_nth` 也在匹配条件里 |
 | `scripts put FILE [--keep-hits]` | `PUT /_fakellm/scripts[?keep_hits=true]`，`.yaml` / `.yml` 按 YAML 发，其他按 JSON；文本输出 `N rules loaded (M total)` |
 | `scripts add FILE` | `POST /_fakellm/scripts` |
 | `scripts clear` | `DELETE /_fakellm/scripts` |
+| `cassettes list` / `get NAME` | `GET /_fakellm/cassettes[/NAME]`；`get recording` 是上游录到的内容 |
+| `cassettes put FILE` / `add FILE` | `PUT` / `POST /_fakellm/cassettes`，JSON、JSONL 或 YAML 文件 |
+| `cassettes delete NAME` / `clear` | `DELETE /_fakellm/cassettes[/NAME]` |
+| `snapshot create [NAME]` / `list` | `POST` / `GET /_fakellm/snapshots` |
+| `snapshot restore NAME` / `delete [NAME]` | `POST /_fakellm/snapshots/NAME/restore` / `DELETE /_fakellm/snapshots[/NAME]` |
 | `clock get` | `GET /_fakellm/clock` |
 | `clock freeze [AT]` | `POST /_fakellm/clock/freeze` |
 | `clock unfreeze` | `POST /_fakellm/clock/unfreeze` |
@@ -69,7 +74,7 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `requests clear` | `DELETE /_fakellm/requests` |
 | `requests config [--enable \| --disable] [--capacity N]` | 不带参数是 `GET`，否则 `PUT /_fakellm/requests/config` |
 
-`--stream` 需要一个值：`--stream true`。`--count` 只打印匹配数。`--status` 接受 `200`、`4xx`、`error`，也接受 `0`（挂起后客户端放弃的请求，见[请求日志](#请求日志)）。`ctl status` 打印版本、时钟、剧本数、保存的 Responses 数、strict 和请求日志状态。
+`--stream` 需要一个值：`--stream true`。`--count` 只打印匹配数。`--status` 接受 `200`、`4xx`、`error`，也接受 `0`（挂起后客户端放弃的请求，见[请求日志](#请求日志)）。`ctl status` 打印版本、时钟、剧本数、cassette 数、快照数、保存的 Responses 数、strict 和请求日志状态。
 
 ## 路由
 
@@ -87,6 +92,11 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `GET` / `DELETE /_fakellm/trajectories/{name}` | 读（`?format=jsonl` 导出 JSONL）/ 删一条轨迹 |
 | `GET` / `PUT` / `POST` / `DELETE /_fakellm/policies` | 策略脚本的列出、替换、追加、清空（会运行代码，见上面的[安全](#安全)） |
 | `GET` / `DELETE /_fakellm/policies/{name}` | 读 / 删一个策略 |
+| `GET` / `PUT` / `POST` / `DELETE /_fakellm/cassettes` | cassette 的列出、替换、追加、清空（同名的原地替换），见 [Cassette](cassette.md) |
+| `GET` / `DELETE /_fakellm/cassettes/{name}` | 读（`?format=jsonl` 导出 JSONL）/ 删一个 cassette；名字 `recording` 是内存里的录制（`--upstream` 时填充），删它就是清空录制，不能用这个名字注册 |
+| `POST` / `GET` / `DELETE /_fakellm/snapshots` | 创建（body `{"name"?}`，或 `?name=`，201）、列出、全部删除 |
+| `GET` / `DELETE /_fakellm/snapshots/{name}` | 读 / 删一个快照 |
+| `POST /_fakellm/snapshots/{name}/restore` | 还原快照（快照保留；未知名字 404，重名创建 409，非法名字 400） |
 | `GET /_fakellm/responses` | 列出保存的 Responses API 对象（只有 id 和创建时间） |
 | `DELETE /_fakellm/responses` | 清空这些对象 |
 | `GET` / `DELETE /v1/responses/{id}` | 这不是控制面路由，是 API：读取、删除一个保存的对象，见[下面](#responses-对象) |
@@ -107,6 +117,8 @@ $ curl $E/_fakellm
 {"version":"0.1.0","clock":{"now":"2026-10-31T15:29:38.658Z","frozen":false,"shifted":false},"scripts":{"count":0},"trajectories":{"count":0},"policies":{"count":0},"responses":{"count":0},"strict":false,"request_log":{"enabled":true,"capacity":10000,"stored":0,"dropped":0}}
 ```
 
+状态里还有：`cassettes.count`、`snapshots.count`，以及配置了 `--upstream` 时的 `upstream`：`{"url", "record", "recorded"}`（地址不含查询串；`record` 是记录文件路径，`recorded` 是已录的 exchange 数）。
+
 ### 重置
 
 ```
@@ -116,7 +128,7 @@ $ curl -X POST "$E/_fakellm/reset?clock=false&requests=false"
 {"reset":true}
 ```
 
-默认清空四样东西：剧本（包括命中计数，同时清掉全部轨迹和策略脚本并杀掉它们的子进程）、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项。
+默认清空四样东西（另外 cassette 和录制随 `scripts` 一起清空；快照默认保留，`?snapshots=true` 才删）：剧本（包括命中计数，同时清掉全部轨迹和策略脚本并杀掉它们的子进程）、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项；`snapshots=true` 额外删除全部快照（默认保留）。
 
 - 挂起（`hang`）的请求一被挂住就以 `status: 0`、`hung: true` 记入日志，放行或客户端放弃时原地更新；错误延迟或同步回复延迟期间客户端断开的请求，以 `status: 0` 记入日志。如果期间发生过清空请求日志的 `reset`，这些记录会被丢弃，不会污染新的日志。
 - `reset` 会唤醒所有挂起的请求：有 `hang_ms` 的按规则的其余部分回答，只写 `hang: true` 的回 503。
@@ -178,6 +190,34 @@ $ curl -X PUT $E/_fakellm/scripts -d '[{"reply":{}}]'
 $ curl -X PUT $E/_fakellm/scripts -d '[{"match":{"bogus":1},"reply":{"text":"x"}}]'
 {"error":{"code":"BadRequest","message":"rule 0: unknown field `bogus`, expected one of `model`, `last_user`, `system`, `any_message`, `has_tool`, `no_tools`, `has_tool_result`, `last_tool_result`, `tool_result_contains`, `last_tool_call_id`, `stream`, `turn`, `any`, `protocol`, `probability`, `every_nth`"}}
 ```
+
+### Cassette 与快照
+
+Cassette（格式和匹配规则见 [cassette.md](cassette.md)）：`PUT` 替换全部、`POST` 追加（同名的原地替换），请求体是一个 cassette、cassette 数组，或 JSON / YAML / JSONL 文本（`Content-Type: text/plain` 时按内容判断；JSONL 第一行是头）。响应是 `{"added": n, "count": m}`。名字必须非空、不含 `/`，也不能是 `recording`（内存里的录制）；不合法整体 400。`reset` 默认连 cassette 和录制一起清空，`?scripts=false` 则保留。
+
+```
+$ curl -X PUT $E/_fakellm/cassettes --data-binary @chats.jsonl -H 'content-type: text/plain'
+{"added":1,"count":1}
+$ curl $E/_fakellm/cassettes
+{"cassettes":[{"name":"chats","exchanges":1,"once":false,"fuzzy":false,"hits":0,"consumed":0,"recording":false}]}
+$ curl "$E/_fakellm/cassettes/chats?format=jsonl"       # 导出
+$ curl "$E/_fakellm/cassettes/recording?format=jsonl"   # 导出 --upstream 录到的内容
+$ curl -X DELETE $E/_fakellm/cassettes/chats
+```
+
+`hits` 是回放次数，`consumed` 是 `once` 的 cassette 已用掉的 exchange 数。
+
+快照把当前的剧本（含命中计数）、轨迹进度、策略（含状态）、cassette（含已用标记和录制）、保存的 Responses 对象和时钟存下来；请求日志、启动配置和其他快照不在其中。还原不消耗快照，可以反复还原。名字是 1 到 64 个 `A-Za-z0-9._-` 字符，不给则是 `snapshot-N`；重名创建是 409，未知名字是 404，非法名字是 400。不要在有请求在飞时还原。
+
+```
+$ curl -X POST "$E/_fakellm/snapshots?name=after-login"
+{"name":"after-login","created":"2026-11-01T01:59:19.155Z","scripts":0,"trajectories":0,"policies":0,"cassettes":1,"responses":0}
+$ curl -X POST $E/_fakellm/snapshots/after-login/restore
+$ curl $E/_fakellm/snapshots
+$ curl -X DELETE $E/_fakellm/snapshots/after-login      # DELETE /_fakellm/snapshots 删全部
+```
+
+`reset` 默认**保留**快照，`?snapshots=true`（`ctl reset --drop-snapshots`）才删。快照里的 cassette 是共享的，不复制；还原策略总会重启它的子进程。命令行：`fakellm ctl cassettes list|put|add|get|delete|clear`，`fakellm ctl snapshot create|list|restore|delete`。
 
 ### 时钟
 
@@ -244,7 +284,7 @@ $ curl "$E/_fakellm/requests?full=true&limit=1"
 | `latency_us` | 从到达到响应头就绪，微秒（真实时间；流的 body 不计，被时钟挂住的同步响应要等放行后才记录，包含等待） |
 | `protocol` | `openai.chat`、`openai.responses`、`openai.embeddings` 或 `anthropic.messages`；body 解析失败时为 `null` |
 | `model`、`stream` | 请求的模型名和是否流式；没有解析出请求时为 `null` / `false` |
-| `source` | 谁回答的：`{"kind": "script", "index", "name"}`、`{"kind": "trajectory", "index", "name", "trajectory", "step"}`、`{"kind": "policy", "index", "name", "policy"}`、`{"kind": "fallback"}`、`{"kind": "strict"}`、`{"kind": "rejected"}`（在匹配之前就被拒绝：认证失败、JSON 不合法、校验失败、404） |
+| `source` | 谁回答的：`{"kind": "script", "index", "name"}`、`{"kind": "trajectory", "index", "name", "trajectory", "step"}`、`{"kind": "policy", "index", "name", "policy"}`、`{"kind": "cassette", "name", "index"}`（cassette 回放，`index` 是 exchange 序号）、`{"kind": "upstream"}`（转发给 `--upstream` 的）、`{"kind": "fallback"}`、`{"kind": "strict"}`、`{"kind": "rejected"}`（在匹配之前就被拒绝：认证失败、JSON 不合法、校验失败、404） |
 | `rule` | 命中规则的 `name`；没有名字或不是规则回答时为 `null` |
 | `request` | 解析后的结构化请求（IR）：完整的 messages、tools、`tool_choice`、参数、`extra`（不认识的字段）。不截断文本；解析失败时 `null` |
 | `reply` | `{"finish", "text", "tool_calls": [{id, name, arguments}], "reasoning", "usage": {prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cached_tokens}}`，或 `{"status", "error", "retry_after", "in_stream", "headers"}`（`error` 是该协议的线上格式，Anthropic 请求用 Anthropic 的错误体）；被 `hang` 挂住的请求还有 `hang: {"until_ms": n \| null}`；没有决定时 `null` |
@@ -270,7 +310,7 @@ Anthropic 请求和 Responses 请求的 `request`（解析后的结构）与 Cha
 | `stream` | `true` / `false` |
 | `protocol` | `openai.chat` / `openai.responses` / `openai.embeddings` / `anthropic.messages`（body 解析失败的请求没有协议，匹配不到任何一个） |
 | `status` | 精确（`404`，挂起后放弃的是 `0`）、类别（`4xx`）、或 `error`（>= 400） |
-| `source` | `script`（也包含轨迹和策略的回答）/ `fallback` / `strict` / `rejected` |
+| `source` | `script`（也包含轨迹和策略的回答）/ `cassette` / `upstream` / `fallback` / `strict` / `rejected` |
 | `rule` | 规则名（精确） |
 | `path` | 路径前缀，如 `/v1/chat/completions` |
 | `since` | RFC 3339，只要这个服务器时间或之后的 |

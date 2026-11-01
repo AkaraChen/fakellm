@@ -3,7 +3,7 @@
 //! A thin shell over [`fakellm::Server`]. Everything calls the library directly, in process; the
 //! request and response logs use the same JSON builders as the control plane's HTTP API
 //! (`Control::requests_json`), so the JS objects are exactly the JSON it serves. [`control`] holds
-//! the sub-objects `scripts`, `trajectories`, `policies`, `requests`, `responses` and `clock`.
+//! the sub-objects `scripts`, `trajectories`, `cassettes`, `snapshots`, `policies`, `requests`, `responses` and `clock`.
 
 mod control;
 
@@ -30,6 +30,17 @@ pub struct StartOptions {
     pub scripts: Option<serde_json::Value>,
     /// Trajectories registered at start: an array of trajectory objects, or a JSON / YAML / JSONL string.
     pub trajectories: Option<serde_json::Value>,
+    /// Cassettes loaded at start: an array of cassette objects, or a JSON / YAML / JSONL string.
+    pub cassettes: Option<serde_json::Value>,
+    /// Relay requests no rule and no cassette answers to this OpenAI-compatible or Anthropic server
+    /// (`http://` or `https://`) and record what it says; see `server.cassettes` for the recording.
+    pub upstream: Option<String>,
+    /// Key sent to the upstream instead of the client's own credentials. Needs `upstream`.
+    pub upstream_api_key: Option<String>,
+    /// Append every recorded exchange to this JSONL file. Needs `upstream`.
+    pub record: Option<String>,
+    /// Re-read these files when they change and replace what they loaded. Default: nothing watched.
+    pub watch: Option<WatchOptions>,
     /// Policies registered at start: an array of `{ name, source, runtime? }`, or a JSON / YAML string.
     /// A module that does not load rejects `start()`.
     pub policies: Option<serde_json::Value>,
@@ -56,6 +67,16 @@ pub struct StartOptions {
     pub redact_auth: Option<bool>,
 }
 
+/// Files to reload on change (`StartOptions.watch`). Each kind reloads when any of its files changed.
+#[napi(object)]
+pub struct WatchOptions {
+    /// A JSON / YAML rules file.
+    pub scripts: Option<String>,
+    pub trajectories: Option<Vec<String>>,
+    pub policies: Option<Vec<String>>,
+    pub cassettes: Option<Vec<String>>,
+}
+
 /// What `reset()` clears; everything by default.
 #[napi(object)]
 pub struct ResetOptions {
@@ -63,6 +84,8 @@ pub struct ResetOptions {
     pub requests: Option<bool>,
     pub scripts: Option<bool>,
     pub responses: Option<bool>,
+    /// Also delete all snapshots. Default `false`.
+    pub snapshots: Option<bool>,
 }
 
 /// A running in-process server.
@@ -119,6 +142,18 @@ impl FakeLlmServer {
         control::TrajectoriesControl::new(self.server.clone())
     }
 
+    /// Cassettes: recorded exchanges that replay through every protocol.
+    #[napi(getter)]
+    pub fn cassettes(&self) -> control::CassettesControl {
+        control::CassettesControl::new(self.server.clone())
+    }
+
+    /// Snapshots: save the state under a name, restore it between tests.
+    #[napi(getter)]
+    pub fn snapshots(&self) -> control::SnapshotsControl {
+        control::SnapshotsControl::new(self.server.clone())
+    }
+
     /// Policy scripts: JS modules that decide each reply.
     #[napi(getter)]
     pub fn policies(&self) -> control::PoliciesControl {
@@ -154,6 +189,7 @@ impl FakeLlmServer {
                 requests: o.requests.unwrap_or(d.requests),
                 scripts: o.scripts.unwrap_or(d.scripts),
                 responses: o.responses.unwrap_or(d.responses),
+                snapshots: o.snapshots.unwrap_or(d.snapshots),
             },
         };
         with_server(&self.server, |s| s.control().reset_with(opts))
@@ -253,6 +289,22 @@ pub async fn start(options: Option<StartOptions>) -> Result<FakeLlmServer> {
         }
         if let Some(r) = o.policy_runtime {
             config.policy_runtime = Some(r.parse().map_err(control_error)?);
+        }
+        if let Some(v) = o.cassettes {
+            config.cassettes = control::cassettes(v)?;
+        }
+        if let Some(u) = o.upstream {
+            config.upstream = Some(u.parse().map_err(|e| control_error(format!("invalid upstream {u:?}: {e}")))?);
+        }
+        config.upstream_api_key = o.upstream_api_key.or(config.upstream_api_key);
+        config.record = o.record.map(Into::into).or(config.record);
+        if let Some(w) = o.watch {
+            config.watch = Some(fakellm::WatchConfig {
+                scripts: w.scripts.map(Into::into),
+                trajectories: w.trajectories.unwrap_or_default().into_iter().map(Into::into).collect(),
+                policies: w.policies.unwrap_or_default().into_iter().map(Into::into).collect(),
+                cassettes: w.cassettes.unwrap_or_default().into_iter().map(Into::into).collect(),
+            });
         }
         config.path_prefix = o.path_prefix.or(config.path_prefix);
         if let Some(t) = o.ttft {

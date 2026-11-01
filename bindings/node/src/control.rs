@@ -154,13 +154,146 @@ impl TrajectoriesControl {
     /// `{ name, steps, on_divergence, cursor, unknown_tool, hits, last_step }` per trajectory.
     #[napi]
     pub fn list(&self) -> Result<Value> {
-        with_server(&self.server, |s| serde_json::to_value(s.trajectories().list()).map_err(control_error))?
+        with_server(&self.server, |s| {
+            serde_json::to_value(s.trajectories().list()).map_err(control_error)
+        })?
     }
 
     /// Removes all trajectories.
     #[napi]
     pub fn clear(&self) -> Result<()> {
         with_server(&self.server, |s| s.trajectories().clear())
+    }
+}
+
+/// Cassettes as an array of objects, a single one, or a JSON / YAML / JSONL string.
+pub(crate) fn cassettes(input: Value) -> Result<Vec<fakellm::Cassette>> {
+    let (text, format) = match input {
+        Value::String(s) => (s, fakellm::CassetteFormat::Auto),
+        v => (v.to_string(), fakellm::CassetteFormat::Json),
+    };
+    fakellm::Cassette::parse_many(&text, format).map_err(control_error)
+}
+
+/// The registered cassettes. Obtained from `server.cassettes`.
+#[napi(js_name = "CassettesControl")]
+pub struct CassettesControl {
+    server: Slot,
+}
+
+impl CassettesControl {
+    pub(crate) fn new(server: Slot) -> Self {
+        Self { server }
+    }
+}
+
+#[napi]
+impl CassettesControl {
+    /// Replaces all cassettes (counters restart; the recording of an `upstream` stays). Takes an
+    /// array of cassette objects, one cassette, or a JSON / YAML / JSONL document as a string.
+    /// Returns `{ added, count }`.
+    #[napi]
+    pub fn put(&self, input: Value) -> Result<ScriptsLoaded> {
+        let items = cassettes(input)?;
+        let added = items.len() as u32;
+        with_server(&self.server, |s| {
+            s.cassettes().replace(items).map(|()| ScriptsLoaded {
+                added,
+                count: s.cassettes().len() as u32,
+            })
+        })?
+        .map_err(control_error)
+    }
+
+    /// Adds cassettes, same input as `put`; one with a registered name replaces it in place.
+    #[napi]
+    pub fn add(&self, input: Value) -> Result<ScriptsLoaded> {
+        let items = cassettes(input)?;
+        let added = items.len() as u32;
+        with_server(&self.server, |s| {
+            s.cassettes().upsert(items).map(|()| ScriptsLoaded {
+                added,
+                count: s.cassettes().len() as u32,
+            })
+        })?
+        .map_err(control_error)
+    }
+
+    /// `{ name, exchanges, once, fuzzy, hits, consumed, recording }` per cassette; the recording of
+    /// an `upstream` comes last.
+    #[napi]
+    pub fn list(&self) -> Result<Value> {
+        with_server(&self.server, |s| serde_json::to_value(s.cassettes().list()).map_err(control_error))?
+    }
+
+    /// Removes the registered cassettes; the recording stays.
+    #[napi]
+    pub fn clear(&self) -> Result<()> {
+        with_server(&self.server, |s| s.cassettes().clear())
+    }
+}
+
+/// Named snapshots of the server's state. Obtained from `server.snapshots`.
+#[napi(js_name = "SnapshotsControl")]
+pub struct SnapshotsControl {
+    server: Slot,
+}
+
+impl SnapshotsControl {
+    pub(crate) fn new(server: Slot) -> Self {
+        Self { server }
+    }
+}
+
+#[napi]
+impl SnapshotsControl {
+    /// Captures scripts, trajectories, policies, cassettes, stored responses and the clock under
+    /// `name` (default `snapshot-<n>`). Throws when the name is invalid or taken. Returns
+    /// `{ name, created, scripts, trajectories, policies, cassettes, responses }`.
+    #[napi]
+    pub fn create(&self, name: Option<String>) -> Result<Value> {
+        with_server(&self.server, |s| {
+            block_on(s.control().snapshot(name.as_deref()))
+                .map_err(control_error)
+                .and_then(|i| serde_json::to_value(i).map_err(control_error))
+        })?
+    }
+
+    /// The snapshots, by name.
+    #[napi]
+    pub fn list(&self) -> Result<Value> {
+        with_server(&self.server, |s| {
+            serde_json::to_value(s.control().snapshots_json()["snapshots"].clone()).map_err(control_error)
+        })?
+    }
+
+    /// Puts a snapshot's state back (the snapshot stays). Throws for an unknown name; policies
+    /// start again, so this blocks the calling thread for that long.
+    #[napi]
+    pub fn restore(&self, name: String) -> Result<Value> {
+        with_server(&self.server, |s| {
+            block_on(s.control().restore(&name))
+                .map_err(control_error)
+                .and_then(|i| serde_json::to_value(i).map_err(control_error))
+        })?
+    }
+
+    /// Deletes the snapshot `name`, or every snapshot without a name. Throws for an unknown name.
+    #[napi]
+    pub fn delete(&self, name: Option<String>) -> Result<()> {
+        with_server(&self.server, |s| match name {
+            Some(n) => s.control().delete_snapshot(&n).map_err(control_error),
+            None => {
+                s.control().reset_with(fakellm::ResetOptions {
+                    clock: false,
+                    requests: false,
+                    scripts: false,
+                    responses: false,
+                    snapshots: true,
+                });
+                Ok(())
+            }
+        })?
     }
 }
 

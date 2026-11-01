@@ -77,12 +77,17 @@ func (s *Server) Status(ctx context.Context) (Status, error) {
 // ResetOptions selects what Reset keeps. The zero value clears everything.
 type ResetOptions struct {
 	KeepClock, KeepRequests, KeepScripts, KeepResponses bool
+	// DropSnapshots also deletes all snapshots, which a reset keeps otherwise.
+	DropSnapshots bool
 }
 
 // Reset clears scripts, the request log, the clock and stored responses, except what opts keeps.
 // Call it before each test. It also releases requests held by hang.
 func (s *Server) Reset(ctx context.Context, opts ResetOptions) error {
 	q := url.Values{}
+	if opts.DropSnapshots {
+		q.Set("snapshots", "true")
+	}
 	for k, keep := range map[string]bool{
 		"clock": opts.KeepClock, "requests": opts.KeepRequests, "scripts": opts.KeepScripts, "responses": opts.KeepResponses,
 	} {

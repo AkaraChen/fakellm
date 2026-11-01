@@ -8,12 +8,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import type {
+  Cassette,
+  CassetteInfo,
   ClockState,
   RequestFilter,
   RequestRecord,
   ResetOptions,
   Rule,
   RuleInfo,
+  SnapshotInfo,
   StartOptions,
   Status,
   WireOptions,
@@ -143,6 +146,37 @@ export class FakeLLM {
     clear: async (): Promise<void> => void (await this.ctl('DELETE', '/policies')),
   };
 
+  readonly cassettes = {
+    /** Replaces all cassettes (the in-memory recording stays). Takes cassettes, or a JSON / JSONL / YAML text. */
+    put: async (items: Cassette | Cassette[] | string): Promise<{ added: number; count: number }> =>
+      this.#sendCassettes('PUT', items),
+    /** Adds cassettes; one with a registered name replaces it in place. */
+    add: async (items: Cassette | Cassette[] | string): Promise<{ added: number; count: number }> =>
+      this.#sendCassettes('POST', items),
+    /** The registered cassettes, then the recording of an `upstream` (`recording: true`) when there is one. */
+    list: async (): Promise<CassetteInfo[]> => (await this.ctl('GET', '/cassettes')).cassettes,
+    /** Removes the registered cassettes; the recording stays (`reset` clears it). */
+    clear: async (): Promise<void> => void (await this.ctl('DELETE', '/cassettes')),
+  };
+
+  readonly snapshots = {
+    /** Captures scripts, trajectories, policies, cassettes, stored responses and the clock under `name` (default `snapshot-<n>`). A taken name rejects with status 409. */
+    create: async (name?: string): Promise<SnapshotInfo> => this.ctl('POST', '/snapshots', name === undefined ? {} : { name }),
+    list: async (): Promise<SnapshotInfo[]> => (await this.ctl('GET', '/snapshots')).snapshots,
+    /** Puts a snapshot's state back; the snapshot stays. Rejects with status 404 for an unknown name. */
+    restore: async (name: string): Promise<SnapshotInfo> => this.ctl('POST', `/snapshots/${encodeURIComponent(name)}/restore`),
+    /** Deletes one snapshot, or all of them without a name. */
+    delete: async (name?: string): Promise<void> =>
+      void (await this.ctl('DELETE', name === undefined ? '/snapshots' : `/snapshots/${encodeURIComponent(name)}`)),
+  };
+
+  #sendCassettes(method: 'PUT' | 'POST', items: Cassette | Cassette[] | string) {
+    // Text goes as text/plain so that the server detects JSON, JSONL or YAML itself.
+    return typeof items === 'string'
+      ? this.ctl(method, '/cassettes', items, { 'content-type': 'text/plain' })
+      : this.ctl(method, '/cassettes', items);
+  }
+
   readonly requests = {
     list: async (filter: RequestFilter = {}): Promise<RequestRecord[]> => (await this.ctl('GET', `/requests${query({ ...filter })}`)).requests,
     /** Number of matches (before `limit`). */
@@ -256,6 +290,18 @@ export async function start(opts: StartOptions = {}): Promise<FakeLLM> {
     writeFileSync(file, JSON.stringify(opts.scripts));
     args.push('--scripts', file);
   }
+  if (typeof opts.cassettes === 'string') {
+    args.push('--cassette', opts.cassettes);
+  } else if (opts.cassettes?.length) {
+    tmp ??= mkdtempSync(join(tmpdir(), 'fakellm-'));
+    const file = join(tmp, 'cassettes.json');
+    writeFileSync(file, JSON.stringify(opts.cassettes));
+    args.push('--cassette', file);
+  }
+  if (opts.upstream !== undefined) args.push('--upstream', opts.upstream);
+  if (opts.upstreamApiKey !== undefined) args.push('--upstream-api-key', opts.upstreamApiKey);
+  if (opts.record !== undefined) args.push('--record', opts.record);
+  if (opts.watch === false) args.push('--no-watch');
   args.push(...(opts.args ?? []));
 
   const { bin, how } = resolveBin(opts);

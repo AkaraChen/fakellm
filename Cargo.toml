@@ -5,6 +5,23 @@ edition = "2024"
 description = "An in-memory, OpenAI-compatible LLM API server for tests"
 license = "MIT"
 repository = "https://github.com/AkaraChen/fakellm"
+homepage = "https://github.com/AkaraChen/fakellm"
+documentation = "https://docs.rs/fakellm"
+readme = "README.md"
+keywords = ["llm", "openai", "testing", "mock", "anthropic"]
+categories = ["development-tools::testing", "web-programming::http-server"]
+rust-version = "1.88"
+exclude = [
+    "/sdk",
+    "/bindings",
+    "/go",
+    "/e2e",
+    "/examples",
+    "/target",
+    "/.github",
+    "/Dockerfile",
+    "/tests/node_sdk.rs",
+]
 
 [dependencies]
 bytes = "1.12"
@@ -14,7 +31,8 @@ futures = "0.3"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "client-legacy", "http1"] }
 mimalloc = "0.1"
 parking_lot = "0.13"
 percent-encoding = "2"

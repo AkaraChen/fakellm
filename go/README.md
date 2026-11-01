@@ -71,6 +71,10 @@ s, err := fakellm.Start(ctx, fakellm.Options{Bin: bin})
 | `Policies` | 启动后注册的策略，`[]fakellm.Policy{{Name, Source, Runtime}}`；需要机器上有 node、bun 或 tjs |
 | `PolicyRuntime` | `--policy-runtime`：`tjs`、`node`、`bun` 或路径；默认由服务器探测 |
 | `PathPrefix` | `--path-prefix`：API 同时挂在这个前缀下；`BaseURL()` 和 `AnthropicBaseURL()` 会带上它（控制面不变） |
+| `Cassettes` | 启动后注册的 cassette：`Cassette`、`[]Cassette`，或 JSON / YAML / JSONL 字符串（`string` / `[]byte`） |
+| `Upstream`、`UpstreamAPIKey` | `--upstream`、`--upstream-api-key`：没有规则和 cassette 命中的请求转发给这个上游并录下来 |
+| `Record` | `--record`：把从上游录到的交换追加到这个 JSONL 文件，需要 `Upstream` |
+| `Watch` | `*bool`；`fakellm.Ptr(false)` 传 `--no-watch`，不再监视 `Args` 里给的剧本、轨迹、策略和 cassette 文件；nil 为默认（监视） |
 | `Args` | 追加的命令行参数，如 `--ttft`、`--tokens-per-sec` |
 | `Env` | 追加的环境变量，`KEY=value` |
 | `StartTimeout` | 等待启动的时间，默认 10 秒 |
@@ -140,6 +144,31 @@ s.Policies().Get(ctx, "p"); s.Policies().Delete(ctx, "p"); s.Policies().Clear(ct
 ```
 
 `Options.Trajectories` / `Policies` 在 `Start` 里通过控制面注册，不合法则 `Start` 返回错误并杀掉进程。`Reset` 会同时清掉轨迹和策略。
+
+### Cassette 和快照
+
+Cassette 是录好或导入的请求/回复交换，按请求含义回放，详见 [docs/cassette.md](../docs/cassette.md)。快照保存并还原整个控制面状态（剧本、轨迹、策略、cassette、保存的响应和时钟）。
+
+```go
+// 录制：proxy 把没人答的请求转给 up，并追加到 rec.jsonl
+proxy, _ := fakellm.Start(ctx, fakellm.Options{Upstream: up.URL() + "/v1", Record: "rec.jsonl"})
+jsonl, _ := proxy.Cassettes().JSONL(ctx, "recording") // 内存里的录制；名字固定为 recording，注册前请改名
+
+// 回放
+s, _ := fakellm.Start(ctx, fakellm.Options{Strict: true, Cassettes: jsonl})
+s.Cassettes().Put(ctx, v)               // 替换全部；v 同 Options.Cassettes，返回现有数量
+s.Cassettes().Add(ctx, v)               // 追加，同名替换
+s.Cassettes().List(ctx)                 // []CassetteInfo：Exchanges / Hits / Consumed / Recording 等
+s.Cassettes().Get(ctx, name)            // Cassette；JSONL(ctx, name) 取 JSON 行
+s.Cassettes().Delete(ctx, name); s.Cassettes().Clear(ctx)
+
+// 快照：先拍基线，每个测试前还原
+s.Snapshots().Create(ctx, "base")       // 名字为空则自动取 snapshot-N；重名返回 409 的 *fakellm.Error
+s.Snapshots().Restore(ctx, "base")      // 快照保留
+s.Snapshots().List(ctx); s.Snapshots().Get(ctx, "base")
+s.Snapshots().Delete(ctx, "base"); s.Snapshots().Clear(ctx)
+s.Reset(ctx, fakellm.ResetOptions{DropSnapshots: true}) // Reset 默认保留快照
+```
 
 写规则时可选字段用指针，`fakellm.Ptr(v)` 帮你取地址：
 

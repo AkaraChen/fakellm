@@ -58,6 +58,17 @@ type Options struct {
 	Scripts any
 	// Trajectories registered right after start: a JSON/YAML/JSONL document (string, []byte), a Trajectory or a []Trajectory.
 	Trajectories any
+	// Cassettes registered right after start: a JSON/YAML/JSONL document (string, []byte), a Cassette or a []Cassette.
+	Cassettes any
+	// Upstream is --upstream: an OpenAI-compatible or Anthropic server that gets the requests no rule or cassette answers.
+	Upstream string
+	// UpstreamAPIKey is --upstream-api-key, sent to the upstream instead of the client's credentials.
+	UpstreamAPIKey string
+	// Record is --record: a file that every exchange recorded from the upstream is appended to. Needs Upstream.
+	Record string
+	// Watch reloads script, trajectory, policy and cassette files given in Args when they change.
+	// nil keeps the server default (on); false passes --no-watch.
+	Watch *bool
 	// Policies registered right after start. Needs a policy runtime (tjs, node or bun) on the machine.
 	Policies []Policy
 	// PolicyRuntime is --policy-runtime: tjs, node, bun or a path; empty means the server default.
@@ -135,6 +146,14 @@ func Start(ctx context.Context, opts Options) (*Server, error) {
 	}
 	if opts.PolicyRuntime != "" {
 		args = append(args, "--policy-runtime", opts.PolicyRuntime)
+	}
+	for _, f := range []struct{ flag, v string }{{"--upstream", opts.Upstream}, {"--upstream-api-key", opts.UpstreamAPIKey}, {"--record", opts.Record}} {
+		if f.v != "" {
+			args = append(args, f.flag, f.v)
+		}
+	}
+	if opts.Watch != nil && !*opts.Watch {
+		args = append(args, "--no-watch")
 	}
 	prefix := ""
 	if opts.PathPrefix != "" {

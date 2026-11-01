@@ -1,6 +1,6 @@
 # 真实消费方实验：用 fakellm 替换别人仓库测试里的 LLM 后端
 
-本文记录两轮实验：在 `/home/akrc/Developer/fakellm-research` 下克隆了会调用 LLM API 的开源仓库，各开一个本地分支 `fakellm`，把它们的测试或 e2e 改成对着 fakellm 跑，用来找 fakellm 的缺口。第一轮六个仓库（xsai、pi-mono、claude-agent-sdk-python、opencode、raft、oar），第二轮（M2 二进制）新增 paseo、ai-sdk 一致性对照，并重跑 oar。所有提交都只在本地，没有推送。
+本文记录三轮实验：在 `/home/akrc/Developer/fakellm-research` 下克隆了会调用 LLM API 的开源仓库，各开一个本地分支 `fakellm`，把它们的测试或 e2e 改成对着 fakellm 跑，用来找 fakellm 的缺口。第一轮六个仓库（xsai、pi-mono、claude-agent-sdk-python、opencode、raft、oar），第二轮（M2 二进制）新增 paseo、ai-sdk 一致性对照，并重跑 oar；第三轮（M3 二进制：trajectory、JS 策略脚本、路径前缀、`args_chunk_bytes`、embeddings）重跑 oar、xsai、raft、pi-mono。所有提交都只在本地，没有推送。
 
 统一约定：
 
@@ -13,15 +13,16 @@
 
 | 仓库 | 分支 / 提交 | 结果 | 阻塞缺口 |
 |---|---|---|---|
-| xsai | `fakellm` / `e9febde` | 14 个 e2e：10 通过，4 失败 | `/v1/embeddings`、`/v1/systemone` |
-| pi-mono | `fakellm` / `839c592` | 新增 10 个全通过 | 无 |
+| xsai | `fakellm` / `e9febde`（第三轮无新提交） | 14 个 e2e：第三轮 12 通过，2 失败（原 10） | `/v1/systemone` |
+| pi-mono | `fakellm` / `9cc6a5a` | 第三轮 ai 10 + agent 4 全通过（原 9 + 1） | 无 |
 | claude-agent-sdk-python | `fakellm` / `6bd191f` | 15 个通过，hooks 3 个跳过（未写规则） | 无 |
 | opencode | `fakellm` / `c200d6b` | 全通过 | 无 |
-| raft | `fakellm` / `678808f` | 157 个通过 | 路径前缀（只影响断言） |
+| raft | `fakellm` / `0adb751` | 第三轮 158 个通过（原 157，新增 1 个 reset 用例） | 无 |
 | oar（第一轮） | `fakellm` / `a86b115` | sea-trial 全通过；vendor 全量有失败 | 多项，见缺口表 |
 | paseo（第二轮） | `fakellm` / `50ee5ef` | 6 个文件全部迁移并通过（16 个测试） | 无阻塞；见缺口 4、5、7 |
 | ai-sdk 一致性（第二轮） | `fakellm` / `23d6d62` | 新增 7 个对照测试全通过 | 无阻塞；差异见下 |
-| oar（第二轮重跑） | `fakellm` / `a6c4802` | claude 49/19，codex 41/11 | predicate 与函数式回复，见缺口 1、7 |
+| oar（第二轮重跑） | `fakellm` / `a6c4802` | claude 49/19，codex 41/11 | predicate 与函数式回复 |
+| oar（第三轮） | `fakellm` / `fee3096` | claude 66/2（改后应为 67/1），codex 50/2，opencode 10/0 | 3 个未解决失败，见缺口 6、7 |
 
 ## xsai
 
@@ -313,29 +314,94 @@ OAR_TEST=opencode-aimock npx tsx sea-trial/main.ts
 
 predicate 与函数式回复占 Claude、Codex 30 个失败中的 26 个，外加 opencode 的 4 个，修它们需要 fakellm 里的声明式等价物或序列/状态功能，具体形态尚未设计。
 
+## 第三轮（M3 二进制）
+
+M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前缀容忍、忽略 `<system-reminder>` 的 `last_user`（原文用 `last_user_raw`）、`stream.args_chunk_bytes`、embeddings。二进制 `/home/akrc/Developer/fakellm-research/bin/fakellm`，Node 24（xsai 用 26.8.1）。所有提交仅在本地。
+
+### oar（`fee3096`，只改 `sea-trial/harness/fakellm.ts`）
+
+- 做法偏离原计划：不能把 `Function.prototype.toString` 的源码塞进策略，因为谓词和回复函数闭包了可变的测试状态（`active`、`slow`、`providerCalls`、`calls`）和 `currentTurnSays`。改为每个动态夹具（非 no_tools 谓词，或函数式回复）注册成策略 `fx<N>`，策略源码是一个很小的 node 模块，把 IR 请求 POST 到测试进程里的 HTTP 回调服务（`127.0.0.1:0`）；回调构造 aimock 形状的视图，原样运行谓词和回复函数，用已有的 `translateReply` 转成 ReplySpec 返回。
+- fakellm 的策略没有“放行/未命中后落到下一条规则”的语义，所以回调自己按顺序用 JS 移植的静态匹配器遍历后面的夹具，都不匹配就返回 404 spec。启动参数 `--policy-timeout-ms 60000`，策略运行时用 `process.execPath`。`reset()` 同时清夹具和策略。
+- 慢参数映射：工具调用回复的 `chunkSize` 映射为 `stream.args_chunk_bytes`，`latency` 映射为 `tokens_per_sec = 1000/latency`（fakellm 每个 token 发一个参数块；实测 10 token/s 下 19 块用 1.9 秒）。claude-partials 的 slow-arguments 现通过。
+- 命令（Node 24，三个后端并行各跑一次）：`CI=1 OAR_MOCK=fakellm OAR_TEST=<claude-aimock|codex-aimock|opencode-aimock> npx vitest run sea-trial/vendor --reporter=json --outputFile=/tmp/oarp/res/<backend>.json`
+
+| 后端 | 第二轮 | 第三轮 |
+|---|---|---|
+| claude-aimock | 49 / 19 | 66 / 2（改映射后只重跑了 claude-partials、tool-input-stream，全量应为 67 / 1） |
+| codex-aimock | 41 / 11 | 50 / 2 |
+| opencode-aimock vendor | 6 / 4 | 10 / 0 |
+
+剩余失败（共 3 个，算上 claude 修好的那个前为 5 个）：
+1. claude-partials "native background child completed blocks retain attribution"：已定位。`onMessage(/CHILD_PARTIAL/)` 在 Anthropic 上映射为 `any_message`，父级后续请求里带着 Task tool_use 参数（含 `CHILD_PARTIAL`），命中子规则而永远返回不了 `PARENT_OUTPUT`。aimock 只看最后一条 user 消息。M3 的 `last_user`（忽略 reminder）可能能修，但还没有换上重试；适配器此前因 Claude 会追加 reminder 和 tool_result 轮才用 `any_message`。
+2. codex failure-classes "unknown model"：分类结果多一个字段，疑为错误体形状差异，未深究。
+3. codex service-tier "resume preserves the saved tier"：继承的会话报 `default` 而不是 `priority`，不涉及谓词或函数式回复，未查是否与 mock 有关。
+
+注意事项：
+- `journal.getAll` 用阻塞的 `execFileSync`，若在策略请求进行中被调用会让回调死锁；未观察到。
+- 每个动态夹具多一个 node 子进程，注册时约 100ms。
+- 回落路径忽略“不含 X”的否定正则，与静态路径一致。
+- 文本回复的 `latency` 仍映射为 `ttft_ms`，aimock 的 `latency` 是每块延迟，文本时序只是近似。
+- 计时类失败没有单独归类；除已修好的慢参数外，剩余失败都不是计时问题。
+
+### xsai（`e9febde`，未改脚本，运行遗留未跟踪的 `.vitest/`）
+
+- 命令：`scripts/e2e-fakellm.sh`（加 `--reporter=verbose` 看逐条）；脚本在 11434 启动二进制并按 PID 退出时清理。规则来自 `scripts/e2e-fakellm.rules.yaml`。
+- 总计 12 / 14（第一轮 10 / 14）：model 3/3、embed 2/2、text-chat 2/2、text-messages 2/2、text-responses 2/2、decide 1/3。embed 两个用例（单输入、批量）现在通过，embeddings 验证完成。
+- decide 唯一失败是两个调用 `systemone` 的用例，均为 `HTTP 404 Invalid URL (POST /v1/systemone)`；Chat Completions 的 decide 通过。
+- `/v1/systemone` 的格式现已查清（`packages/decide/src/model-systemone.ts`）：
+  - 请求：`model`；`state`（字符串或 JSON）；可选 `images`；`questions` 为 id 到 `{criteria, instructions, type}` 的映射，`type` 为 `choice`、`score`、`noul`（SDK 对布尔问题发 `noul`）。choice 的 `criteria` 是 `{value: 描述|null}`，score 的是等级字符串数组，noul 无。
+  - 响应：`answers`（`{type:'choice', choice, confidence, probabilities}`、`{type:'score', score, confidence, probabilities:{'0','1','2'}}`、`{type:'noul', noul:p}`）和 `usage:{input_tokens, output_tokens}`。
+  - 测试约束：`damaged.probability` 对 angry 输入大于 0.5、happy 输入小于 0.5（需要按 `state` 区分两个请求）；`route.choice` 为 `shipping` 且概率在 `['billing','shipping']` 上和为 1；`anger.score` 大于 1 且不大于 2；`usage.input_tokens` 大于 0。
+- 值得做，成本低：纯 JSON POST。但路由器对非标准路径一律 404，策略脚本也到不了；需要“自定义端点规则”（匹配任意 `POST <path>`，返回静态或模板化 JSON，可带策略）。按 `damaged` 匹配需要 body 级匹配器（`last_user` 对没有 messages 的请求无效）。
+- 脚本用 `sleep 1` 而不是轮询就绪；fakellm 日志在 `/tmp/xsai-fakellm.log`。
+
+### raft（`0adb751`，在 `678808f` 之上，只改 `packages/daemon/src/drivers/pi.test.ts`）
+
+- 三个原本丢掉前缀的 Anthropic 用例（契约捕获 helper、工具往返、resume）恢复使用 `${fake.url}/anthropic`，路径断言改为 `startsWith("/anthropic/v1/messages")`（请求日志记录完整前缀路径），“fakellm 没有 /anthropic 前缀”的注释删除。路径前缀缺口已解决。
+- 新增一个用例：Pi provider 经 CONNECT 代理访问真实 fakellm 子进程，规则 `reply.stream.reset_after_chunks: 1`（`last_user: "stream failure proof"`），断言 pi-ai 报 `stopReason: "error"`、`errorMessage: "terminated"`，并断言 CONNECT 目标 `direct-unreachable.invalid:80`。
+- 命令（`packages/daemon`，Node 24）：`npx vitest run src/agentProcessManager.builtin.e2e.test.ts src/drivers/kimi-sdk.test.ts src/drivers/pi.test.ts`。157 通过，加 reset 用例后 158 通过；没有跑完整 daemon 套件。
+- 发现：裸 `net` 客户端对 M3 二进制得到 `ECONNRESET`，没有干净的 `end`，即二进制发真正的 RST（与 `docs/m3-spec.md` 的 linger 0 一致），而 `docs/scripts.md`、README、本文旧版写的“FIN 不是 RST”已过时。经 Node CONNECT 代理时 undici 仍报 `terminated`，没抓到代理是转发 RST 还是转成 FIN；该用例在 pi-ai 层区分不了 FIN 与 RST。
+- 第一次插入新用例落进了上一个用例体里，过滤运行时被跳过，提交前已修正括号位置。
+
+### pi-mono（`9cc6a5a`，Node 24.20.0）
+
+- 命令：`cd packages/ai && npx vitest --run test/fakellm.e2e.test.ts`；`cd packages/agent && npx vitest --run test/fakellm.e2e.test.ts`。ai 9 到 10，agent 1 到 4，全部通过。
+- reset 用例（ai）：`reset_after_chunks: 2`、`chunk_tokens: 1`、`maxRetries: 0`；pi-ai 报 `stopReason: "error"`、`errorMessage: "terminated"`，内容为部分文本 `"one two"`，fakellm 只记录 1 个请求（无重试）。比旧的截断用例（接受 error/stop/length）严格。
+- trajectory 用例（agent）：三步，`tool_map` 把 shell 映射到 `run_shell`（`cmd: "$command"`），第 2 步 `expect contains: "Cargo"`，第 3 步 `contains: "version = 7"`；agent 真的执行了 `ls` 和 `cat Cargo.toml`；`GET /_fakellm/trajectories` 为 `hits: 3, last_step: 2`。
+- 分歧用例（agent，额外增加）：`expect` 写错时，最后一条 assistant 消息 `stopReason: "error"`，`errorMessage` 含 "diverged"；严格分歧返回 400，pi-ai 不重试，agent 循环正常结束不抛异常。
+- 策略用例（agent）：node 运行时的 async 策略，按 `request.messages.at(-1)` 与 `state.stage` 选下一个工具；最终文本含工具输出（"Policy saw: version = 7"）；策略列表 `hits: 3, state.stage: "done"`。
+- 新增通用 helper `put(path, body, method?)`（`packages/ai/test/helpers/fakellm.ts`），非 2xx 即抛错。
+- `package-lock.json` 在开始前就已被修改（删 26 行），没有提交。vitest 会吞 `console.log`，用 `--disableConsoleIntercept` 查看。
+
 ## fakellm 缺口
 
-两轮之后重新排序：先按需要它的仓库数，同数时按受影响的用例数。缺口名后括号里是涉及的仓库。「已解决」的单独列在表后。
+三轮之后重新排序：先按需要它的仓库数，同数时按受影响的用例数；第三轮已解决的缺口移到表后。
 
 | # | 缺口 | 涉及仓库 | 精确的失败断言或行为 |
 |---|---|---|---|
-| 1 | 任意谓词、turn 范围与跨请求序列/状态匹配（oar、paseo） | oar、paseo | oar：没有 `currentTurnSays`、`request.tools.length==0`、按最后一个 `tool_call_id ===` 比较的等价物；`last_tool_call_id` 与 `no_tools` 只覆盖其中两种。第二轮重跑后仍有 `match.predicate` 失败：claude 8、codex 6、opencode 4，共 18 个。paseo：guardian 请求与主请求只靠 `times:1` 的先后顺序区分，没有匹配条件，codex 一旦调整调用顺序就失效 |
-| 2 | Anthropic 请求里的 system 角色消息与 `<system-reminder>` 前置块污染 `last_user`（oar、claude-agent-sdk-python） | oar、claude-agent-sdk-python | Claude Code 2.1.314 在 `messages[]` 末尾发 `{"role":"system"}`，IR 把它转成 `user`，`last_user` 匹配的是环境块而不是真实提示词；第一条 user 消息本身是 `<system-reminder>`，`last_user: "pong"` 永远不命中。oar 第二轮再次确认：Anthropic 适配只能用 `any_message`，改 `last_user` 会让 Claude 从 49 掉到 44（reminder 与 tool_result 轮排在提示词之后）；`any_message` 又比 aimock 宽松，Codex 侧已因此出过续聊误命中。修法：IR 保留 `role:system`，`last_user` 只看真实 user 文本 |
-| 3 | 工具参数流式的分块大小与延迟（oar、ai-sdk） | oar、ai-sdk | oar `claude-partials` "slow tool arguments"：`expected 1 to be greater than 500`，适配器已把 `latency`、`chunkSize` 映射到 `ttft_ms`、`chunk_tokens` 仍失败，因为工具参数固定 16 字节一块、未设 `tokens_per_sec` 不限速。ai-sdk 对照：responses `tool-input-delta` 夹具 13 块、fakellm 2 块 |
-| 4 | Anthropic 缓存读取与 `input_tokens` 耦合，`count_tokens` 不一致（paseo、ai-sdk） | paseo、ai-sdk | 规则的 `usage.input_tokens` 对 Anthropic 要包含缓存读取（paseo 写 `20236+turn+cache`，ai-sdk 写 input + cache read + cache write），响应里被扣减；`count_tokens` 不扣，会返回被抬高的值。TODO「文档与一致性」已有此条 |
-| 5 | 函数式/动态回复（oar） | oar | `echo-mcp.ts` 的 `echoFixtures`/`scriptEchoes` 与权限、input-identity 夹具：claude 9、codex 3，共 12 个失败 |
-| 6 | Anthropic 的 `input_tokens` 位置不可控（paseo） | paseo | 不能选择 `message_start` 还是 `message_delta`；paseo 的 Claude `start`/`delta` 两个用例变成同一 wire 形状，旧区分不再被覆盖 |
-| 7 | 与真实 API 的响应保真差异（ai-sdk） | ai-sdk | anthropic usage 缺 `cache_creation`、`service_tier`、`inference_geo`；`model` 是请求别名而非带日期的 id；`message_start` 的 `output_tokens` 为 1（夹具 10 和 2）；`message_delta` 缺 `context_management`，`contextManagement` 为 `null` 而非 `{appliedEdits: []}`；`tool-no-args` 多一个 `{}` 的 `tool-input-delta`；responses 的 `encrypted_content` 在 `output_item.added` 与 `.done` 上用同一个值（夹具不同）；每个 delta 一个分词 token，块数多于真实 API（chat 301 对 477、anthropic 文本 6 对 29） |
-| 8 | 可配置的路由前缀，或匹配任意前缀的 `.../v1/messages`（raft） | raft | `POST /anthropic/v1/messages` 404，`/v1/messages` 200；Pi 的路径断言只能改成 `/v1/messages` |
-| 9 | `POST /v1/systemone`（Ollama 专有，xsai） | xsai | `packages/decide/src/model-systemone.ts` 的两个 decide 用例在 HTTP 404 处失败，响应格式未知；是否值得实现要看 Ollama 这个端点是否稳定 |
-| 10 | `cut_after_chunks`/`reset_after_chunks` 不发 TCP RST（pi-mono，README 已列） | pi-mono | 截断测试只能断言 `stopReason` 属于 `error`/`stop`/`length`；客户端看到 `terminated`/`unexpected EOF` 而不是 `ECONNRESET` |
-| 11 | 正则不支持环视（oar） | oar | Rust regex 无 lookahead；opencode 的"不含 X"已能靠规则顺序（无条件规则放在 X 规则之后）表达，适配器遇到其他环视仍抛错，降为低优先级 |
-| 12 | oar 两个未诊断的 codex 失败，无法判断是否 fakellm 问题 | oar | `failure-classes` unknown model：`expected {failure:'model_unavailable', …(1)} to deeply equal {failure:'model_unavailable'}`（多一个字段，疑为 `status`）；`service-tier`：`expected 'default' to be 'priority'`。两者在第一轮 aimock 基线就失败；另有 `claude-partials` "native background child" `expected false to be true` 未诊断 |
+| 1 | 策略脚本没有“放行/未命中”语义，动态夹具要靠外部回调模拟（oar、paseo） | oar、paseo | 第三轮 oar 用每个动态夹具一个策略加测试进程里的 HTTP 回调实现了 predicate 与函数式回复（claude 49 到 66、codex 41 到 50、opencode 6 到 10），但策略拒绝时 fakellm 不会落到下一条规则，适配器只能在回调里用 JS 重写静态匹配器并自己返回 404；每个动态夹具一个 node 子进程（约 100ms）。paseo 的 guardian 与主请求仍只靠 `times:1` 的顺序区分，没有匹配条件。需要策略返回“declined”落到后续规则，或声明式的序列/状态匹配 |
+| 2 | Anthropic 缓存读取与 `input_tokens` 耦合，`count_tokens` 不一致（paseo、ai-sdk） | paseo、ai-sdk | 规则的 `usage.input_tokens` 对 Anthropic 要包含缓存读取（paseo 写 `20236+turn+cache`，ai-sdk 写 input + cache read + cache write），响应里被扣减；`count_tokens` 不扣，会返回被抬高的值。TODO「文档与一致性」已有此条 |
+| 3 | 与真实 API 的响应保真差异（ai-sdk） | ai-sdk | anthropic usage 缺 `cache_creation`、`service_tier`、`inference_geo`；`model` 是请求别名而非带日期的 id；`message_start` 的 `output_tokens` 为 1（夹具 10 和 2）；`message_delta` 缺 `context_management`，`contextManagement` 为 `null` 而非 `{appliedEdits: []}`；`tool-no-args` 多一个 `{}` 的 `tool-input-delta`；responses 的 `encrypted_content` 在 `output_item.added` 与 `.done` 上相同；每个 delta 一个分词 token，块数多于真实 API；responses `tool-input-delta` 夹具 13 块、fakellm 2 块（`args_chunk_bytes` 现可调，但未对照重测） |
+| 4 | Anthropic 的 `input_tokens` 位置不可控（paseo） | paseo | 不能选择 `message_start` 还是 `message_delta`；paseo 的 Claude `start`/`delta` 两个用例变成同一 wire 形状 |
+| 5 | 自定义端点规则：`POST /v1/systemone`（xsai） | xsai | 两个 decide 用例 `HTTP 404 Invalid URL (POST /v1/systemone)`。格式已查清（见第三轮 xsai）。路由器对非标准路径一律 404，需要“匹配任意 `POST <path>`、返回静态/模板 JSON、带 body 级匹配器（JSON 路径或 body 包含）”的规则；一个特性可同时覆盖 angry/happy 两个用例 |
+| 6 | Anthropic 适配只能用 `any_message`，误命中历史消息（oar） | oar | claude-partials "native background child completed blocks retain attribution"：父级后续请求含 Task tool_use 参数（带 `CHILD_PARTIAL`），`any_message` 命中子规则。M3 的 `last_user` 已忽略 `<system-reminder>`，可能已可替换，但第三轮未重试（此前换成 `last_user` 曾使 Claude 49 掉到 44，原因是 Claude 在提示词后追加 reminder 和 tool_result 轮）。需要先用 M3 重试，再决定是否要“最后一条真实 user 消息”的更精确语义 |
+| 7 | oar 两个未诊断的 codex 失败，无法判断是否 fakellm 问题 | oar | `failure-classes` unknown model：结果多一个字段，疑为错误体形状差异；`service-tier` "resume preserves the saved tier"：继承会话报 `default` 而不是 `priority`。两者在 aimock 基线上第一轮就失败，不涉及谓词 |
+| 8 | 正则不支持环视（oar） | oar | Rust regex 无 lookahead；opencode 的“不含 X”已能靠规则顺序表达，适配器遇到其他环视仍抛错；回落路径也忽略否定正则。低优先级 |
+| 9 | 文档过时：RST 行为（raft） | raft | 二进制已发 RST（裸 `net` 客户端得到 `ECONNRESET`），但 README、`docs/scripts.md` 仍写“FIN 不是 RST”；未验证 CONNECT 代理会转发 RST 还是转成 FIN。经代理和 pi-ai 看到的都是 `terminated`，区分不了 |
+| 10 | trajectory/策略的覆盖缺口（pi-mono） | pi-mono | agent 测试只用 openai-completions，Responses 与 Anthropic 的 trajectory/策略没测；bun 与 tjs 运行时没试；`args_chunk_bytes`（仅 oar 间接覆盖）、`last_user_raw`、路径前缀容忍（仅 raft 覆盖）没有专门测试 |
 
-已解决或已实现：
+第三轮已解决：
 
-- `reply.usage` 覆盖：第一轮的 codex resumed-usage、`reasoning-tokens` 失败。第二轮 oar 适配器已透传，重跑通过。
-- `POST /v1/embeddings`（xsai）：embed 两个用例原先 404。embeddings 在工作区里已实现（`src/openai/embeddings.rs`），但还没有在 xsai 上重跑验证，状态记为「已实现、待验证」。
+- 工具参数流式分块与延迟（oar）：`stream.args_chunk_bytes` 加 `tokens_per_sec`，slow-arguments 用例通过（10 token/s 下 19 块用 1.9 秒）。
+- 可配置路径前缀（raft）：`/anthropic/v1/messages` 现可用，raft 三个用例已恢复前缀并通过。
+- `POST /v1/embeddings`（xsai）：embed 两个用例通过，已验证。
+- `reset_after_chunks` 的 RST（pi-mono、raft）：二进制现发真正的 RST；剩余的只是文档过时（缺口 9）。
+- 任意谓词与函数式回复（oar）：可由策略脚本实现，剩余问题见缺口 1。
+- Anthropic 的 system 角色消息与 `<system-reminder>` 污染 `last_user`：M3 已让 `last_user` 忽略 reminder（`last_user_raw` 取原文），oar 重试见缺口 6。
+
+第二轮已解决：
+
+- `reply.usage` 覆盖：第一轮的 codex resumed-usage、`reasoning-tokens` 失败，oar 适配器透传后重跑通过。
 
 不算缺口但值得写进文档的使用坑：
 
@@ -347,6 +413,8 @@ predicate 与函数式回复占 Claude、Codex 30 个失败中的 26 个，外�
 
 ## 经验
 
+- 第三轮补充：期望被改写成函数式的测试，不要靠嵌入函数源码——闭包状态会丢，用回调服务把真实函数留在测试进程里更稳；策略脚本目前没有“放行”语义（缺口 1）。
+- 第三轮补充：别信文档里的 wire 行为，用裸 `net` 客户端对二进制探一下（RST 就是这样发现已实现的）。
 - 第二轮补充：paseo 的 16 个测试迁移后净减 392 行（+144/−536）手写假服务代码；日志按原始请求正文断言（例如 `function_call_output`/`call1`）比手写假服务更直接。
 - 第二轮补充：夹具对照说明汇总断言（文本、工具、finish reason、usage）全部一致，差异集中在块粒度和 provider 元数据，不影响多数客户端，但会影响逐块断言的测试。
 - 六个仓库里，Chat Completions、Responses、Anthropic Messages 三种协议在同一套规则上都能跑通；最常用的匹配键是 `has_tool_result`、`turn`、`system`、`no_tools`、`model`。

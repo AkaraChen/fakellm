@@ -3,7 +3,9 @@ use std::io::Write;
 use clap::Parser;
 use clap::builder::BoolishValueParser;
 
+mod cassette_cli;
 mod ctl;
+mod import_cli;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -61,6 +63,39 @@ struct Opt {
     #[arg(long, env = "FAKELLM_PATH_PREFIX")]
     path_prefix: Option<String>,
 
+    /// Cassettes to load at start (repeatable): a JSON, YAML or JSONL file, see docs/cassette.md. Requests no script
+    /// rule answers are looked up in them by meaning, not by bytes.
+    #[arg(long = "cassette", env = "FAKELLM_CASSETTES", value_delimiter = ',', value_name = "FILE")]
+    cassettes: Vec<std::path::PathBuf>,
+
+    /// Relay requests that no script rule and no cassette answers to this OpenAI-compatible or Anthropic server
+    /// (http:// or https://), in the request's own protocol, and record what it answers.
+    #[arg(long, env = "FAKELLM_UPSTREAM", value_name = "URL")]
+    upstream: Option<http::Uri>,
+
+    /// API key sent to the upstream instead of the client's own credentials. Without it the client's
+    /// `authorization` and `x-api-key` headers are passed through.
+    #[arg(long, env = "FAKELLM_UPSTREAM_API_KEY", requires = "upstream")]
+    upstream_api_key: Option<String>,
+
+    /// Append every exchange recorded from the upstream to this file as a JSONL cassette.
+    #[arg(long, env = "FAKELLM_RECORD", requires = "upstream", value_name = "FILE")]
+    record: Option<std::path::PathBuf>,
+
+    /// Also record the upstream's 401, 403, 408, 409, 429 and 5xx answers (by default they are relayed but not
+    /// recorded, so a retry that succeeded is not shadowed on replay).
+    #[arg(long, requires = "record")]
+    record_errors: bool,
+
+    /// Seconds the upstream may take to send response headers; 0 means no limit.
+    #[arg(long, env = "FAKELLM_UPSTREAM_TIMEOUT", requires = "upstream", default_value_t = 600)]
+    upstream_timeout: u64,
+
+    /// Do not reload --scripts, --trajectory, --policy and --cassette files when they change.
+    #[arg(long, env = "FAKELLM_NO_WATCH", value_parser = BoolishValueParser::new(), num_args = 0..=1,
+        default_missing_value = "true", default_value_t = false)]
+    no_watch: bool,
+
     /// Length of the default reply, in tokens.
     #[arg(long, default_value_t = 32, env = "FAKELLM_FALLBACK_TOKENS")]
     fallback_tokens: u32,
@@ -110,6 +145,10 @@ fn at_least_one(s: &str) -> Result<usize, String> {
 enum Cmd {
     /// Control a running server: reset, scripts, clock, request log.
     Ctl(ctl::Ctl),
+    /// Convert Hugging Face dataset rows (or a local dump of them) into a cassette or trajectories.
+    Import(import_cli::Import),
+    /// Offline tools for cassette files.
+    Cassette(cassette_cli::Cassette),
     /// Print the configuration that points a client at a running fakellm.
     Wire {
         /// One of: claude, codex, opencode, pi, openai-sdk, ai-sdk, anthropic-sdk.
@@ -135,6 +174,13 @@ fn main() -> std::io::Result<std::process::ExitCode> {
                 .build()?
                 .block_on(ctl::run(c)));
         }
+        Some(Cmd::Import(i)) => {
+            return Ok(tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(import_cli::run(i)));
+        }
+        Some(Cmd::Cassette(c)) => return Ok(cassette_cli::run(c)),
         Some(Cmd::Wire {
             target,
             endpoint,
@@ -144,7 +190,10 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         None => {}
     }
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "warn,fakellm::watch=info,fakellm::upstream=info".into()),
+        )
         .init();
     let invalid = |m: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, m);
     let scripts = match &opt.scripts {
@@ -175,6 +224,23 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         .iter()
         .map(|path| fakellm::PolicySpec::from_path(path).map_err(|e| invalid(format!("{}: {e}", path.display()))))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut cassettes = Vec::new();
+    for path in &opt.cassettes {
+        let text = std::fs::read_to_string(path).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+        let format = match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => fakellm::CassetteFormat::Json,
+            Some("jsonl" | "ndjson") => fakellm::CassetteFormat::Jsonl,
+            Some("yaml" | "yml") => fakellm::CassetteFormat::Yaml,
+            _ => fakellm::CassetteFormat::Auto,
+        };
+        cassettes.extend(fakellm::Cassette::parse_many(&text, format).map_err(|e| invalid(format!("{}: {e}", path.display())))?);
+    }
+    let watch = (!opt.no_watch).then(|| fakellm::WatchConfig {
+        scripts: opt.scripts.clone(),
+        trajectories: opt.trajectories.clone(),
+        policies: opt.policies.clone(),
+        cassettes: opt.cassettes.clone(),
+    });
     let ttft = fakellm::parse_duration(&opt.ttft).map_err(invalid)?;
     if ttft < 0 {
         return Err(invalid("--ttft must not be negative".into()));
@@ -208,6 +274,13 @@ fn main() -> std::io::Result<std::process::ExitCode> {
         policies,
         policy_runtime: opt.policy_runtime,
         policy_timeout_ms: opt.policy_timeout_ms,
+        cassettes,
+        upstream: opt.upstream,
+        upstream_api_key: opt.upstream_api_key,
+        record: opt.record,
+        record_errors: opt.record_errors,
+        upstream_timeout_secs: opt.upstream_timeout,
+        watch,
     };
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async {
         let mut server = fakellm::Server::start(config).await?;

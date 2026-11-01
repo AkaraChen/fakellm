@@ -3,10 +3,13 @@
 //! Commands: `status`, `reset [--keep-clock] [--keep-requests] [--keep-scripts] [--keep-responses]`,
 //! `responses {list, clear}`,
 //! `scripts {list, put FILE [--keep-hits], add FILE, clear}` (FILE is JSON or YAML by extension),
+//! `cassettes {list, put FILE, add FILE, get NAME [--jsonl], delete NAME, clear}` (FILE is JSON, JSONL or YAML by extension),
+//! `snapshot {create [NAME], list, restore NAME, delete NAME}`,
 //! `clock {get, freeze [AT], unfreeze, set AT, advance BY, reset}`,
 //! `requests {list [--model] [--has-tool] [--stream] [--protocol] [--status] [--source] [--rule] [--path]
 //! [--since] [--after] [--limit] [--full] [--count], clear, config [--enable|--disable] [--capacity N]}`.
 //! `--endpoint` (env `FAKELLM_ENDPOINT`, default `http://127.0.0.1:4010`) and `--json` are global.
+//! `fakellm import` (dataset converters) is a separate offline subcommand; its output files are loaded with `cassettes put|add`.
 //! Human output is a compact text rendering; `--json` prints the server's JSON.
 
 use std::path::{Path, PathBuf};
@@ -20,6 +23,10 @@ use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
 #[derive(Args)]
+#[command(
+    after_help = "Importing is offline and not a ctl command: `fakellm import ... -o FILE` converts Hugging Face dataset rows \
+into a cassette or trajectory file, which `ctl cassettes put FILE` loads into a running server (trajectories: `--trajectory FILE` at start)."
+)]
 pub struct Ctl {
     /// Server to control.
     #[arg(long, global = true, default_value = "http://127.0.0.1:4010", env = "FAKELLM_ENDPOINT")]
@@ -51,10 +58,19 @@ enum Command {
         /// Leave the stored Responses API objects as they are.
         #[arg(long)]
         keep_responses: bool,
+        /// Also delete all snapshots (they survive a reset otherwise).
+        #[arg(long)]
+        drop_snapshots: bool,
     },
     /// Manage scripted replies.
     #[command(subcommand)]
     Scripts(Scripts),
+    /// Manage cassettes: recorded or imported exchanges replayed by meaning.
+    #[command(subcommand)]
+    Cassettes(Cassettes),
+    /// Save and restore the whole control-plane state.
+    #[command(subcommand)]
+    Snapshot(Snapshot),
     /// Read or move the server's time.
     #[command(subcommand)]
     Clock(Clock),
@@ -89,6 +105,44 @@ enum Scripts {
     Add { file: PathBuf },
     /// Delete all rules.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum Cassettes {
+    /// List loaded cassettes (and the in-memory recording).
+    List,
+    /// Replace all cassettes with those in a JSON, JSONL or YAML file.
+    Put { file: PathBuf },
+    /// Add the cassettes in a JSON, JSONL or YAML file; a same-named one is replaced.
+    Add { file: PathBuf },
+    /// Print one cassette as JSON; `recording` is what the upstream proxy has recorded so far.
+    Get {
+        name: String,
+        /// One exchange per line, after a header line.
+        #[arg(long)]
+        jsonl: bool,
+    },
+    /// Remove one cassette (`recording` empties the recording).
+    Delete { name: String },
+    /// Remove all cassettes (not the recording).
+    Clear,
+}
+
+#[derive(Subcommand)]
+enum Snapshot {
+    /// Capture scripts, trajectories, policies, cassettes, stored responses and the clock.
+    Create {
+        /// 1 to 64 characters of A-Za-z0-9._-; default: snapshot-N.
+        name: Option<String>,
+    },
+    List,
+    /// Put a snapshot's state back (the snapshot stays).
+    Restore {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -210,6 +264,16 @@ fn script_body(file: &Path) -> Result<Body> {
     })
 }
 
+fn cassette_body(file: &Path) -> Result<Body> {
+    let bytes = std::fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+    let content_type = match file.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("jsonl" | "ndjson") => "application/x-ndjson",
+        Some("yaml" | "yml") => "application/yaml",
+        _ => "application/json",
+    };
+    Ok(Body { bytes, content_type })
+}
+
 fn requests_query(r: &Requests) -> String {
     let Requests::List {
         model,
@@ -268,14 +332,62 @@ fn plan(command: &Command) -> Result<Call> {
             keep_requests,
             keep_scripts,
             keep_responses,
+            drop_snapshots,
         } => (
             "POST",
             format!(
-                "/_fakellm/reset?clock={}&requests={}&scripts={}&responses={}",
-                !keep_clock, !keep_requests, !keep_scripts, !keep_responses
+                "/_fakellm/reset?clock={}&requests={}&scripts={}&responses={}{}",
+                !keep_clock,
+                !keep_requests,
+                !keep_scripts,
+                !keep_responses,
+                if *drop_snapshots { "&snapshots=true" } else { "" }
             ),
             None,
         ),
+        Command::Cassettes(c) => match c {
+            Cassettes::List => ("GET", "/_fakellm/cassettes".into(), None),
+            Cassettes::Put { file } => ("PUT", "/_fakellm/cassettes".into(), Some(cassette_body(file)?)),
+            Cassettes::Add { file } => ("POST", "/_fakellm/cassettes".into(), Some(cassette_body(file)?)),
+            Cassettes::Get { name, jsonl } => (
+                "GET",
+                format!(
+                    "/_fakellm/cassettes/{}{}",
+                    percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC),
+                    if *jsonl { "?format=jsonl" } else { "" }
+                ),
+                None,
+            ),
+            Cassettes::Delete { name } => (
+                "DELETE",
+                format!(
+                    "/_fakellm/cassettes/{}",
+                    percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC)
+                ),
+                None,
+            ),
+            Cassettes::Clear => ("DELETE", "/_fakellm/cassettes".into(), None),
+        },
+        Command::Snapshot(s) => match s {
+            Snapshot::Create { name } => ("POST", "/_fakellm/snapshots".into(), Some(json!({ "name": name }).into())),
+            Snapshot::List => ("GET", "/_fakellm/snapshots".into(), None),
+            Snapshot::Restore { name } => (
+                "POST",
+                format!(
+                    "/_fakellm/snapshots/{}/restore",
+                    percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC)
+                ),
+                None,
+            ),
+            Snapshot::Delete { name } => (
+                "DELETE",
+                format!(
+                    "/_fakellm/snapshots/{}",
+                    percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC)
+                ),
+                None,
+            ),
+        },
         Command::Scripts(s) => match s {
             Scripts::List => ("GET", "/_fakellm/scripts".into(), None),
             Scripts::Put { file, keep_hits } => (
@@ -342,6 +454,23 @@ fn print_human(command: &Command, v: &Value) {
             print_clock(&v["clock"]);
             let n = v["scripts"]["count"].as_u64().map_or_else(|| "-".to_owned(), |n| n.to_string());
             println!("scripts        {n} rules");
+            if let Some(n) = v["cassettes"]["count"].as_u64() {
+                println!("cassettes      {n} loaded");
+            }
+            if let Some(n) = v["snapshots"]["count"].as_u64() {
+                println!("snapshots      {n}");
+            }
+            if let Some(u) = v["upstream"].as_object() {
+                let recorded = u.get("recorded").and_then(Value::as_u64).unwrap_or(0);
+                let file = u
+                    .get("record")
+                    .and_then(Value::as_str)
+                    .map_or(String::new(), |f| format!(" -> {f}"));
+                println!(
+                    "upstream       {} ({recorded} recorded{file})",
+                    u.get("url").and_then(Value::as_str).unwrap_or("-")
+                );
+            }
             if let Some(n) = v["responses"]["count"].as_u64() {
                 println!("responses      {n} stored");
             }
@@ -366,6 +495,50 @@ fn print_human(command: &Command, v: &Value) {
             _ => println!("ok"),
         },
         Command::Scripts(Scripts::Clear) => println!("cleared"),
+        Command::Cassettes(c) => match c {
+            Cassettes::List => {
+                for c in v["cassettes"].as_array().into_iter().flatten() {
+                    println!(
+                        "{:<24} {:>5} exchanges  {:>4} hits  {}{}{}{}",
+                        text(c, "name"),
+                        c["exchanges"],
+                        c["hits"],
+                        if c["once"] == true { "once " } else { "" },
+                        if c["fuzzy"] == true { "fuzzy " } else { "" },
+                        if c["consumed"].as_u64().unwrap_or(0) > 0 {
+                            format!("consumed={} ", c["consumed"])
+                        } else {
+                            String::new()
+                        },
+                        if c["recording"] == true { "(recording)" } else { "" },
+                    );
+                }
+                if v["cassettes"].as_array().is_none_or(Vec::is_empty) {
+                    println!("no cassettes");
+                }
+            }
+            Cassettes::Put { .. } | Cassettes::Add { .. } => match (v["added"].as_u64(), v["count"].as_u64()) {
+                (Some(n), Some(total)) => println!("{n} cassettes loaded ({total} total)"),
+                _ => println!("ok"),
+            },
+            Cassettes::Get { jsonl: true, .. } => print!("{}", v.as_str().unwrap_or_default()),
+            Cassettes::Get { .. } => println!("{}", serde_json::to_string_pretty(v).unwrap_or_default()),
+            Cassettes::Delete { .. } => println!("deleted"),
+            Cassettes::Clear => println!("cleared"),
+        },
+        Command::Snapshot(s) => match s {
+            Snapshot::List => {
+                for sn in v["snapshots"].as_array().into_iter().flatten() {
+                    println!("{}", snapshot_line(sn));
+                }
+                if v["snapshots"].as_array().is_none_or(Vec::is_empty) {
+                    println!("no snapshots");
+                }
+            }
+            Snapshot::Create { .. } => println!("created {}", snapshot_line(v)),
+            Snapshot::Restore { .. } => println!("restored {}", snapshot_line(v)),
+            Snapshot::Delete { .. } => println!("deleted"),
+        },
         Command::Clock(_) => print_clock(v),
         Command::Requests(Requests::List { count: true, .. }) => println!("{}", v["total"]),
         Command::Requests(Requests::List { .. }) => {
@@ -387,6 +560,19 @@ fn print_human(command: &Command, v: &Value) {
         Command::Requests(Requests::Clear) => println!("cleared"),
         Command::Requests(Requests::Config { .. }) => print_log_config(v),
     }
+}
+
+fn snapshot_line(s: &Value) -> String {
+    format!(
+        "{}  {}  scripts={} trajectories={} policies={} cassettes={} responses={}",
+        text(s, "name"),
+        text(s, "created"),
+        s["scripts"],
+        s["trajectories"],
+        s["policies"],
+        s["cassettes"],
+        s["responses"]
+    )
 }
 
 const MATCH_FIELDS: &[&str] = &[
@@ -556,9 +742,23 @@ impl Api {
             .map_err(|e| e.to_string())?;
         let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let bytes = resp.into_body().collect().await.map_err(|e| e.to_string())?.to_bytes();
-        let json: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| format!("{} did not answer like a fakellm control plane (HTTP {status})", self.authority))?;
+        let ndjson = content_type.as_deref().is_some_and(|c| c.starts_with("application/x-ndjson"));
+        let json: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) if ndjson && status.is_success() => Value::String(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(_) => {
+                return Err(format!(
+                    "{} did not answer like a fakellm control plane (HTTP {status})",
+                    self.authority
+                ));
+            }
+        };
         if status.is_success() {
             return Ok(json);
         }
@@ -685,6 +885,48 @@ mod tests {
         assert_eq!(String::from_utf8(b.unwrap().bytes).unwrap(), r#"{"enabled":false,"capacity":5}"#);
         assert_eq!(plan_of(&["requests", "config"]).0, "GET");
         assert_eq!(plan_of(&["clock", "advance", "-2w"]).1, "/_fakellm/clock/advance");
+    }
+
+    #[test]
+    fn help_documents_import_and_new_commands() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(help.contains("fakellm import") && help.contains("cassettes put"), "{help}");
+        assert!(help.contains("cassettes") && help.contains("snapshot"), "{help}");
+    }
+
+    #[test]
+    fn cassettes_and_snapshots() {
+        let dir = std::env::temp_dir().join(format!("fakellm-ctl-cs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let l = dir.join("rec.JSONL");
+        std::fs::write(&l, "{\"kind\":\"cassette\",\"name\":\"x\"}\n").unwrap();
+        let (m, p, b) = plan_of(&["cassettes", "put", l.to_str().unwrap()]);
+        assert_eq!(
+            (m, p.as_str(), b.unwrap().content_type),
+            ("PUT", "/_fakellm/cassettes", "application/x-ndjson")
+        );
+        let (m, p, _) = plan_of(&["cassettes", "add", l.to_str().unwrap()]);
+        assert_eq!((m, p.as_str()), ("POST", "/_fakellm/cassettes"));
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(
+            plan_of(&["cassettes", "get", "my cassette", "--jsonl"]).1,
+            "/_fakellm/cassettes/my%20cassette?format=jsonl"
+        );
+        assert_eq!(plan_of(&["cassettes", "delete", "recording"]).1, "/_fakellm/cassettes/recording");
+        assert_eq!(plan_of(&["cassettes", "clear"]).0, "DELETE");
+
+        let (m, p, b) = plan_of(&["snapshot", "create", "seeded"]);
+        assert_eq!((m, p.as_str()), ("POST", "/_fakellm/snapshots"));
+        assert_eq!(String::from_utf8(b.unwrap().bytes).unwrap(), r#"{"name":"seeded"}"#);
+        let (_, _, b) = plan_of(&["snapshot", "create"]);
+        assert_eq!(String::from_utf8(b.unwrap().bytes).unwrap(), r#"{"name":null}"#);
+        assert_eq!(plan_of(&["snapshot", "restore", "seeded"]).1, "/_fakellm/snapshots/seeded/restore");
+        let (m, p, b) = plan_of(&["snapshot", "delete", "seeded"]);
+        assert_eq!((m, p.as_str(), b.is_none()), ("DELETE", "/_fakellm/snapshots/seeded", true));
+        assert_eq!(plan_of(&["snapshot", "list"]).0, "GET");
+        assert!(plan_of(&["reset", "--drop-snapshots"]).1.ends_with("&snapshots=true"));
     }
 
     #[test]

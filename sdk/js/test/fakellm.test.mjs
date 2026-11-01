@@ -1,6 +1,8 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
 import { start, connect, text, toolCall, error, FakeLLMError } from '../dist/index.js';
@@ -241,4 +243,93 @@ test('start: trajectories, policies, policyRuntime and pathPrefix', async () => 
     await s.stop();
   }
   await assert.rejects(start({ bin, policyRuntime: 'node', policies: [{ name: 'bad', source: 'export default 1 +' }] }), (e) => e instanceof FakeLLMError);
+});
+
+const tape = (name, user, answer, extra = {}) => ({
+  kind: 'cassette',
+  name,
+  ...extra,
+  exchanges: [
+    {
+      request: { model: 'm1', messages: [{ role: 'user', content: [{ type: 'text', text: user }] }] },
+      outcome: { outcome: 'reply', reply: { text: answer, finish: 'stop', usage: { prompt_tokens: 5, completion_tokens: 2 } } },
+      protocol: 'openai.chat',
+    },
+  ],
+});
+
+test('cassettes: put/add/list/clear and replay', async () => {
+  assert.deepEqual(await srv.cassettes.put(tape('c1', 'capital?', 'Paris')), { added: 1, count: 1 });
+  assert.equal((await ask('capital?')).choices[0].message.content, 'Paris');
+  assert.deepEqual(await srv.cassettes.add([tape('c2', 'other?', 'Rome')]), { added: 1, count: 2 });
+  const list = await srv.cassettes.list();
+  assert.deepEqual(list.map((c) => [c.name, c.exchanges, c.recording]), [['c1', 1, false], ['c2', 1, false]]);
+  assert.equal(list[0].hits, 1);
+  assert.equal((await srv.status()).cassettes.count, 2);
+  // JSONL text: header line, then one exchange per line.
+  const [header, ex] = [{ ...tape('c3', 'x', 'y'), exchanges: undefined }, tape('c3', 'jsonl?', 'from jsonl').exchanges[0]];
+  assert.deepEqual(await srv.cassettes.put(`${JSON.stringify(header)}\n${JSON.stringify(ex)}\n`), { added: 1, count: 1 });
+  assert.equal((await ask('jsonl?')).choices[0].message.content, 'from jsonl');
+  await srv.cassettes.clear();
+  assert.equal((await srv.cassettes.list()).length, 0);
+});
+
+test('cassettes: an invalid one throws FakeLLMError', async () => {
+  await assert.rejects(srv.cassettes.put([tape('a/b', 'x', 'y')]), (e) => e instanceof FakeLLMError && e.status === 400);
+});
+
+test('snapshots: create/list/restore/delete', async () => {
+  await srv.scripts.put([text('one')]);
+  await srv.cassettes.put(tape('c1', 'capital?', 'Paris'));
+  const snap = await srv.snapshots.create('base');
+  assert.equal(snap.name, 'base');
+  assert.equal(snap.scripts, 1);
+  assert.equal(snap.cassettes, 1);
+  await assert.rejects(srv.snapshots.create('base'), (e) => e instanceof FakeLLMError && e.status === 409);
+  await srv.scripts.put([text('two')]);
+  await srv.cassettes.clear();
+  assert.equal((await ask()).choices[0].message.content, 'two');
+  assert.equal((await srv.snapshots.restore('base')).name, 'base');
+  assert.equal((await ask()).choices[0].message.content, 'one');
+  assert.equal((await srv.cassettes.list()).length, 1);
+  assert.equal((await srv.snapshots.create()).name.startsWith('snapshot-'), true);
+  assert.equal((await srv.snapshots.list()).length, 2);
+  assert.equal((await srv.status()).snapshots.count, 2);
+  await srv.reset();
+  assert.equal((await srv.snapshots.list()).length, 2, 'reset keeps snapshots');
+  await srv.reset({ snapshots: true });
+  assert.equal((await srv.snapshots.list()).length, 0);
+  await assert.rejects(srv.snapshots.restore('base'), (e) => e instanceof FakeLLMError && e.status === 404);
+  await srv.snapshots.create('x');
+  await srv.snapshots.delete('x');
+  await assert.rejects(srv.snapshots.delete('x'), (e) => e.status === 404);
+});
+
+test('start: cassettes, upstream and record', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'fakellm-test-'));
+  const up = await start({ bin, scripts: [text('UPSTREAM_SAYS_HI')] });
+  const rec = path.join(dir, 'rec.jsonl');
+  const proxy = await start({ bin, upstream: up.url, record: rec, cassettes: [tape('boot', 'capital?', 'Paris')] });
+  try {
+    const c = new OpenAI({ baseURL: proxy.baseURL, apiKey: 'k', maxRetries: 0 });
+    const ask2 = async (q) => (await c.chat.completions.create({ model: 'm1', messages: [{ role: 'user', content: q }] })).choices[0].message.content;
+    assert.equal(await ask2('capital?'), 'Paris');
+    assert.equal(await ask2('something new'), 'UPSTREAM_SAYS_HI');
+    const st = await proxy.status();
+    assert.equal(st.upstream.url.startsWith(up.url), true);
+    assert.equal(st.upstream.recorded, 1);
+    assert.equal((await proxy.cassettes.list()).some((c) => c.recording), true);
+    const replay = await start({ bin, strict: true, cassettes: rec, watch: false });
+    try {
+      const c2 = new OpenAI({ baseURL: replay.baseURL, apiKey: 'k', maxRetries: 0 });
+      const r = await c2.chat.completions.create({ model: 'm1', messages: [{ role: 'user', content: 'something new' }] });
+      assert.equal(r.choices[0].message.content, 'UPSTREAM_SAYS_HI');
+    } finally {
+      await replay.stop();
+    }
+  } finally {
+    await proxy.stop();
+    await up.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

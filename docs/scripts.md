@@ -160,9 +160,9 @@
 | `chunk_tokens` | 整数 | 每个 content chunk 含几个 token，默认 1（真实 API 的行为）；0 按 1 处理 |
 | `args_chunk_bytes` | 整数 | 流式工具调用的参数每个分片的字节数，至少 1（0 是 400），覆盖 `--args-chunk-bytes`（默认 16），三个协议都生效。配合 `tokens_per_sec` 可以模拟缓慢的工具参数，如 `args_chunk_bytes: 5` 把 20 字节的参数分成 4 片 |
 | `cut_after_chunks` | 整数 | 发完这么多个 content chunk 后结束 body，**不发 finish chunk 和 `[DONE]`**（Anthropic 没有 `message_delta` / `message_stop`，Responses 没有 `response.completed`），用来测客户端的流中断处理。结束是干净的 chunked 结尾，不是连接中断（要中断用 `reset_after_chunks`） |
-| `reset_after_chunks` | 整数 | 和 `cut_after_chunks` 同一个位置，但连接被**异常中断**（没有结尾的 `0\r\n\r\n`）：连接以 FIN 关闭（不是 RST），客户端看到 `premature close` / `terminated` / `unexpected EOF` / 不完整的 chunked body（通常不是 ECONNRESET），而不是干净的流结束。两者都写时取较小的那个 |
+| `reset_after_chunks` | 整数 | 和 `cut_after_chunks` 同一个位置，但连接被**异常中断**（没有结尾的 `0\r\n\r\n`）：连接设了 `SO_LINGER(0)`，关闭时发 TCP RST，客户端看到 `ECONNRESET` / `connection reset by peer`（curl 的退出码是 56），而不是干净的流结束。两者都写时取较小的那个 |
 
-`reply.reset: true`：同步响应在响应头（200）和一半 body 发出后连接被中断；流式请求在第一个非头部帧处中断（等价于 `reset_after_chunks: 0`）。连接以 FIN 关闭（没有结尾 chunk），不是 TCP RST，客户端在读 body 时报传输错误。限制：响应头已经发出，所以不可能表现成 HTTP 错误状态，也无法在发头之前断开（那种情况用 `hang` 加客户端超时）。
+`reply.reset: true`：同步响应在响应头（200）和一半 body 发出后连接被中断；流式请求在第一个非头部帧处中断（等价于 `reset_after_chunks: 0`）。连接以 RST 中断（没有结尾 chunk），客户端在读 body 时报传输错误。限制：响应头已经发出，所以不可能表现成 HTTP 错误状态，也无法在发头之前断开（那种情况用 `hang` 加客户端超时）。
 
 所有时间都读服务端时钟：冻结时钟时流停在对应位置，`advance` 后放行。详见[控制面的时钟一节](control-plane.md#时钟)。
 
@@ -254,6 +254,19 @@ HTTP 层面（不在流里）：429 加 `{"error":{"type":"usage_limit_reached"}
 `response.incomplete` 的 `content_filter` 原因会被 codex 重试，`max_output_tokens` 是硬错误；对应 `finish_reason: content_filter` 和 `finish_reason: length`。
 
 以上这些除了 `e2e/codex.sh` 的两个正常场景和 `e2e/codex-faults.sh`（真实 codex 0.162.1）验证的 `context_length_exceeded` 外，没有用真实 codex 逐项验证过：`in_stream: true` 时 codex 打印 “Codex ran out of room in the model's context window...” 并退出码 1，不重试（只有 1 个请求）；同一条规则不加 `in_stream`（HTTP 400）时，codex 原样打印错误体 JSON，没有这句友好提示。`response.failed` 的形状有 `tests/responses.rs` 覆盖。
+
+## 与 cassette、上游的关系
+
+剧本规则永远排在 [cassette](cassette.md) 和上游代理前面：一个请求先按注册顺序找规则，**没有规则命中**才在 cassette 里按含义查找，再不行才转发给 `--upstream`，最后是默认兜底（`--strict` 时 400）。后果：
+
+- 规则可以盖住录制：给某个请求写一条 `match` + `reply`，就不会走回放。
+- 想在回放上注入故障，写一条带 `probability` / `every_nth` / `times` 的错误规则，放行的那部分请求自然落到 cassette。`times: 1` 的 429 规则适合测重试：第一次 429，重试时规则已用完，请求落到 cassette 得到录制的回复。
+- 规则命中的请求**不会**被录制，也不会到达上游，即使配置了 `--upstream`。
+- 规则的 `reply.trajectory` / `reply.policy` 把请求交给[轨迹或策略](agent.md)，同样排在 cassette 之前；录好的会话想按步骤推进，用 `fakellm cassette to-trajectory` 转成轨迹。
+- `/v1/embeddings` 只有带 `error` 的规则对它生效，cassette 不处理它。
+- 请求日志的 `source` 区分谁回答了：`script`（规则、轨迹、策略）/ `cassette` / `upstream` / `fallback` / `strict`，`ctl requests list --source cassette` 可以过滤。
+- 兜底的 `json_schema` 结构化输出见[README](../README.md#结构化输出)。
+- `PUT /_fakellm/scripts` 只替换规则；`reset` 默认连 cassette 和录制一起清掉（`--keep-scripts` 保留规则，也保留 cassette）。
 
 ## 示例一：最简单的文本
 

@@ -12,12 +12,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent::trajectory::{Trajectory, TrajectoryFormat};
+use crate::cassette::format::{Cassette, CassetteFormat};
 use crate::clock::{self, Clock};
 use crate::ir::{Outcome, Protocol, Source};
 use crate::openai::responses_store::ResponseStore;
 use crate::policy::{Policies, PolicySpec};
 use crate::reqlog::{RequestFilter, RequestLog, RequestRecord, StatusFilter};
 use crate::script::{Engine, Rule, ScriptFormat};
+use crate::snapshot::Snapshots;
+use crate::upstream::Upstream;
 use crate::{Config, Response, json_response};
 
 pub const PREFIX: &str = "/_fakellm";
@@ -32,6 +35,13 @@ pub struct Control {
     pub(crate) engine: Engine,
     /// Stored Responses API objects, see `openai::responses_store`.
     pub(crate) responses: ResponseStore,
+    /// Named snapshots of the state above, see `crate::snapshot`.
+    pub(crate) snapshots: Snapshots,
+    /// Where requests that nothing else answers go, when `Config::upstream` is set.
+    pub(crate) upstream: Option<Upstream>,
+    /// Serializes everything that replaces or restores registries: mutating control-plane routes (except the snapshot
+    /// ones, whose methods take it themselves), hot reload and snapshot restore. See docs/m4-spec.md section 9.
+    admin: tokio::sync::Mutex<()>,
     /// Mixed into response ids and `x-request-id` so that identical requests (retries, parallel
     /// agents) get distinct ids, while a fresh or reset server repeats the same sequence.
     counter: AtomicU64,
@@ -52,6 +62,9 @@ pub struct ResetOptions {
     pub scripts: bool,
     /// Forget stored Responses API objects.
     pub responses: bool,
+    /// Also delete all snapshots. Off by default, so "take a baseline snapshot, reset or restore before each
+    /// test" works.
+    pub snapshots: bool,
 }
 
 impl Default for ResetOptions {
@@ -61,6 +74,7 @@ impl Default for ResetOptions {
             requests: true,
             scripts: true,
             responses: true,
+            snapshots: false,
         }
     }
 }
@@ -69,12 +83,14 @@ impl Default for ResetOptions {
 pub enum ControlError {
     BadRequest(String),
     NotFound(String),
+    /// 409: the name is taken (snapshots).
+    Conflict(String),
 }
 
 impl fmt::Display for ControlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadRequest(m) | Self::NotFound(m) => f.write_str(m),
+            Self::BadRequest(m) | Self::NotFound(m) | Self::Conflict(m) => f.write_str(m),
         }
     }
 }
@@ -89,6 +105,12 @@ impl From<crate::clock::OutOfRange> for ControlError {
 
 impl From<crate::agent::trajectory::TrajectoryError> for ControlError {
     fn from(e: crate::agent::trajectory::TrajectoryError) -> Self {
+        Self::BadRequest(e.to_string())
+    }
+}
+
+impl From<crate::cassette::CassetteError> for ControlError {
+    fn from(e: crate::cassette::CassetteError) -> Self {
         Self::BadRequest(e.to_string())
     }
 }
@@ -114,6 +136,29 @@ impl Control {
         if !config.trajectories.is_empty() {
             engine.trajectories.replace(config.trajectories.clone())?;
         }
+        if !config.cassettes.is_empty() {
+            engine.cassettes.replace(config.cassettes.clone())?;
+        }
+        let upstream = match &config.upstream {
+            Some(base) => {
+                engine.cassettes.start_recording(Some(base.to_string()));
+                if config.api_key.is_some() && config.upstream_api_key.is_none() {
+                    tracing::warn!(
+                        target: "fakellm::upstream",
+                        "--api-key is set without --upstream-api-key: fakellm's own key is not forwarded, so relayed requests reach {base} without credentials"
+                    );
+                }
+                Some(
+                    Upstream::new(base, config.upstream_api_key.clone(), config.record.as_deref())
+                        .map_err(ControlError::BadRequest)?
+                        .with_local_key(config.api_key.clone())
+                        .with_record_errors(config.record_errors)
+                        .with_header_timeout_secs(config.upstream_timeout_secs),
+                )
+            }
+            None if config.record.is_some() => return Err(ControlError::BadRequest("`record` needs `upstream`".into())),
+            None => None,
+        };
         let log = RequestLog::new(config.request_log, config.request_log_capacity);
         log.set_redact_auth(config.redact_auth);
         Ok(Self {
@@ -121,10 +166,19 @@ impl Control {
             log,
             engine,
             responses: ResponseStore::default(),
+            snapshots: Snapshots::default(),
+            upstream,
+            admin: tokio::sync::Mutex::new(()),
             counter: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             release: tokio::sync::Notify::new(),
         })
+    }
+
+    /// The admin lock. Hold it for the whole of a registry replacement or restore (parse and prepare first, commit
+    /// last) so that PUTs, hot reloads and snapshot restores never interleave. Not reentrant.
+    pub(crate) async fn exclusive(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.admin.lock().await
     }
 
     /// Clears scripts, the request log and the clock.
@@ -137,6 +191,10 @@ impl Control {
             self.engine.scripts.clear();
             self.engine.trajectories.clear();
             self.engine.policies.clear();
+            self.engine.cassettes.clear_all();
+        }
+        if opts.snapshots {
+            self.snapshots.clear();
         }
         if opts.clock {
             self.clock.reset();
@@ -164,6 +222,13 @@ impl Control {
             "scripts": { "count": self.engine.scripts.len() },
             "trajectories": { "count": self.engine.trajectories.len() },
             "policies": { "count": self.engine.policies.len() },
+            "cassettes": { "count": self.engine.cassettes.len() },
+            "snapshots": { "count": self.snapshots.len() },
+            "upstream": self.upstream.as_ref().map(|u| json!({
+                "url": u.display_url(),
+                "record": u.recorder().map(|r| r.path().display().to_string()),
+                "recorded": self.engine.cassettes.recording().exchanges.len(),
+            })),
             "responses": { "count": self.responses.len() },
             "strict": self.engine.strict,
             "request_log": log_config_json(&self.log),
@@ -214,6 +279,16 @@ impl Control {
         self.generation.load(Ordering::Relaxed)
     }
 
+    /// The id counter's current value, for snapshots.
+    pub(crate) fn counter_value(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
+
+    /// Puts the id counter back to `value`, for snapshots.
+    pub(crate) fn set_counter(&self, value: u64) {
+        self.counter.store(value, Ordering::Relaxed);
+    }
+
     /// The next value of the per-server id counter, starting at 0.
     pub(crate) fn next_salt(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::Relaxed)
@@ -233,6 +308,24 @@ impl Control {
 
     pub fn policies(&self) -> &Policies {
         &self.engine.policies
+    }
+
+    pub fn cassettes(&self) -> &crate::cassette::Cassettes {
+        &self.engine.cassettes
+    }
+
+    /// What `GET /_fakellm/snapshots` returns.
+    pub fn snapshots_json(&self) -> Value {
+        json!({ "snapshots": self.snapshots.list() })
+    }
+
+    /// Deletes a snapshot; `NotFound` when there is none by that name.
+    pub fn delete_snapshot(&self, name: &str) -> Result<(), ControlError> {
+        if self.snapshots.delete(name) {
+            Ok(())
+        } else {
+            Err(ControlError::NotFound(format!("no snapshot named {name:?}")))
+        }
     }
 
     /// Logged requests matching `filter`, oldest first, and the match count before `limit`.
@@ -259,7 +352,7 @@ impl Control {
     /// Answers a request under [`PREFIX`]. Routes (see docs/design.md):
     ///
     /// - `GET  /_fakellm`                      status: version, clock, scripts count, log config
-    /// - `POST /_fakellm/reset?clock=&requests=&scripts=`   booleans, all default true
+    /// - `POST /_fakellm/reset?clock=&requests=&scripts=&responses=&snapshots=`   booleans, all default true except `snapshots`
     /// - `GET  /_fakellm/scripts`              `{"rules": [RuleInfo...]}`
     /// - `PUT  /_fakellm/scripts[?keep_hits=true]`  replace; body is a JSON array / `{"rules":[...]}`,
     ///   or YAML when `Content-Type` is `application/yaml` or `text/yaml`
@@ -271,6 +364,14 @@ impl Control {
     /// - `POST /_fakellm/trajectories`         add, a same-named trajectory is replaced in place
     /// - `DELETE /_fakellm/trajectories`       clear
     /// - `GET  /_fakellm/trajectories/{name}[?format=jsonl]`, `DELETE /_fakellm/trajectories/{name}`
+    /// - `GET  /_fakellm/cassettes`            `{"cassettes": [CassetteInfo...]}` (the recording last, when it exists)
+    /// - `PUT|POST /_fakellm/cassettes`        replace / add; body is a cassette, an array, `{"cassettes":[...]}` or JSONL
+    /// - `DELETE /_fakellm/cassettes`          clear the registered cassettes (not the recording)
+    /// - `GET  /_fakellm/cassettes/{name}[?format=jsonl]`, `DELETE /_fakellm/cassettes/{name}`; the name `recording`
+    ///   is the in-memory recording
+    /// - `POST /_fakellm/snapshots`            `{"name"?}` take a snapshot (201; 409 when the name is taken)
+    /// - `GET  /_fakellm/snapshots[/{name}]`, `DELETE /_fakellm/snapshots[/{name}]`,
+    ///   `POST /_fakellm/snapshots/{name}/restore`
     /// - `GET  /_fakellm/policies`             `{"policies": [PolicyInfo...]}`
     /// - `PUT|POST /_fakellm/policies`         body is `{name, source, runtime?}`, an array of them or
     ///   `{"policies":[...]}` (JSON or YAML); every module is dry-run loaded first, a load error is a 400
@@ -301,26 +402,32 @@ impl Control {
         let query: Query = form_urlencoded::parse(parts.uri.query().unwrap_or("").as_bytes())
             .into_owned()
             .collect();
-        let format = script_format(&parts.headers);
-        let tformat = trajectory_format(&parts.headers);
-        self.route(&parts.method, parts.uri.path(), &query, &body, format, tformat)
+        let formats = Formats {
+            script: script_format(&parts.headers),
+            trajectory: trajectory_format(&parts.headers),
+            cassette: cassette_format(&parts.headers),
+        };
+        self.route(&parts.method, parts.uri.path(), &query, &body, formats)
             .await
             .unwrap_or_else(Response::from)
     }
 
-    async fn route(
-        &self,
-        method: &http::Method,
-        path: &str,
-        q: &Query,
-        body: &[u8],
-        format: ScriptFormat,
-        tformat: TrajectoryFormat,
-    ) -> Result<Response, ControlError> {
+    async fn route(&self, method: &http::Method, path: &str, q: &Query, body: &[u8], formats: Formats) -> Result<Response, ControlError> {
+        let Formats {
+            script: format,
+            trajectory: tformat,
+            cassette: cformat,
+        } = formats;
         use http::Method as M;
         let rest = path.strip_prefix(PREFIX).unwrap_or("").trim_end_matches('/');
         let segs: Vec<&str> = rest.split('/').skip(1).collect();
         let not_allowed = || Ok(error(405, "MethodNotAllowed", format!("{method} is not allowed on {path}")));
+        // Snapshot and restore take the lock inside `snapshot()` / `restore()`, which library users call directly too.
+        let _admin = if *method != M::GET && segs.first() != Some(&"snapshots") {
+            Some(self.exclusive().await)
+        } else {
+            None
+        };
         match segs.as_slice() {
             [""] | [] => match *method {
                 M::GET => Ok(reply(200, self.status())),
@@ -334,6 +441,7 @@ impl Control {
                         requests: query_flag(q, "requests", defaults.requests)?,
                         scripts: query_flag(q, "scripts", defaults.scripts)?,
                         responses: query_flag(q, "responses", defaults.responses)?,
+                        snapshots: query_flag(q, "snapshots", defaults.snapshots)?,
                     });
                     Ok(reply(200, json!({ "reset": true })))
                 }
@@ -400,6 +508,85 @@ impl Control {
                     M::DELETE => Err(ControlError::NotFound(format!("no trajectory named {name:?}"))),
                     _ => not_allowed(),
                 }
+            }
+            ["cassettes"] => match *method {
+                M::GET => Ok(reply(200, json!({ "cassettes": self.engine.cassettes.list() }))),
+                M::PUT | M::POST => {
+                    let text = std::str::from_utf8(body).map_err(|_| ControlError::BadRequest("body must be UTF-8".into()))?;
+                    let items = Cassette::parse_many(text, cformat)?;
+                    let count = items.len();
+                    if *method == M::PUT {
+                        self.engine.cassettes.replace(items)?;
+                    } else {
+                        self.engine.cassettes.upsert(items)?;
+                    }
+                    Ok(reply(200, json!({ "added": count, "count": self.engine.cassettes.len() })))
+                }
+                M::DELETE => {
+                    self.engine.cassettes.clear();
+                    Ok(reply(200, json!({ "cleared": true })))
+                }
+                _ => not_allowed(),
+            },
+            ["cassettes", name] => {
+                let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
+                match *method {
+                    M::GET => {
+                        let c = self
+                            .engine
+                            .cassettes
+                            .get(&name)
+                            .ok_or_else(|| ControlError::NotFound(format!("no cassette named {name:?}")))?;
+                        match q.iter().find(|(k, _)| k == "format").map(|(_, v)| v.as_str()) {
+                            None | Some("json") => Ok(reply(200, c.to_json())),
+                            Some("jsonl") => Ok(text_response(200, "application/x-ndjson", c.to_jsonl())),
+                            Some(_) => Err(ControlError::BadRequest("format must be json or jsonl".into())),
+                        }
+                    }
+                    M::DELETE if self.engine.cassettes.remove(&name) => Ok(reply(200, json!({ "deleted": true }))),
+                    M::DELETE => Err(ControlError::NotFound(format!("no cassette named {name:?}"))),
+                    _ => not_allowed(),
+                }
+            }
+            ["snapshots"] => match *method {
+                M::GET => Ok(reply(200, self.snapshots_json())),
+                M::POST => {
+                    let b: SnapshotBody = parse_body(body)?;
+                    let name = b.name.or_else(|| q.iter().find(|(k, _)| k == "name").map(|(_, v)| v.clone()));
+                    Ok(reply(
+                        201,
+                        serde_json::to_value(self.snapshot(name.as_deref()).await?).unwrap_or(Value::Null),
+                    ))
+                }
+                M::DELETE => {
+                    self.snapshots.clear();
+                    Ok(reply(200, json!({ "cleared": true })))
+                }
+                _ => not_allowed(),
+            },
+            ["snapshots", name] => {
+                let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
+                match *method {
+                    M::GET => {
+                        let info = self
+                            .snapshots
+                            .info(&name)
+                            .ok_or_else(|| ControlError::NotFound(format!("no snapshot named {name:?}")))?;
+                        Ok(reply(200, serde_json::to_value(info).unwrap_or(Value::Null)))
+                    }
+                    M::DELETE => {
+                        self.delete_snapshot(&name)?;
+                        Ok(reply(200, json!({ "deleted": true })))
+                    }
+                    _ => not_allowed(),
+                }
+            }
+            ["snapshots", name, "restore"] => {
+                if *method != M::POST {
+                    return not_allowed();
+                }
+                let name = percent_encoding::percent_decode_str(name).decode_utf8_lossy();
+                Ok(reply(200, serde_json::to_value(self.restore(&name).await?).unwrap_or(Value::Null)))
             }
             ["policies"] => match *method {
                 M::GET => Ok(reply(200, json!({ "policies": self.engine.policies.list() }))),
@@ -495,6 +682,14 @@ impl Control {
 
 type Query = Vec<(String, String)>;
 
+/// How the request body is to be read, by `Content-Type`, for each kind of document the control plane accepts.
+#[derive(Clone, Copy)]
+struct Formats {
+    script: ScriptFormat,
+    trajectory: TrajectoryFormat,
+    cassette: CassetteFormat,
+}
+
 fn script_format(headers: &http::HeaderMap) -> ScriptFormat {
     let ct = headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let essence = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
@@ -512,6 +707,15 @@ fn trajectory_format(headers: &http::HeaderMap) -> TrajectoryFormat {
         "application/x-ndjson" | "application/jsonl" | "application/json-lines" | "text/jsonl" => TrajectoryFormat::Jsonl,
         "application/yaml" | "text/yaml" | "application/x-yaml" => TrajectoryFormat::Yaml,
         _ => TrajectoryFormat::Auto,
+    }
+}
+
+/// Same content types as for trajectories.
+fn cassette_format(headers: &http::HeaderMap) -> CassetteFormat {
+    match trajectory_format(headers) {
+        TrajectoryFormat::Jsonl => CassetteFormat::Jsonl,
+        TrajectoryFormat::Yaml => CassetteFormat::Yaml,
+        _ => CassetteFormat::Auto,
     }
 }
 
@@ -537,6 +741,7 @@ impl From<ControlError> for Response {
         match e {
             ControlError::BadRequest(m) => error(400, "BadRequest", m),
             ControlError::NotFound(m) => error(404, "NotFound", m),
+            ControlError::Conflict(m) => error(409, "Conflict", m),
         }
     }
 }
@@ -577,6 +782,12 @@ struct AdvanceBody {
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SnapshotBody {
+    name: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LogConfigBody {
     enabled: Option<bool>,
     capacity: Option<usize>,
@@ -592,8 +803,8 @@ fn request_filter(q: &[(String, String)]) -> Result<RequestFilter, ControlError>
             "stream" => f.stream = Some(parse_flag(k, v)?),
             "status" => f.status = Some(v.parse::<StatusFilter>().map_err(ControlError::BadRequest)?),
             "source" => {
-                if !matches!(v.as_str(), "script" | "fallback" | "strict" | "rejected") {
-                    return Err(bad("expected script, fallback, strict or rejected"));
+                if !matches!(v.as_str(), "script" | "cassette" | "upstream" | "fallback" | "strict" | "rejected") {
+                    return Err(bad("expected script, cassette, upstream, fallback, strict or rejected"));
                 }
                 f.source = Some(v.clone());
             }

@@ -1,0 +1,24 @@
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"role":"assistant","content":"","refusal":null},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"reasoning_content":"think"},"finish_reason":null}],"usage":null}
+
+: keep-alive comment
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"reasoning_content":"ing"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"content":"Hello, w"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"content":"örld"},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":null}
+
+data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1770933892,"model":"gpt-4.1-nano","choices":[],"usage":{"prompt_tokens":16,"completion_tokens":30,"total_tokens":46,"prompt_tokens_details":{"cached_tokens":8,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":4,"audio_tokens":0}}}
+
+data: [DONE]
+

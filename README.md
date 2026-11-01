@@ -2,7 +2,7 @@
 
 一个专门给测试用的 LLM API 服务：全内存、不跑模型，启动只要几毫秒。
 只复刻协议（请求和响应的格式、SSE 分帧、错误体、状态码），回复来自你写的剧本，或者一个确定性的默认回复。
-和 fakes3 之于 S3 是同一个思路。目前实现了三种协议：OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages（加模型列表、`count_tokens` 和 Embeddings），三者共用同一套剧本、请求日志和虚拟时钟，还能扮演 agent 循环里的模型（[fake agent](#fake-agent)），用 Rust 编写。
+和 fakes3 之于 S3 是同一个思路。目前实现了三种协议：OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages（加模型列表、`count_tokens` 和 Embeddings），三者共用同一套剧本、请求日志和虚拟时钟，还能扮演 agent 循环里的模型（[fake agent](#fake-agent)），也能把真实上游的往返录下来按含义回放（[cassette](#cassette上游代理与导入)），或导入 Hugging Face 数据集当夹具，用 Rust 编写。
 
 ## 为什么
 
@@ -215,8 +215,8 @@ JSON：
 兜底规则：
 
 - 遵守 `max_tokens` / `max_completion_tokens`（截断，`finish_reason` 为 `length`；Anthropic 是 `stop_reason: max_tokens`，Responses 是 `max_output_tokens`，状态 `incomplete`，真实 API 要求它至少为 16，更小是 400）。
-- `response_format`（Responses 里是 `text.format`）是 `json_object` 或 `json_schema` 时返回 `{"message": "<lorem>"}`。
-- `tool_choice` 强制调用工具（`required` 或指定名字，Anthropic 的 `any` 和 `tool`）时返回一个参数为 `{}` 的工具调用；其他情况**永远不会**主动调用工具，所以 agent 循环到兜底就会结束，而不是空转。
+- `response_format`（Responses 里是 `text.format`）是 `json_object` 时返回 `{"message": "<lorem>"}`；是带 schema 的 `json_schema` 时返回一个符合 schema 的确定性实例，强制调用的工具有 `parameters` 时参数也按它生成，见下面的[结构化输出](#结构化输出)；没有 schema 的 `json_schema` 仍是 `{"message": ...}`。
+- `tool_choice` 强制调用工具（`required` 或指定名字，Anthropic 的 `any` 和 `tool`）时返回一个工具调用，工具没有 `parameters` 时参数为 `{}`；其他情况**永远不会**主动调用工具，所以 agent 循环到兜底就会结束，而不是空转。
 
 `--strict`（或 `FAKELLM_STRICT=true`，环境变量也认 `1/0`、`yes/no`、`on/off`）把兜底换成错误：没有规则命中的请求得到 400：
 
@@ -225,6 +225,21 @@ JSON：
 ```
 
 用 400 而不是 5xx，是为了让 SDK 不重试、测试立刻失败。Anthropic 路由的 strict 错误是同样的状态码，错误体是 Anthropic 的格式（`type: fakellm_error`，没有 `code`）。
+
+### 结构化输出
+
+请求带 `response_format: json_schema`（Responses 里是 `text.format`）且给了 schema 时，兜底回复是**符合 schema 的确定性实例**（同一个 schema 和请求种子得到同一个值，所以测试可重复）；被 `tool_choice` 强制调用的工具有 `parameters` 时，参数同样按它生成。流式和同步、三种协议都一样。这是兜底行为：剧本规则或 cassette 命中时回复由它们决定。
+
+```bash
+curl $E/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "gpt-4o", "messages": [{"role": "user", "content": "extract"}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "p", "schema": {
+    "type": "object", "required": ["name", "age"],
+    "properties": {"name": {"type": "string"}, "age": {"type": "integer", "minimum": 18, "maximum": 65}}}}}}'
+# choices[0].message.content 是 {"name":"culpa eu inc","age":29} 这样的 JSON 字符串
+```
+
+支持 `const`、`enum`、`examples` / `default`、`$ref`（文档内）、`oneOf` / `anyOf`（取第一支）、`allOf`（合并，数值、长度、个数的界取更严的一边，`enum` 取交集）、各类型的界和 `format`、一小部分 `pattern`、`items` / `prefixItems`、`required`、简单形式的 `not`。`if/then/else`、`patternProperties`、`propertyNames`、`unevaluated*`、`dependentSchemas` 被忽略，严格的校验器可能因此拒绝生成的值。`max_tokens` 太小时按 `length` 截断，得到不完整的 JSON，和真实 API 一致。
 
 ## 虚拟时钟与流式节奏
 
@@ -422,6 +437,29 @@ fakellm --trajectory fix-bug.yaml --policy reader.mjs --scripts rules.yaml
 
 端点 `/_fakellm/trajectories` 和 `/_fakellm/policies`（见[控制面](docs/control-plane.md)）；`sdk/js`、`bindings/node`、Go helper 都有对应的 `trajectories` / `policies` 客户端，`fakellm ctl` 暂时没有。格式、步骤选择、偏离处理、工具映射、策略协议、运行时、超时和三个完整例子（包括 SWE-agent 风格的轨迹）见 [docs/agent.md](docs/agent.md)；`e2e/codex-trajectory.sh`、`claude-trajectory.sh`、`opencode-policy.sh` 用真实的 codex、Claude Code、opencode 跑通了它。
 
+## Cassette、上游代理与导入
+
+**cassette** 是录好的一组请求/回复交换（exchange），存成 IR 而不是原始字节，所以按请求的**含义**回放：`temperature` 之类的采样参数、工具调用 id、系统提示里的日期和时间戳、UUID 都不影响匹配；用 Chat Completions 录的，Responses 和 Anthropic 请求也能命中，回复按进来的协议渲染。
+
+```bash
+# 录制：没有剧本和 cassette 命中的请求转发给真实上游（原协议），同时写进 chats.jsonl
+fakellm --upstream https://api.openai.com --upstream-api-key $OPENAI_API_KEY --record chats.jsonl
+# 回放（不需要网络和密钥）；--strict 让没录到的请求立刻 400
+fakellm --cassette chats.jsonl --strict
+# 从 Hugging Face 数据集导入对话或 agent 轨迹
+fakellm import hf allenai/WildChat-1M --limit 50 -o wildchat.jsonl
+# 把录好的 agent 会话转成轨迹
+fakellm cassette to-trajectory chats.jsonl -o agent.jsonl --with-expect
+```
+
+查找顺序：**剧本规则 > cassette > 上游 > 兜底（或 `--strict` 的 400）**，所以可以在回放上叠加故障注入，也可以只替换其中几个请求。上游可以是 OpenAI、Anthropic，或者 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 这类网关，用它就能录下真实 Claude Code、codex 的会话。`/v1/embeddings` 不走 cassette。
+录制和回放的细节：匹配规则与归一化、`once` / `fuzzy`、凭证转发、脱敏、哪些响应不录、回环保护，见 [docs/cassette.md](docs/cassette.md)；导入的格式、选项和数据集许可证见 [docs/import.md](docs/import.md)。
+
+- **控制面**：`/_fakellm/cassettes`、`/_fakellm/snapshots`，状态接口多了 `cassettes`、`snapshots`、`upstream` 三项，见 [docs/control-plane.md](docs/control-plane.md)；`fakellm ctl cassettes` / `ctl snapshot`；`sdk/js`、`bindings/node`、Go helper 的 `cassettes` / `snapshots`。
+- **快照**：`POST /_fakellm/snapshots` 保存剧本（含命中计数）、轨迹进度、策略、cassette（含已用标记和录制）、保存的 Responses 对象和时钟，`restore` 原样放回，快照不会被消耗。适合在昂贵的准备（加载大 cassette、推进到某一步）之后，每个测试前还原。`reset` 默认保留快照。
+- **热加载**：`--scripts`、`--trajectory`、`--policy`、`--cassette` 的文件每 500 ms 检查一次，变了就重新读取并替换（命中计数重置，策略重启）；读不了或内容无效时保留旧的并打警告。`--no-watch` 关闭。
+- **结构化输出**：兜底回复按 `json_schema` 生成，见[默认兜底](#结构化输出)。
+
 ## Responses 的状态与 `previous_response_id`
 
 `POST /v1/responses` 默认把每个响应保存在内存里（请求带 `store: false` 则不存），供三件事用：
@@ -594,11 +632,13 @@ test('agent 调用工具', async () => {
 
 | 名字 | 说明 |
 |---|---|
-| `start(options?)` | 启动二进制，返回 `FakeLLM`（选项 `bin`、`host`、`port`、`apiKey`、`models`、`strict`、`scripts`、`trajectories`、`policies`、`policyRuntime`、`pathPrefix`、`ttft`、`tokensPerSec`、`args`、`env`、`readyTimeoutMs`） |
+| `start(options?)` | 启动二进制，返回 `FakeLLM`（选项 `bin`、`host`、`port`、`apiKey`、`models`、`strict`、`scripts`、`trajectories`、`policies`、`policyRuntime`、`cassettes`、`upstream`、`upstreamApiKey`、`record`、`watch`、`pathPrefix`、`ttft`、`tokensPerSec`、`args`、`env`、`readyTimeoutMs`） |
 | `connect(url)` | 连接已经在运行的服务，不管理进程 |
 | `llm.url` / `baseURL` / `anthropicBaseURL` | `http://host:port` / 加了 `/v1`（OpenAI SDK） / 同 `url`（Anthropic SDK 自己加 `/v1`） |
 | `llm.scripts` | `put`（替换）、`add`、`list`（带 `hits`、`exhausted`）、`clear` |
 | `llm.trajectories` / `llm.policies` | 各有 `put`（替换）、`add`、`list`、`clear`，见 [Fake agent](#fake-agent) |
+| `llm.cassettes` | `put`（替换）、`add`、`list`、`clear`：录下来的交换，任何协议都能回放 |
+| `llm.snapshots` | `create(name?)`、`list`、`restore(name)`、`delete(name?)`：保存和还原整套状态；`reset` 默认不删快照 |
 | `llm.requests` | `list`、`count`、`clear`、`config`、`dropped`；过滤字段与请求日志的查询参数同名 |
 | `llm.clock` | `now`、`state`、`freeze`、`unfreeze`、`set`、`advance`（`'500ms'`、`'1h30m'` 或毫秒数）、`reset` |
 | `llm.responses` | `list`、`clear` |
@@ -627,7 +667,7 @@ server.reset();
 await server.stop();                    // 关闭监听和所有未结束的连接（包括挂起的请求）
 ```
 
-`start(options?)` 的选项：`host`、`port`、`apiKey`、`models`、`strict`、`scripts`（规则数组，或 JSON / YAML 字符串）、`trajectories`、`policies`（数组，或 JSON / YAML / JSONL 字符串）、`policyRuntime`、`pathPrefix`、`ttft`、`tokensPerSec`、`fallbackTokens`、`chunkTokens`、`argsChunkBytes`、`requestLog`、`requestLogCapacity`、`redactAuth`。服务器对象的属性有 `endpoint`、`baseUrl`、`anthropicBaseUrl`、`host`、`port`，以及 `scripts`、`trajectories`、`policies`、`requests`、`responses`、`clock`、`reset()`、`status()`、`wire(target, format?)`、`stop()`。类型声明由 `napi build` 生成（`index.d.ts`）。没有调用 `stop()` 的服务器对象被垃圾回收时也会停止，所以在用到它的地址期间要保留引用。
+`start(options?)` 的选项：`host`、`port`、`apiKey`、`models`、`strict`、`scripts`（规则数组，或 JSON / YAML 字符串）、`trajectories`、`policies`（数组，或 JSON / YAML / JSONL 字符串）、`policyRuntime`、`cassettes`（数组，或 JSON / YAML / JSONL 字符串）、`upstream`、`upstreamApiKey`、`record`（文件路径）、`watch`（`{ scripts?, trajectories?, policies?, cassettes? }` 文件路径，变化时重新加载；默认什么都不监视）、`pathPrefix`、`ttft`、`tokensPerSec`、`fallbackTokens`、`chunkTokens`、`argsChunkBytes`、`requestLog`、`requestLogCapacity`、`redactAuth`。服务器对象的属性有 `endpoint`、`baseUrl`、`anthropicBaseUrl`、`host`、`port`，以及 `scripts`、`trajectories`、`cassettes`、`snapshots`、`policies`、`requests`、`responses`、`clock`、`reset()`、`status()`、`wire(target, format?)`、`stop()`。类型声明由 `napi build` 生成（`index.d.ts`）。没有调用 `stop()` 的服务器对象被垃圾回收时也会停止，所以在用到它的地址期间要保留引用。
 
 - **Bun**：同一个 `.node` 在 Bun 下可以加载，`bun test __test__/openai.test.mjs` 在本机通过（20 通过，1 跳过：那一条需要 `node --expose-gc`）；CI 的 `napi-bun` 任务会跑它。Bun 的 napi 实现和 Node 不是同一个，除这个测试覆盖的内容外没有别的保证。
 - **平台**：构建目标是 Linux 的 x64 / arm64，glibc 和 musl；macOS 和 Windows 没有构建，也没有验证过。
@@ -684,16 +724,23 @@ func TestAgent(t *testing.T) {
 | `--policy` | `FAKELLM_POLICIES` | 无 | 启动时加载的策略脚本（ES 模块，导出默认函数 `decide`），可重复；策略名是文件名去掉扩展名；加载失败则启动失败 |
 | `--policy-runtime` | `FAKELLM_POLICY_RUNTIME` | 自动 | 策略脚本的运行时：`tjs`、`node`、`bun` 或可执行文件路径；默认按 `tjs`、`node`、`bun` 的顺序在 `PATH` 里找 |
 | `--policy-timeout-ms` | `FAKELLM_POLICY_TIMEOUT_MS` | `5000` | 一个策略做一次决定的时限（真实时间，不跟虚拟时钟）；超时杀掉进程并返回 500 |
+| `--cassette` | `FAKELLM_CASSETTES` | 无 | 启动时加载的 cassette 文件，可重复；JSON、YAML 或 JSONL。没有剧本规则命中的请求按含义在里面查找，见 [docs/cassette.md](docs/cassette.md)。不合法则启动失败 |
+| `--upstream` | `FAKELLM_UPSTREAM` | 无 | 没有剧本和 cassette 命中的请求转发到这个 OpenAI 兼容或 Anthropic 服务（`http://` 或 `https://`，不能带用户名密码），并记录回答 |
+| `--upstream-api-key` | `FAKELLM_UPSTREAM_API_KEY` | 无 | 发给上游的密钥，替代客户端自己的凭证；不设则客户端的 `authorization` / `x-api-key` 原样转发 |
+| `--record` | `FAKELLM_RECORD` | 无 | 把从上游录到的 exchange 追加写进这个 JSONL 文件（可以跨多次运行继续录） |
+| `--record-errors` | 无 | 关 | 也录上游的 401、403、408、409、429 和 5xx（默认转发但不录，免得盖住随后重试成功的那次） |
+| `--upstream-timeout` | `FAKELLM_UPSTREAM_TIMEOUT` | `600` | 上游发响应头最多等多少秒，`0` 为不限；超时是 502 |
+| `--no-watch` | `FAKELLM_NO_WATCH` | 关 | 不监视 `--scripts`、`--trajectory`、`--policy`、`--cassette` 的文件变化 |
 | `--path-prefix` | `FAKELLM_PATH_PREFIX` | 无 | API 同时挂在这个前缀下，如 `/anthropic` |
 | `--no-request-log` | `FAKELLM_NO_REQUEST_LOG` | 关 | 不记录请求 |
 | `--request-log-capacity` | `FAKELLM_REQUEST_LOG_CAPACITY` | `10000` | 日志保留的请求数，满了丢最旧的 |
 | `--redact-auth` | `FAKELLM_REDACT_AUTH` | 关 | 请求日志里把 `authorization`、`proxy-authorization`、`x-api-key` 的值记成 `<redacted>`；不设则原样保存 |
 
-Docker 镜像把 `FAKELLM_HOST` 设为 `0.0.0.0`、`FAKELLM_PORT` 设为 `4010`（见 [Docker 镜像](#docker-镜像)）。布尔参数可以只写 `--strict` 不带值。日志级别用 `RUST_LOG`（默认 `warn`）。`fakellm ctl` 和 `fakellm wire` 的 `--endpoint` 读 `FAKELLM_ENDPOINT`（默认 `http://127.0.0.1:4010`）。`--scripts` 文件读不出来时报错信息里有文件名。
+Docker 镜像把 `FAKELLM_HOST` 设为 `0.0.0.0`、`FAKELLM_PORT` 设为 `4010`（见 [Docker 镜像](#docker-镜像)）。布尔参数可以只写 `--strict` 不带值。日志级别用 `RUST_LOG`（默认 `warn`）。子命令：`fakellm ctl`（控制面）、`fakellm wire`（接线）、`fakellm import`（导入数据集）、`fakellm cassette`（cassette 的离线工具），后两个不需要服务在运行。`fakellm ctl` 和 `fakellm wire` 的 `--endpoint` 读 `FAKELLM_ENDPOINT`（默认 `http://127.0.0.1:4010`）。`--scripts` 文件读不出来时报错信息里有文件名。
 
 ## 控制面
 
-API 端口上 `/_fakellm/*` 是测试控制面：重置状态、注册剧本、轨迹和策略脚本、移动时钟、查询请求日志、查看和清空保存的 Responses 对象。命令行 `fakellm ctl` 和 Rust 的 `Server` 方法做同样的事。
+API 端口上 `/_fakellm/*` 是测试控制面：重置状态、注册剧本、轨迹、策略脚本和 cassette、保存和还原快照、移动时钟、查询请求日志、查看和清空保存的 Responses 对象。命令行 `fakellm ctl` 和 Rust 的 `Server` 方法做同样的事。
 **控制面没有认证**，只监听 `127.0.0.1` 是唯一的防护（Docker 镜像里监听 `0.0.0.0`，别把端口发布到公网）。其中 `/_fakellm/policies` 会运行代码（见 [Fake agent](#fake-agent)）。路由、请求和响应示例见 [docs/control-plane.md](docs/control-plane.md)，规则格式见 [docs/scripts.md](docs/scripts.md)。
 
 ```bash
@@ -718,7 +765,7 @@ fakellm ctl requests list --status 0   # 此刻被 hang 挂住的请求（JSON �
 - 剧本里的 `max_tokens` 只截断 `text`；`reasoning` 和工具调用参数按原样发出。`reasoning` 作为 `reasoning_content` 发送。
 - 工具调用的 `id` 不写就由请求派生；`arguments` 可以是对象（紧凑序列化）或字符串（原样发送，可以故意写成不完整的 JSON）。
 - 流式工具调用的参数每 16 字节一个分片，第一片带 `id`、`type`、`name` 和 `arguments: ""`。
-- `cut_after_chunks` 的断流是**干净地结束 chunked body**（没有 finish chunk，没有 `[DONE]`）；客户端看到的是流提前结束。`reset_after_chunks` / `reset` 中断连接，但是以 FIN 关闭而不是 TCP RST，所以多数客户端报 `terminated` / `premature close` / `unexpected EOF`，而不是 `ECONNRESET`。
+- `cut_after_chunks` 的断流是**干净地结束 chunked body**（没有 finish chunk，没有 `[DONE]`）；客户端看到的是流提前结束。`reset_after_chunks` / `reset` 中断连接：设了 `SO_LINGER(0)`，关闭时发 TCP RST，客户端看到 `ECONNRESET` / `connection reset by peer`（curl 的退出码是 56），而不是干净的 EOF。
 - 不支持：`logprobs`（请求里带了会被接受并记入日志，但响应里永远是 `null`）、`prediction`、音频输入输出、图片输入只会被解析并记录。
 - `/v1/chat/completions` 也可以不带 `/v1` 前缀访问（`/chat/completions`）。
 - 其他入口见[协议与端点](#协议与端点)，同样可以不带 `/v1`。
@@ -759,10 +806,17 @@ fakellm ctl requests list --status 0   # 此刻被 hang 挂住的请求（JSON �
 | M3 | fake agent：轨迹回放、工具映射、txiki.js / Node / Bun 策略脚本，见 [docs/agent.md](docs/agent.md) | 已完成 |
 | M3 | `POST /v1/embeddings`，见 [Embeddings](#embeddings) | 已完成 |
 | M3 | 可配置的路径前缀、`last_user` 忽略 `<system-reminder>`、`last_user_raw`、`stream.args_chunk_bytes` | 已完成 |
-| M4 | cassette 录制回放、Hugging Face 数据集导入 | 未做 |
-| M4 | 按 `json_schema` 生成结构化输出 | 未做 |
+| M4 | cassette 录制回放（`--upstream`、`--record`）、`fakellm import hf`、快照、热加载，见 [docs/cassette.md](docs/cassette.md) | 已完成 |
+| M4 | 按 `json_schema` 生成结构化输出 | 已完成 |
 
-M3 已完成，下一步是 M4。完整的设计思路见 [docs/design.md](docs/design.md)，具体的待办见 [TODO.md](TODO.md)。
+M0 到 M4 的路线图都已完成。接下来：
+
+- **发布**：第一次推 `v*` tag，发布 GHCR 镜像、GitHub release 二进制（`go/` 的 `Download` 依赖它）和 npm 包（`@fakellm/native`、`sdk/js`），之后在真实镜像上验证 testcontainers 片段；发布到 crates.io。
+- **验证**：e2e 进 CI，补 pi 和 paseo；Docker 镜像（alpine）里没有 JS 运行时，策略脚本跑不起来；用真实的 `tjs` 跑一遍策略脚本的测试。
+- **协议**：Responses 的 WebSocket、`background`、`/cancel`、`/input_items`。
+- **消费方缺口**：任意谓词或 turn 范围匹配、函数式回复、自定义端点规则（`docs/consumers.md` 整理的缺口）。
+
+完整的设计思路见 [docs/design.md](docs/design.md)，具体的待办和已知问题见 [TODO.md](TODO.md)。
 
 ## 不做的事
 
@@ -770,4 +824,6 @@ M3 已完成，下一步是 M4。完整的设计思路见 [docs/design.md](docs/
 - 不保证 tokenizer 和任何模型一致，只保证结果确定、前后自洽。
 - 不做多模态生成（图片、音频输出）；输入里的图片只会被解析并记入日志。
 - 不做内容审核、安全策略这类模型行为；`content_filter` 只能在剧本里通过 `finish_reason` 手动指定。
-- 不持久化：重启即清空。
+- 不持久化：服务端状态在内存里，重启即清空。唯一写盘的是你主动给的 `--record` 文件；导入（`fakellm import`）是离线命令，产物是你仓库里的夹具文件。
+- 不分发数据集：`fakellm import` 只转换你自己取的行，许可证由你确认，见 [docs/import.md](docs/import.md#数据集与许可证)。
+- 不做真正的“语义”匹配：cassette 的“含义”指规范化之后的消息和工具相等（`fuzzy` 也只是按末尾消息相近选一个），不是向量相似度，也不会改写回复。

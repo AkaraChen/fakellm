@@ -239,6 +239,11 @@ func (s *Server) register(ctx context.Context, opts Options) error {
 			return err
 		}
 	}
+	if opts.Cassettes != nil {
+		if _, err := s.Cassettes().Put(ctx, opts.Cassettes); err != nil {
+			return err
+		}
+	}
 	if len(opts.Policies) > 0 {
 		if _, err := s.Policies().Put(ctx, opts.Policies...); err != nil {
 			return err

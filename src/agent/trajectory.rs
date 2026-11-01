@@ -453,6 +453,14 @@ pub struct TrajectoryInfo {
     pub last_step: Option<usize>,
 }
 
+/// A trajectory and its counters, as a snapshot keeps them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrajectoryState {
+    pub trajectory: Trajectory,
+    pub hits: u64,
+    pub last_step: Option<usize>,
+}
+
 /// The step chosen for a request.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stepped {
@@ -540,6 +548,30 @@ impl Trajectories {
             .iter()
             .find(|c| c.trajectory.name == name)
             .map(|c| c.trajectory.clone())
+    }
+
+    /// For snapshots: every trajectory with its counters.
+    pub fn export_state(&self) -> Vec<TrajectoryState> {
+        self.inner
+            .lock()
+            .iter()
+            .map(|c| TrajectoryState {
+                trajectory: c.trajectory.clone(),
+                hits: c.hits,
+                last_step: c.last_step,
+            })
+            .collect()
+    }
+
+    /// For snapshots: replaces all trajectories and counters with `state`. Fails without changing anything if one is invalid.
+    pub fn import_state(&self, state: Vec<TrajectoryState>) -> Result<(), TrajectoryError> {
+        let mut compiled = Self::compile(state.iter().map(|s| s.trajectory.clone()).collect())?;
+        for (c, s) in compiled.iter_mut().zip(&state) {
+            c.hits = s.hits;
+            c.last_step = s.last_step;
+        }
+        *self.inner.lock() = compiled;
+        Ok(())
     }
 
     pub fn list(&self) -> Vec<TrajectoryInfo> {

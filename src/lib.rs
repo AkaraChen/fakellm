@@ -24,16 +24,21 @@
 mod agent;
 mod anthropic;
 mod blocking;
+mod cassette;
 mod clock;
 mod control;
 mod fallback;
+pub mod import;
 pub mod ir;
 mod openai;
 mod policy;
 mod reqlog;
 mod script;
+mod snapshot;
 mod sse;
 mod tokenizer;
+mod upstream;
+mod watch;
 pub mod wire;
 
 use std::convert::Infallible;
@@ -55,13 +60,20 @@ pub use agent::trajectory::{
     UnknownTool,
 };
 pub use blocking::BlockingServer;
+pub use cassette::format::{
+    Cassette, CassetteFormat, CassetteOutcome, DEFAULT_IGNORE, Exchange, ExchangeMeta, Normalizer, ToTrajectory, reply_spec,
+};
+pub use cassette::{CassetteError, CassetteInfo, Cassettes, RECORDING, Replay};
 pub use clock::{Clock, OutOfRange, parse_duration};
 pub use control::{Control, ControlError, ResetOptions};
 pub use fallback::FallbackConfig;
 pub use ir::{ApiError, Delivery, FinishReason, Outcome, Reply, Request, Source, Usage};
 pub use policy::{Policies, PolicyError, PolicyInfo, PolicySpec, Runtime};
 pub use reqlog::{DEFAULT_CAPACITY as DEFAULT_REQUEST_LOG_CAPACITY, RequestFilter, RequestLog, RequestRecord, StatusFilter};
-pub use script::{Engine, Match, ReplySpec, Rule, RuleInfo, ScriptError, ScriptFormat, Scripts};
+pub use script::{Engine, Match, ReplySpec, Rule, RuleInfo, ScriptError, ScriptFormat, ScriptState, Scripts};
+pub use snapshot::SnapshotInfo;
+pub use upstream::client::{ClientError, HttpClient};
+pub use watch::WatchConfig;
 
 /// Response body type used throughout: fully buffered JSON, or a streamed SSE body.
 /// Boxed so a body can fail mid-flight (the reset faults): hyper then drops the connection
@@ -133,6 +145,26 @@ pub struct Config {
     pub policy_runtime: Option<Runtime>,
     /// How long a policy may take to decide, in host-clock milliseconds.
     pub policy_timeout_ms: u64,
+    /// Cassettes registered at start (`--cassette FILE`, repeatable); the control plane can replace them.
+    pub cassettes: Vec<Cassette>,
+    /// Relay requests that no script rule and no cassette answers to this server (`--upstream URL`), in the request's
+    /// own protocol, and record what comes back. `http://` or `https://`, optionally with a path (`/v1` is not
+    /// repeated). `http::Uri` stands in for a URL type: the crate has no `url` dependency.
+    pub upstream: Option<http::Uri>,
+    /// Replaces the client's credentials toward the upstream (`authorization: Bearer <key>`, plus `x-api-key` for
+    /// Anthropic requests). `None` passes the client's own headers through.
+    pub upstream_api_key: Option<String>,
+    /// Append every recorded exchange to this file as JSONL (`--record FILE`); needs `upstream`.
+    pub record: Option<std::path::PathBuf>,
+    /// Also record the upstream's 401, 403, 408, 409, 429 and 5xx answers (`--record-errors`); by default they are
+    /// relayed but not recorded, so a retry that succeeded is not shadowed on replay.
+    pub record_errors: bool,
+    /// Seconds the upstream may take to send response headers (`--upstream-timeout`); 0 waits without limit. A
+    /// non-streaming completion sends them only when it is done.
+    pub upstream_timeout_secs: u64,
+    /// Re-read these files when they change; `None` (the default) watches nothing. The binary fills it from the
+    /// startup flags unless `--no-watch`.
+    pub watch: Option<WatchConfig>,
 }
 
 impl Default for Config {
@@ -154,7 +186,35 @@ impl Default for Config {
             policies: Vec::new(),
             policy_runtime: None,
             policy_timeout_ms: policy::DEFAULT_TIMEOUT_MS,
+            cassettes: Vec::new(),
+            upstream: None,
+            upstream_api_key: None,
+            record: None,
+            record_errors: false,
+            upstream_timeout_secs: 600,
+            watch: None,
         }
+    }
+}
+
+/// Whether `url` names the address `addr` this server is bound to: same port, and a host that is that IP, `localhost`
+/// or a loopback address when bound to loopback, or any local-looking host when bound to an unspecified address. Names
+/// that need DNS are not resolved; those loops are caught at run time by the hop header (`upstream::HOP_HEADER`).
+fn points_at(url: &http::Uri, addr: SocketAddr) -> bool {
+    let Some(host) = url.host() else { return false };
+    let port = url.port_u16().unwrap_or(if url.scheme_str() == Some("https") { 443 } else { 80 });
+    if port != addr.port() {
+        return false;
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let local = host.eq_ignore_ascii_case("localhost");
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            ip == addr.ip()
+                || (addr.ip().is_unspecified() && (ip.is_loopback() || ip.is_unspecified()))
+                || (addr.ip().is_loopback() && ip.is_loopback())
+        }
+        Err(_) => local && (addr.ip().is_loopback() || addr.ip().is_unspecified()),
     }
 }
 
@@ -173,6 +233,14 @@ impl Server {
     pub async fn start(config: Config) -> std::io::Result<Self> {
         let listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
         let addr = listener.local_addr()?;
+        if let Some(upstream) = &config.upstream
+            && points_at(upstream, addr)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("upstream {upstream} is this server's own address ({addr}): requests would be relayed to themselves"),
+            ));
+        }
         let control = Arc::new(Control::new(&config).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?);
         if !config.policies.is_empty() {
             control
@@ -182,6 +250,23 @@ impl Server {
                 .await
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         }
+        // The record file grows with every exchange; reloading it would reset hit counters and `once` flags.
+        let record = config
+            .record
+            .as_ref()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+        let watcher = config
+            .watch
+            .clone()
+            .map(|mut w| {
+                if let Some(record) = &record {
+                    w.cassettes
+                        .retain(|c| &std::fs::canonicalize(c).unwrap_or_else(|_| c.clone()) != record);
+                }
+                w
+            })
+            .filter(|w| !w.is_empty())
+            .map(|w| watch::spawn(control.clone(), w));
         let (stop, mut stopped) = oneshot::channel();
         let shared = Arc::new(Shared {
             control: control.clone(),
@@ -223,6 +308,11 @@ impl Server {
                 });
             }
             conns.shutdown().await;
+            if let Some(w) = watcher {
+                // Await it, so a tick that is committing is finished before shutdown clears the policies.
+                w.abort();
+                let _ = w.await;
+            }
             stop_control.release.notify_waiters();
         });
         Ok(Self {
@@ -266,6 +356,11 @@ impl Server {
     /// The registered trajectories.
     pub fn trajectories(&self) -> &Trajectories {
         &self.control.engine.trajectories
+    }
+
+    /// The loaded cassettes and the recording.
+    pub fn cassettes(&self) -> &Cassettes {
+        &self.control.engine.cassettes
     }
 
     /// The registered policy scripts.
@@ -415,4 +510,24 @@ pub(crate) fn error_headers(err: &ir::ApiError) -> Vec<(String, String)> {
 /// Whole seconds, rounded up, for `retry-after`.
 pub(crate) fn retry_after_secs(d: Duration) -> u64 {
     d.as_secs() + u64::from(d.subsec_nanos() > 0)
+}
+
+#[cfg(test)]
+mod points_at_tests {
+    use super::points_at;
+
+    fn at(url: &str, addr: &str) -> bool {
+        points_at(&url.parse().unwrap(), addr.parse().unwrap())
+    }
+
+    #[test]
+    fn detects_own_address() {
+        assert!(at("http://127.0.0.1:8080", "127.0.0.1:8080"));
+        assert!(at("http://localhost:8080/v1", "127.0.0.1:8080"));
+        assert!(at("http://[::1]:8080", "[::1]:8080"));
+        assert!(at("http://127.0.0.1:8080", "0.0.0.0:8080"));
+        assert!(at("http://localhost/", "127.0.0.1:80"));
+        assert!(!at("http://127.0.0.1:8081", "127.0.0.1:8080"));
+        assert!(!at("http://example.com:8080", "127.0.0.1:8080"));
+    }
 }

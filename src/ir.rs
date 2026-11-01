@@ -8,16 +8,19 @@
 //! Tool call arguments stay a raw string end to end: clients are tested on how they reassemble
 //! streamed fragments, including fragments that never add up to valid JSON.
 
+pub mod schema;
+
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Which API the request came in on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     /// `POST /v1/chat/completions`.
+    #[default]
     #[serde(rename = "openai.chat")]
     OpenaiChat,
     /// `POST /v1/responses`.
@@ -207,6 +210,8 @@ pub struct ThinkingConfig {
 /// `extra` so the log can still show it and scripts can still match on it later.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Request {
+    /// Defaults to Chat so hand-written cassette exchanges can leave it out (the exchange has its own `protocol`).
+    #[serde(default)]
     pub protocol: Protocol,
     pub model: String,
     pub messages: Vec<Message>,
@@ -216,6 +221,7 @@ pub struct Request {
     pub tool_choice: Option<ToolChoice>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
     pub stream: bool,
     /// `stream_options.include_usage` (Chat Completions). Meaningless when `stream` is false.
     #[serde(default)]
@@ -750,6 +756,33 @@ impl ApiError {
         Self::new(500, "fakellm_error", format!("fakellm: policy {policy:?} exited while deciding")).code("fakellm_policy_crashed")
     }
 
+    /// 502 `fakellm_upstream_unreachable`: the `--upstream` server could not be reached or did not answer in time.
+    pub fn upstream_unreachable(upstream: &str, detail: &str) -> Self {
+        Self::new(
+            502,
+            "fakellm_error",
+            format!("fakellm: upstream {upstream} did not answer: {detail}"),
+        )
+        .code("fakellm_upstream_unreachable")
+    }
+
+    /// 508 `fakellm_upstream_loop`: the request was already relayed by this fakellm instance (or has passed through too
+    /// many instances), i.e. `--upstream` leads back here. Refused instead of relayed again.
+    pub fn upstream_loop(upstream: &str) -> Self {
+        Self::new(
+            508,
+            "fakellm_error",
+            format!("fakellm: upstream {upstream} leads back to this fakellm instance (request loop); refusing to relay it again"),
+        )
+        .code("fakellm_upstream_loop")
+    }
+
+    /// 502 `fakellm_upstream_incomplete`: the upstream response ended or broke before its body was complete, so no
+    /// outcome could be reassembled (logged only; the client saw the bytes as they came).
+    pub fn upstream_incomplete(detail: &str) -> Self {
+        Self::new(502, "fakellm_error", format!("fakellm: upstream response incomplete: {detail}")).code("fakellm_upstream_incomplete")
+    }
+
     /// Replaces the status, keeping everything else.
     pub fn with_status(mut self, status: u16) -> Self {
         self.status = status;
@@ -825,6 +858,10 @@ pub enum Source {
         name: Option<String>,
         policy: String,
     },
+    /// A recorded exchange of a cassette answered: `name` is the cassette, `index` the exchange in it.
+    Cassette { name: String, index: usize },
+    /// The request was relayed to the `--upstream` server; the outcome is what it answered.
+    Upstream,
     /// Nothing matched; the deterministic default answered.
     Fallback,
     /// Nothing matched and strict mode is on.
@@ -864,7 +901,7 @@ impl Source {
             Self::Script { index, name } | Self::Trajectory { index, name, .. } | Self::Policy { index, name, .. } => {
                 Some((*index, name.as_deref()))
             }
-            Self::Fallback | Self::Strict | Self::Rejected => None,
+            Self::Cassette { .. } | Self::Upstream | Self::Fallback | Self::Strict | Self::Rejected => None,
         }
     }
 }
@@ -1039,6 +1076,28 @@ mod tests {
         assert_eq!(
             ApiError::for_status_in(Protocol::OpenaiResponses, 429).code.as_deref(),
             Some("rate_limit_exceeded")
+        );
+    }
+
+    #[test]
+    fn cassette_and_upstream_sources() {
+        let c = Source::Cassette {
+            name: "weather".into(),
+            index: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            serde_json::json!({"kind": "cassette", "name": "weather", "index": 3})
+        );
+        assert_eq!(
+            serde_json::to_value(Source::Upstream).unwrap(),
+            serde_json::json!({"kind": "upstream"})
+        );
+        assert_eq!((c.rule(), Source::Upstream.rule()), (None, None));
+        assert_eq!(ApiError::upstream_unreachable("http://u", "refused").status, 502);
+        assert_eq!(
+            ApiError::upstream_incomplete("cut").code.as_deref(),
+            Some("fakellm_upstream_incomplete")
         );
     }
 

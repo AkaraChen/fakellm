@@ -156,6 +156,73 @@ export interface TrajectoryInfo {
   last_step: number | null;
 }
 
+/** A request in the IR (`requests.list()[i].request`); only `model` and `messages` are required in a cassette. */
+export type IRRequest = { model: string; messages: Record<string, any>[] } & Record<string, any>;
+
+/** The data of a recorded call: a reply or an error, in the shape of the IR outcome without delivery and source. */
+export type CassetteOutcome =
+  | { outcome: 'reply'; reply: Record<string, any> }
+  | { outcome: 'error'; error: Record<string, any> };
+
+/** One recorded round trip. */
+export interface Exchange {
+  request: IRRequest;
+  outcome: CassetteOutcome;
+  /** The protocol it was recorded under; replay works across protocols. */
+  protocol?: Protocol;
+  meta?: Record<string, unknown>;
+  /** Request fields to ignore for this exchange, on top of the cassette's list. */
+  ignore?: string[];
+}
+
+/** A recording: request/outcome pairs in IR form. Replays through every protocol. */
+export interface Cassette {
+  kind?: 'cassette';
+  /** Unique, no `/`, not `recording`. */
+  name: string;
+  recorded_at?: string;
+  upstream?: string;
+  /** Request fields to ignore when matching, added to the defaults; `!field` removes a default. */
+  ignore?: string[];
+  /** Regex substitutions applied to every text of a request before comparing. */
+  normalize?: { pattern: string; replace?: string }[];
+  /** `false` leaves the default normalizers (timestamps, UUIDs, request ids) out. */
+  normalize_defaults?: boolean;
+  /** Compare tool parameter schemas too, not just tool names. */
+  match_tool_schemas?: boolean;
+  /** Glob over the request's model. Default `*`. */
+  model_glob?: string;
+  /** Answer with the nearest exchange when none matches exactly. */
+  fuzzy?: boolean;
+  /** Each exchange answers once, in order; a spent one is skipped. */
+  once?: boolean;
+  meta?: Record<string, unknown>;
+  exchanges: Exchange[];
+}
+
+/** A cassette as returned by `cassettes.list()`; the in-memory recording of an `upstream` comes last with `recording: true`. */
+export interface CassetteInfo {
+  name: string;
+  exchanges: number;
+  once: boolean;
+  fuzzy: boolean;
+  hits: number;
+  consumed: number;
+  recording: boolean;
+}
+
+/** A snapshot as returned by `snapshots.create()`, `list()` and `restore()`; the numbers count what it holds. */
+export interface SnapshotInfo {
+  name: string;
+  /** RFC 3339, server clock. */
+  created: string;
+  scripts: number;
+  trajectories: number;
+  policies: number;
+  cassettes: number;
+  responses: number;
+}
+
 export type PolicyRuntime = 'tjs' | 'node' | 'bun' | (string & {});
 
 /** A policy script: an ES module whose default export is `decide(request, context)`. */
@@ -191,6 +258,10 @@ export interface Status {
   scripts: { count: number };
   trajectories: { count: number };
   policies: { count: number };
+  cassettes: { count: number };
+  snapshots: { count: number };
+  /** `null` unless started with `upstream`. */
+  upstream: { url: string; record: string | null; recorded: number } | null;
   responses: { count: number };
   strict: boolean;
   request_log: LogConfig;
@@ -211,6 +282,8 @@ export interface ResetOptions {
   requests?: boolean;
   scripts?: boolean;
   responses?: boolean;
+  /** Default false: snapshots survive a reset, so "snapshot once, reset or restore per test" works. */
+  snapshots?: boolean;
 }
 
 export interface RequestFilter {
@@ -291,6 +364,16 @@ export interface StartOptions {
   scripts?: Rule[] | string;
   /** Trajectories registered at start. */
   trajectories?: Trajectory[];
+  /** Cassettes loaded at start: objects, or the path of a JSON / JSONL / YAML cassette file. */
+  cassettes?: Cassette[] | string;
+  /** Relay requests no rule and no cassette answers to this OpenAI-compatible or Anthropic server, and record what it says. */
+  upstream?: string;
+  /** Key sent to the upstream instead of the client's own credentials. Needs `upstream`. */
+  upstreamApiKey?: string;
+  /** Append every recorded exchange to this JSONL file. Needs `upstream`. */
+  record?: string;
+  /** `false` stops reloading `scripts` / `cassettes` files when they change (default: watched). */
+  watch?: boolean;
   /** Policies registered at start; a module that does not load makes `start()` reject. */
   policies?: Policy[];
   /** Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: tjs, node, bun, whichever is on PATH first. */

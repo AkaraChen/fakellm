@@ -283,6 +283,9 @@ pub(super) async fn respond(shared: &Shared, bytes: &[u8], trace: &mut super::Tr
             return super::error::render(&error);
         }
     }
+    if control.upstream.is_some() {
+        return super::proxy(shared, Arc::new(parsed.request), bytes, trace, super::Style::Openai).await;
+    }
     let tokens: u32 = parsed.inputs.iter().map(input_tokens).sum();
     trace.outcome = Some(Arc::new(Outcome::Reply {
         reply: Reply {

@@ -322,7 +322,7 @@ agent 的每个请求会得到：`read_file` → `edit_file` →（结果带 err
 {"reply":{"text":"修复完成，测试通过。"},"expect":{"tool_results":[{"id":"c3","contains":"passed"}]}}
 ```
 
-第二步发给客户端的是 `edit_file {"path": "astropy/units/core.py", "old": "a < b", "new": "a <= b"}`（`command` 没有被 `args` 模板引用，所以丢掉；要保留就加 `keep_rest: true`）。第一次请求时 `bash` 经映射成 `run_shell`，客户端必须有这个工具，否则按 `unknown_tool: stop` 直接以 `stop_text` 结束。Hugging Face 数据集的批量导入（`fakellm import hf`）是 M4 的内容，现在需要自己把数据转成这个格式。
+第二步发给客户端的是 `edit_file {"path": "astropy/units/core.py", "old": "a < b", "new": "a <= b"}`（`command` 没有被 `args` 模板引用，所以丢掉；要保留就加 `keep_rest: true`）。第一次请求时 `bash` 经映射成 `run_shell`，客户端必须有这个工具，否则按 `unknown_tool: stop` 直接以 `stop_text` 结束。Hugging Face 数据集可以用 `fakellm import hf` 批量转成这个格式（SWE-agent、OpenHands、Hermes 等），录好的 cassette 用 `fakellm cassette to-trajectory` 转，见 [cassette.md](cassette.md) 和 [import.md](import.md)。
 
 ## 驱动真实的 codex、Claude Code、opencode
 

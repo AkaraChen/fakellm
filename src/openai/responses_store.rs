@@ -93,6 +93,23 @@ impl ResponseStore {
         inner.order.clear();
     }
 
+    /// For snapshots: every stored response, oldest first.
+    pub fn export(&self) -> Vec<Arc<StoredResponse>> {
+        let inner = self.inner.lock();
+        inner.order.iter().filter_map(|id| inner.by_id.get(id).cloned()).collect()
+    }
+
+    /// For snapshots: replaces the store with `items`, keeping their order.
+    pub fn import(&self, items: Vec<Arc<StoredResponse>>) {
+        let mut inner = self.inner.lock();
+        inner.by_id.clear();
+        inner.order.clear();
+        for r in items {
+            inner.order.push_back(r.id.clone());
+            inner.by_id.insert(r.id.clone(), r);
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().by_id.len()
     }

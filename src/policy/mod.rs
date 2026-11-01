@@ -125,6 +125,15 @@ pub struct PolicyInfo {
     pub log: Vec<String>,
 }
 
+/// A policy and what it has learned, as a snapshot keeps it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicyState {
+    pub spec: PolicySpec,
+    pub state: Value,
+    pub hits: u64,
+    pub restarts: u64,
+}
+
 /// The registered policies and their subprocesses.
 pub struct Policies {
     default_runtime: Option<Runtime>,
@@ -170,6 +179,9 @@ struct Live {
     process: Option<runtime::Process>,
     next_id: u64,
 }
+
+/// Started but not yet registered policies, see [`Policies::prepare`].
+pub(crate) struct Prepared(Vec<Arc<Entry>>);
 
 impl Default for Policies {
     fn default() -> Self {
@@ -224,6 +236,20 @@ impl Policies {
         }
     }
 
+    /// Validates `specs` and starts one dry-run subprocess each, without touching the registry: the slow, fallible half
+    /// of [`Policies::replace`]. Hot reload and snapshot restore prepare first, then [`Policies::commit`] together with
+    /// the other registries, so a failure changes nothing and the swap itself never awaits.
+    pub(crate) async fn prepare(&self, specs: Vec<PolicySpec>) -> Result<Prepared, PolicyError> {
+        self.start(specs).await.map(Prepared)
+    }
+
+    /// Swaps in prepared policies under one lock. The replaced ones are closed: a decision in flight on one of them
+    /// ends as `fakellm_policy_crashed` (500) and the request is not retried.
+    pub(crate) fn commit(&self, prepared: Prepared) {
+        let old = std::mem::replace(&mut *self.inner.lock(), prepared.0);
+        close(&old);
+    }
+
     async fn start(&self, specs: Vec<PolicySpec>) -> Result<Vec<Arc<Entry>>, PolicyError> {
         let mut seen = std::collections::HashSet::new();
         for spec in &specs {
@@ -272,9 +298,8 @@ impl Policies {
     /// duplicated, no runtime is available, or a module does not load (the message carries the
     /// module's own error). The dry-run subprocess is kept as the live one.
     pub async fn replace(&self, specs: Vec<PolicySpec>) -> Result<(), PolicyError> {
-        let entries = self.start(specs).await?;
-        let old = std::mem::replace(&mut *self.inner.lock(), entries);
-        close(&old);
+        let prepared = self.prepare(specs).await?;
+        self.commit(prepared);
         Ok(())
     }
 
@@ -291,6 +316,38 @@ impl Policies {
                 None => inner.push(entry),
             }
         }
+        Ok(())
+    }
+
+    /// For snapshots: every policy's spec, `state`, `hits` and `restarts`.
+    pub fn export_state(&self) -> Vec<PolicyState> {
+        let entries = self.inner.lock().clone();
+        entries
+            .iter()
+            .map(|e| {
+                let snap = e.snap.lock();
+                PolicyState {
+                    spec: e.spec.clone(),
+                    state: snap.state.clone(),
+                    hits: snap.hits,
+                    restarts: snap.restarts,
+                }
+            })
+            .collect()
+    }
+
+    /// For snapshots: replaces all policies like [`Policies::replace`] (fresh subprocesses, dry run) and then sets each
+    /// one's `state`, `hits` and `restarts` from `state`. Fails like `replace`, without changing anything.
+    pub async fn import_state(&self, state: Vec<PolicyState>) -> Result<(), PolicyError> {
+        let specs = state.iter().map(|s| s.spec.clone()).collect();
+        let prepared = self.prepare(specs).await?;
+        for (entry, saved) in prepared.0.iter().zip(&state) {
+            let mut snap = entry.snap.lock();
+            snap.state = saved.state.clone();
+            snap.hits = saved.hits;
+            snap.restarts = saved.restarts;
+        }
+        self.commit(prepared);
         Ok(())
     }
 

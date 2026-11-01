@@ -1,0 +1,15 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_abc","object":"response","status":"in_progress","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs_1","type":"reasoning","summary":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"output_index":1,"content_index":0,"delta":"Hi "}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":3,"output_index":1,"content_index":0,"delta":"there"}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":9,"response":{"id":"resp_abc","object":"response","created_at":1770933892,"status":"completed","model":"gpt-5.5","output":[{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"First."},{"type":"summary_text","text":"Second."}],"encrypted_content":"enc=="},{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi there","annotations":[]}]},{"id":"fc_1","type":"function_call","call_id":"call_9","name":"lookup","arguments":"{\"a\":1}"}],"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":3},"output_tokens":20,"output_tokens_details":{"reasoning_tokens":6},"total_tokens":32}}}
+

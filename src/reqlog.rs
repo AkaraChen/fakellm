@@ -136,6 +136,8 @@ impl RequestFilter {
         if let Some(want) = &self.source {
             let kind = match r.outcome.as_deref().map(Outcome::source) {
                 Some(Source::Script { .. } | Source::Trajectory { .. } | Source::Policy { .. }) => "script",
+                Some(Source::Cassette { .. }) => "cassette",
+                Some(Source::Upstream) => "upstream",
                 Some(Source::Fallback) => "fallback",
                 Some(Source::Strict) => "strict",
                 Some(Source::Rejected) => "rejected",

@@ -3,6 +3,7 @@
 //! the same reply and different requests get different ones. Also home to the other derived
 //! identifiers (completion ids, system fingerprints) so they are stable across runs too.
 
+use crate::ir::schema;
 use crate::ir::{FinishReason, Protocol, Reply, Request, ResponseFormat, ToolCall, ToolChoice};
 use crate::tokenizer;
 
@@ -18,7 +19,7 @@ impl Default for FallbackConfig {
     }
 }
 
-const WORDS: [&str; 64] = [
+pub(crate) const WORDS: [&str; 64] = [
     "lorem",
     "ipsum",
     "dolor",
@@ -89,9 +90,9 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Builds the default reply for `req`. Honors `max_tokens` (truncating to `finish: Length`),
-/// `response_format` (`json_object`/`json_schema` get `{"message": "<lorem>"}`), and a
-/// `tool_choice` that forces a tool call (`required` or a named tool: one call with `{}`
-/// arguments). Never calls a tool otherwise, so an agent loop ends instead of spinning.
+/// `response_format` (`json_schema` with a schema gets an instance of it, `json_object` and a schema-less
+/// `json_schema` get `{"message": "<lorem>"}`), and a `tool_choice` that forces a tool call (`required` or a
+/// named tool: one call whose arguments are an instance of the tool's `parameters`, `{}` without any). Never calls a tool otherwise, so an agent loop ends instead of spinning.
 /// `usage` is left zeroed; the engine fills it in.
 pub fn reply(req: &Request, cfg: &FallbackConfig) -> Reply {
     let seed = request_seed(req);
@@ -102,14 +103,37 @@ pub fn reply(req: &Request, cfg: &FallbackConfig) -> Reply {
         _ => None,
     };
     if let Some(name) = forced {
+        let arguments = req
+            .tools
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.parameters.as_ref())
+            .map(|schema| schema::instance(schema, seed ^ hash64(name.as_bytes())).to_string())
+            .unwrap_or_else(|| "{}".into());
         return Reply {
             text: None,
             tool_calls: vec![ToolCall {
                 id: tool_call_id(req.protocol, seed),
                 name,
-                arguments: "{}".into(),
+                arguments,
             }],
             finish: FinishReason::ToolCalls,
+            ..Reply::default()
+        };
+    }
+
+    if let Some(ResponseFormat::JsonSchema { schema: Some(schema), .. }) = &req.response_format {
+        let mut text = schema::instance(schema, seed).to_string();
+        let mut finish = FinishReason::Stop;
+        if let Some(max) = req.max_tokens
+            && tokenizer::count(&text) > max
+        {
+            text = tokenizer::truncate(&text, max).0;
+            finish = FinishReason::Length;
+        }
+        return Reply {
+            text: Some(text),
+            finish,
             ..Reply::default()
         };
     }
@@ -381,6 +405,57 @@ mod tests {
         assert_eq!(reply(&r, &FallbackConfig::default()).tool_calls[0].name, "second");
         r.tool_choice = Some(ToolChoice::Auto);
         assert!(reply(&r, &FallbackConfig::default()).tool_calls.is_empty());
+    }
+
+    #[test]
+    fn json_schema_gets_an_instance() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}, "temp": {"type": "integer", "minimum": -10, "maximum": 40}},
+            "required": ["city", "temp"],
+            "additionalProperties": false
+        });
+        let mut r = req("weather?");
+        r.response_format = Some(ResponseFormat::JsonSchema {
+            name: Some("w".into()),
+            schema: Some(schema),
+            strict: Some(true),
+        });
+        let out = reply(&r, &FallbackConfig::default());
+        let v: serde_json::Value = serde_json::from_str(&out.text.clone().unwrap()).unwrap();
+        assert!(v["city"].is_string() && (-10..=40).contains(&v["temp"].as_i64().unwrap()));
+        assert_eq!(out, reply(&r, &FallbackConfig::default()));
+        r.max_tokens = Some(3);
+        let cut = reply(&r, &FallbackConfig::default());
+        assert_eq!(cut.finish, FinishReason::Length);
+        assert!(serde_json::from_str::<serde_json::Value>(&cut.text.unwrap()).is_err());
+        r.max_tokens = None;
+        r.response_format = Some(ResponseFormat::JsonSchema {
+            name: None,
+            schema: None,
+            strict: None,
+        });
+        assert!(reply(&r, &FallbackConfig::default()).text.unwrap().starts_with("{\"message\""));
+    }
+
+    #[test]
+    fn forced_tool_gets_arguments_from_its_schema() {
+        let mut r = req("go");
+        let mut t = tool("lookup");
+        t.parameters = Some(serde_json::json!({
+            "type": "object",
+            "properties": {"q": {"type": "string"}, "n": {"type": "integer"}},
+            "required": ["q", "n"]
+        }));
+        r.tools = vec![t, tool("other")];
+        for choice in [ToolChoice::Tool { name: "lookup".into() }, ToolChoice::Required] {
+            r.tool_choice = Some(choice);
+            let call = &reply(&r, &FallbackConfig::default()).tool_calls[0];
+            let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+            assert!(args["q"].is_string() && args["n"].is_i64(), "{args}");
+        }
+        r.tool_choice = Some(ToolChoice::Tool { name: "other".into() });
+        assert_eq!(reply(&r, &FallbackConfig::default()).tool_calls[0].arguments, "{}");
     }
 
     #[test]
