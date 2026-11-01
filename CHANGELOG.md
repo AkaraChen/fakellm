@@ -10,6 +10,7 @@
 - `sdk/js` 类型、Go 的 `Match` / `ReplySpec` / `RawReply`、`bindings/node` 文档同步；测试：`tests/custom.rs`（回放 `docs/research.md` 里的录制流、418、Responses 事件、`nth`、方法与头、校验）、`sdk/node` 的 openai SDK 回放用例（Chat 流、Responses）、`bindings/node` 用例。
 - 真实消费方验证（见 [docs/consumers.md](docs/consumers.md#替换原有测试)）：codex 核心套件加 fakellm 后端（`cli_stream` 9 / 9），ai-sdk 的 `createTestServer` 垫片（1786 / 1787 个原有测试不改文件），claude-agent-sdk-typescript 新增 `e2e-fakellm`（6 / 6），oar-codex 两个过期期望修复（codex 52 / 0）。已知缺口：请求日志不解码 zstd 请求正文。
 - 套件结果（2026-11-01）：`cargo test --workspace` 620 个通过（`--no-default-features` 610），clippy `-D warnings` 与 fmt 干净；`sdk/js` 33、`sdk/node` 110、`bindings/node` 41（Bun 40 加 1 跳过）、Go 17、Python 17，`e2e/*.sh` 与 `docker.sh` 全部通过。
+- 请求体解码：`content-encoding: zstd | gzip | deflate | br`（含逗号串联）在解析和记录前解开；未知编码 415、解压超限 413、数据损坏 400；上游代理原样转发压缩字节。`tests/encoding.rs` 8 个用例。
 
 ## 未提交（内置 txiki.js：策略脚本进程内运行）
 

@@ -7,6 +7,7 @@
 pub mod chat;
 mod custom;
 pub mod embeddings;
+mod encoding;
 pub mod error;
 pub mod models;
 pub mod responses;
@@ -61,6 +62,9 @@ struct Trace {
     deferred: bool,
     /// A custom endpoint rule answered: log the request even though the path is not under `/v1`.
     custom: bool,
+    /// The request body as sent, when `content-encoding` made it differ from the decoded one the handlers see;
+    /// [`proxy`] relays these bytes with the original header.
+    original: Option<bytes::Bytes>,
 }
 
 /// Records a request as `status: 0` when its future is dropped while parked on the server clock
@@ -342,7 +346,25 @@ async fn dispatch(shared: &Shared, parts: &http::request::Parts, path: &str, bod
     let mut body_bytes = None;
     if reads_body || custom {
         match Limited::new(body, MAX_BODY).collect().await {
-            Ok(b) => body_bytes = Some(b.to_bytes()),
+            Ok(b) => {
+                let sent = b.to_bytes();
+                match encoding::decode(&encoding::encodings(&parts.headers), &sent) {
+                    Ok(None) => body_bytes = Some(sent),
+                    Ok(Some(decoded)) => {
+                        trace.original = Some(sent);
+                        body_bytes = Some(decoded);
+                    }
+                    Err(_) if !reads_body => body_bytes = Some(sent),
+                    Err(f) => {
+                        let err = match f {
+                            encoding::Failure::Unsupported(e) => style_error(style, 415, format!("Unsupported content-encoding: {e}.")),
+                            encoding::Failure::TooLarge => style_error(style, 413, "Request body is too large."),
+                            encoding::Failure::Corrupt(e) => ApiError::invalid_request(format!("The request body is not valid {e} data.")),
+                        };
+                        return reject(trace, style, err);
+                    }
+                }
+            }
             Err(e) if reads_body => {
                 let err = if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
                     style_error(style, 413, "Request body is too large.")
@@ -726,7 +748,7 @@ async fn proxy(shared: &Shared, req: Arc<Request>, body: &[u8], trace: &mut Trac
         method,
         path_and_query,
         headers,
-        body: bytes::Bytes::copy_from_slice(body),
+        body: trace.original.take().unwrap_or_else(|| bytes::Bytes::copy_from_slice(body)),
         protocol: req.protocol,
     };
     match upstream

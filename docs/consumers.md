@@ -498,7 +498,7 @@ M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前
 | 只用 `mount_sse_once` / `mount_sse_sequence` 的 85 个模块 | 282 通过、1 失败、3 忽略 | 259 通过、24 失败、3 忽略 |
 
   完整运行里的 420 个失败不设变量也失败，是环境问题。fakellm 模式没跑完整：挂 wiremock `Mock`、`*_match` 或 `mount_response_*` 的测试会挂起，因为这些挂载落在客户端根本不连的 wiremock 上；85 个模块是用 grep 避开这些 helper 选出来的，选择是近似的，仍有几个会挂的混在里面。没有让这些 wiremock 专用 helper 在 fakellm 模式下 panic。
-- 24 个失败的原因：15 个是请求日志解不开 codex 在 ChatGPT 认证下发的 zstd 请求正文（记录里是有损的 `raw_text`，`body_json()` 报 "failed to decode zstd request body"，集中在 `search_tool`、`hooks_mcp`），属于 fakellm 缺口 11；5 个是 `unified_exec_process_events` 的 "deadline has elapsed"，4 个其他，这 9 个没有调查。
+- 24 个失败的原因：15 个是请求日志解不开 codex 在 ChatGPT 认证下发的 zstd 请求正文（记录里是有损的 `raw_text`，`body_json()` 报 "failed to decode zstd request body"，集中在 `search_tool`、`hooks_mcp`），属于 fakellm 缺口 11（已解决，见下表）；5 个是 `unified_exec_process_events` 的 "deadline has elapsed"，4 个其他，这 9 个没有调查。
 - 限制：wiremock 的 `Match` 闭包没有对应物；要支持 `mount_sse_once_match` 之类得翻译成 `body` / `header` / `nth` 条件。`fakellm-e2e/target/*` 已被 git 跟踪、工作区里显示为删除，提交只含 codex-rs 的测试路径和 `Cargo.lock`。
 - 构建代价：codex-core 测试二进制约 40 分钟（主要是依赖和 rusty_v8 拉取），另有 `codex` 二进制 8 分钟；磁盘最低剩 17 GB。
 
@@ -549,7 +549,7 @@ M3 带来 trajectory、JS 策略脚本（`PUT /_fakellm/policies`）、路径前
 | 8 | 正则不支持环视（oar） | oar | Rust regex 无 lookahead；opencode 的“不含 X”已能靠规则顺序表达，适配器遇到其他环视仍抛错；回落路径也忽略否定正则。低优先级 |
 | 9 | 文档过时：RST 行为（raft）。文档已更正，仅剩代理验证 | raft | 二进制已发 RST（裸 `net` 客户端得到 `ECONNRESET`），README、`docs/scripts.md` 已改成 RST；未验证 CONNECT 代理会转发 RST 还是转成 FIN。经代理和 pi-ai 看到的都是 `terminated`，区分不了 |
 | 10 | trajectory/策略的覆盖缺口（pi-mono） | pi-mono | agent 测试只用 openai-completions，Responses 与 Anthropic 的 trajectory/策略没测；bun 与 tjs 运行时没试；`args_chunk_bytes`（仅 oar 间接覆盖）、`last_user_raw`、路径前缀容忍（仅 raft 覆盖）没有专门测试 |
-| 11 | 请求日志不解码 `content-encoding: zstd` 的请求正文（codex） | codex | codex 在 ChatGPT 认证下发 zstd 压缩的请求正文；记录里只有有损的 `raw_text`，`body_json()` 报 "failed to decode zstd request body"，核心套件 85 个模块里 15 个失败（`search_tool`、`hooks_mcp`）。未实现 |
+| 11 | 请求日志不解码 `content-encoding: zstd` 的请求正文（codex） | codex | codex 在 ChatGPT 认证下发 zstd 压缩的请求正文；记录里只有有损的 `raw_text`，`body_json()` 报 "failed to decode zstd request body"，核心套件 85 个模块里 15 个失败（`search_tool`、`hooks_mcp`）。**已解决**：fakellm 现在在解析和记录前解码 `zstd` / `gzip` / `deflate` / `br`（纯 Rust 解码器，解压上限同请求体上限），上游代理仍原样转发压缩字节；复测 115 个模块 506 个用例 473 通过，剩余 29 个失败均与压缩无关（`guardian_authorization`、`unified_exec_process_events` 超时、`shell_snapshot` 等 codex 版本相关的用例）。 |
 | 12 | 替换原有 mock 时的剩余差异（codex、ai-sdk） | codex、ai-sdk | wiremock 的 `Match` 闭包没有对应物（要翻成 `body` / `header` / `nth`）；hyper 一定会加 `date` 和 `transfer-encoding`，不能关；ai-sdk 垫片不支持 `controlled-stream` 和 `binary`（垫片侧，不是引擎缺口） |
 
 替换原有测试这一轮没有新增已解决的缺口；原样回放（`reply.raw`、`match.nth` / `method` / `header`）本身就是为这一轮做的。

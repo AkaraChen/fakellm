@@ -35,9 +35,11 @@ default = ["tjs"]
 tjs = ["dep:tjs-sys"]
 
 [dependencies]
+brotli = "9.1.1"
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive", "env"] }
 fancy-regex = "0.20.0"
+flate2 = "1.1.10"
 form_urlencoded = "1.2"
 futures = "0.3"
 http = "1"
@@ -49,6 +51,7 @@ mimalloc = "0.1"
 parking_lot = "0.13"
 percent-encoding = "2"
 regex = "1"
+ruzstd = "0.9.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9"
