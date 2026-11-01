@@ -4,11 +4,11 @@
 
 ## 第一次发布
 
-1. 确认 `cargo test`、`cargo clippy --all-targets -- -D warnings`、`cargo fmt --check`、`sdk/js` / `sdk/node` / `bindings/node` 的测试、Go 的 `go test`、`e2e/docker.sh` 都是绿的。
+1. 先 `tjs-sys/fetch-sources.sh`（内置的 txiki.js 从 git 子模块编），然后确认 `cargo test --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo clippy --no-default-features --all-targets -- -D warnings`、`cargo fmt --check`、`sdk/js` / `sdk/node` / `bindings/node` 的测试、Go 的 `go test`、`e2e/docker.sh` 都是绿的。
 2. 手动触发 `e2e` 工作流（`workflow_dispatch`，在 GitHub Actions 里装最新的 claude / codex / opencode），或者在装了这三个 CLI 的机器上跑 `e2e/*.sh`；结果记进 README 的“测试与验证”。
 3. 推 `v<版本>` tag：`release.yml` 构建并推送 GHCR 镜像（`latest`、版本、`主.次`、短 sha，另有 `node` 变体）和 GitHub release 的二进制（`go/` 的 `Download` 依赖它）；`node.yml` 构建 Linux 的四个 `.node` 并在有 `NPM_TOKEN` 时发布 `@fakellm/native`。没有 tag 或手动触发时它们都是 dry run。
 4. 发布 `sdk/js` 到 npm（`npm publish`，需要 npm 账号）。
-5. 发布到 crates.io（`cargo publish`，需要 crates.io token）；之后把 README 里的 git 依赖改成版本号。
+5. 发布到 crates.io（`cargo publish`，需要 crates.io token）；之后把 README 里的 git 依赖改成版本号。**目前发不了**：内置运行时的 `tjs-sys` 是 `publish = false`，源码约 145 MB，超过 crates.io 的 10 MB 上限，而 `fakellm` 默认依赖它。可选的出路：把 `tjs` feature 改成默认关闭（发布的 crate 不带内置运行时，用 git 依赖拿带运行时的版本）、发布精简过源码的 `tjs-sys`，或者保持只用 git 依赖。这是需要作者决定的事，见 [TODO.md](../TODO.md)。
 6. 镜像发布后，把 README 的 Testcontainers 片段里的镜像名在真实镜像上跑一遍（本地已经用 `fakellm:local` 验证过同样的流程，见下）。
 
 ## 已经在本地验证过的

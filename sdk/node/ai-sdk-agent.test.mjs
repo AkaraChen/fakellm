@@ -57,7 +57,7 @@ function tools(editResults) {
 }
 
 async function registerPolicy() {
-  await srv.ctl.put('/policies', { name: 'agent', source: POLICY, runtime: 'node' });
+  await srv.ctl.put('/policies', { name: 'agent', source: POLICY });
   await srv.ctl.put('/scripts', [{ reply: { policy: 'agent' } }]);
 }
 
@@ -92,7 +92,7 @@ test('policy works over the Responses API', async () => {
 });
 
 test('a failing policy surfaces as an API error, not a retry storm', async () => {
-  await srv.ctl.put('/policies', { name: 'bad', source: "export default () => { throw new Error('policy bug'); };", runtime: 'node' });
+  await srv.ctl.put('/policies', { name: 'bad', source: "export default () => { throw new Error('policy bug'); };" });
   await srv.ctl.put('/scripts', [{ reply: { policy: 'bad' } }]);
   await assert.rejects(
     generateText({ model: provider.chat('gpt-4o'), prompt: 'x', maxRetries: 2 }),

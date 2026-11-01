@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# opencode agent loop driven by a node policy: call bash once, then answer with the tool output it got back.
-# Needs node. Everything lives under /tmp/fakellm-e2e-opencode-policy.
+# opencode agent loop driven by a policy script on the default runtime (txiki.js embedded in the fakellm binary): call bash
+# once, then answer with the tool output it got back. Needs opencode only, no node. Everything lives under /tmp/fakellm-e2e-opencode-policy.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -22,7 +22,7 @@ done
 URL=http://127.0.0.1:$PORT
 
 cat >"$T/policy.json" <<'JSON'
-{"name": "once", "runtime": "node", "source": "export default function decide(request, context) {\n  const last = request.messages.at(-1);\n  if (last.role !== 'tool') {\n    return { tool_calls: [{ name: 'bash', arguments: { command: 'echo POLICY_MARKER_9917', description: 'echo marker' } }], state: { called: true } };\n  }\n  const out = last.content.map((p) => p.text ?? '').join('');\n  return { text: 'POLICY_DONE saw=' + out.includes('POLICY_MARKER_9917'), state: { called: true } };\n}\n"}
+{"name": "once", "source": "export default function decide(request, context) {\n  const last = request.messages.at(-1);\n  if (last.role !== 'tool') {\n    return { tool_calls: [{ name: 'bash', arguments: { command: 'echo POLICY_MARKER_9917', description: 'echo marker' } }], state: { called: true } };\n  }\n  const out = last.content.map((p) => p.text ?? '').join('');\n  return { text: 'POLICY_DONE saw=' + out.includes('POLICY_MARKER_9917'), state: { called: true } };\n}\n"}
 JSON
 curl -sf -X PUT "$URL/_fakellm/policies" -H 'content-type: application/json' --data @"$T/policy.json" >/dev/null
 curl -sf -X PUT "$URL/_fakellm/scripts" -H 'content-type: application/json' -d '[

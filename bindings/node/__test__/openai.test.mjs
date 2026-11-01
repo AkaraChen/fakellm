@@ -295,9 +295,9 @@ test('policies: put/add return promises and do not block the JS thread', () =>
     let ticks = 0
     const timer = setInterval(() => ticks++, 5)
     try {
-      const pending = s.policies.put([{ name: 'slow', source: policySource, runtime: 'node' }])
+      const pending = s.policies.put([{ name: 'slow', source: policySource }])
       assert.ok(pending instanceof Promise)
-      // Control calls from the JS thread stay usable while the subprocess loads.
+      // Control calls from the JS thread stay usable while the policy loads.
       assert.equal(s.status().version.length > 0, true)
       assert.deepEqual(await pending, { added: 1, count: 1 })
       assert.ok(ticks >= 0)
@@ -308,25 +308,28 @@ test('policies: put/add return promises and do not block the JS thread', () =>
 
 test('policies: put/add/list/clear and a load error', () =>
   withServer({ scripts: [{ reply: { policy: 'p1' } }] }, async (s) => {
-    assert.deepEqual(await s.policies.put([{ name: 'p1', source: policySource, runtime: 'node' }]), { added: 1, count: 1 })
+    // No runtime named: the one linked into the addon runs it in-process.
+    assert.deepEqual(await s.policies.put([{ name: 'p1', source: policySource }]), { added: 1, count: 1 })
     const r = await openai(s).chat.completions.create({ model: 'm', messages: [{ role: 'user', content: 'hi' }] })
     assert.equal(r.choices[0].message.content, 'from policy')
     const [info] = s.policies.list()
-    assert.equal(info.runtime, 'node')
+    assert.equal(info.runtime, 'tjs')
+    assert.equal(info.in_process, true)
     assert.equal(info.hits, 1)
+    // 'node' is the explicit subprocess runtime.
     assert.equal((await s.policies.add([{ name: 'p2', source: policySource, runtime: 'node' }])).count, 2)
-    await assert.rejects(s.policies.put([{ name: 'bad', source: 'export default 1 +', runtime: 'node' }]))
+    assert.deepEqual(s.policies.list().filter((p) => p.name === 'p2').map((p) => [p.runtime, p.in_process]), [['node', false]])
+    await assert.rejects(s.policies.put([{ name: 'bad', source: 'export default 1 +' }]))
     assert.equal(s.policies.list().length, 2)
     s.policies.clear()
     assert.equal(s.policies.list().length, 0)
   }))
 
-test('start: trajectories, policies, policyRuntime and pathPrefix', async () => {
+test('start: trajectories, policies in both runtimes and pathPrefix', async () => {
   await withServer(
     {
       trajectories: [{ name: 'boot', steps: [{ reply: { text: 'from trajectory' } }] }],
-      policies: [{ name: 'pol', source: policySource }],
-      policyRuntime: 'node',
+      policies: [{ name: 'pol', source: policySource }, { name: 'pol-node', source: policySource, runtime: 'node' }],
       pathPrefix: '/anthropic',
       scripts: [
         { match: { last_user: 'traj' }, reply: { trajectory: 'boot' } },
@@ -338,11 +341,13 @@ test('start: trajectories, policies, policyRuntime and pathPrefix', async () => 
         (await openai(s).chat.completions.create({ model: 'm', messages: [{ role: 'user', content }] })).choices[0].message.content
       assert.equal(await say('traj'), 'from trajectory')
       assert.equal(await say('pol'), 'from policy')
-      assert.equal(s.policies.list()[0].runtime, 'node')
+      assert.deepEqual(s.policies.list().map((p) => p.runtime), ['tjs', 'node'])
       assert.equal((await fetch(`${s.endpoint}/anthropic/v1/models`)).status, 200)
     },
   )
-  await assert.rejects(start({ policyRuntime: 'node', policies: [{ name: 'bad', source: 'export default 1 +' }] }))
+  for (const policyRuntime of [undefined, 'node']) {
+    await assert.rejects(start({ policyRuntime, policies: [{ name: 'bad', source: 'export default 1 +' }] }))
+  }
 })
 
 const tape = (name, user, answer) => ({

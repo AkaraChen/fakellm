@@ -2,6 +2,15 @@
 
 按里程碑记录，新的在前。版本号还是 `0.1.0`，还没有推过 `v*` tag，所以没有正式发布；日期是提交日期。设计思路见 [docs/design.md](docs/design.md)，待办见 [TODO.md](TODO.md)。
 
+## 未提交（内置 txiki.js：策略脚本进程内运行）
+
+- **策略脚本默认在进程内运行**：txiki.js（QuickJS-ng + libuv，提交 `e32a7386`）作为静态库编进二进制，新 crate `tjs-sys`（`build.rs` 用 cmake 编 `third_party/txiki.js` 子模块，加一层 C 胶水）；`src/policy/tjs.rs` 给每个策略一个专用线程，异步侧用 channel 和 `oneshot` 收发决定。语义和子进程运行时一致：`state` 只在回复带 `state` 时替换，decline 不计命中，超时用宿主机时钟（死循环和挂着的 `await` 都会被打断），超时或被取消后下一个请求重建运行时并计入 `restarts`，`files` 多文件照旧写进临时目录。删除、替换、`reset`、还原快照、热加载、`Server::shutdown` 和丢弃 `Server` 都会取消在途决定并 join 线程（最多等 3 秒）；客户端中途断开也会取消。
+- 运行时选择：`runtime: "tjs"` 现在指内置的那个（外部 `tjs` 子进程 shim 和 `shim_tjs.js` 删除）；`node`、`bun` 和路径仍是子进程。默认是 `tjs`（cargo feature `tjs`，默认开）；`--no-default-features` 的构建没有内置运行时，默认退回 `PATH` 里的 `node`、`bun`，不需要 cmake 和子模块。`GET /_fakellm/policies` 多了 `in_process`（`sdk/js` 类型、Go `PolicyInfo`、`bindings/node` 同步）。
+- 代价：release 二进制 9.1 MB → 14.3 MB（strip 后 12.7 MB），`bindings/node` 的 `.node` 约 12.5 MB；构建要 cmake、make、C / C++ 编译器和 git 子模块（`tjs-sys/fetch-sources.sh`），冷编译多约 45 秒；只支持 Linux 和 macOS；隔离变弱（`tjs.exit()` 会结束服务器，见 `docs/agent.md`）；`cargo publish` 暂时发不了（`tjs-sys` 约 145 MB 源码，见 `TODO.md`）。`bindings/node` 里链进来的 libuv / QuickJS 符号全是局部的（只导出 `napi_register_module_v1`），不会和 Node 自己的 libuv 串。
+- 测试：`tests/policy.rs` 的场景在默认运行时和显式 `node` 上各跑一遍，另有 tjs 专属用例（`tjs.*` API、死循环超时并重建、重建时加载失败、移除时打断在途决定、客户端断开、永不完成的 Promise、策略互不阻塞、大状态）；`tests/policy_threads.rs` 用 `/proc/self/status` 数线程；`tests/bin.rs` 在空 `PATH` 下启动二进制跑策略并在在途决定时收 SIGTERM；`tjs-sys` 自带 22 个测试（含跨线程取消）。`sdk/js`、`sdk/node`、`bindings/node`、`e2e/opencode-policy.sh` 不再显式指定 `node`（各留一个 node 变体），`e2e/docker.sh` 的默认镜像现在能跑策略。
+- 各 SDK 各加一条“不写 `runtime` 的策略在进程内运行”的用例（`sdk/js`、`bindings/node`、Go，断言 `in_process: true`）。合计：`cargo test --workspace` 605 个通过（`--no-default-features` 573）；`sdk/js` 32、`sdk/node` 106、`bindings/node` 40（Bun 39 加 1 跳过）、Go 17、Python 17。
+- CI：各任务先 `tjs-sys/fetch-sources.sh`；Windows 的 `cargo check` 加 `--no-default-features`；新增 `no-tjs` 任务；Alpine 镜像和 musl 构建装 cmake、g++、git。
+
 ## 未提交（收尾之后的一轮：保真、Python、e2e、清零 TODO）
 
 - 响应保真：Anthropic `usage` 补 `cache_creation`、`service_tier`、`inference_geo`，`message_delta.context_management`，空参数工具调用流出一个空 `input_json_delta`；Responses 的 `encrypted_content` 在 `added` 与 `done` 之间不同。有意保留的差异写进 [docs/wire.md](docs/wire.md#与真实-api-有意保留的差异)。

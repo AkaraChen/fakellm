@@ -179,7 +179,7 @@ impl Control {
     }
 
     /// Puts the state of snapshot `name` back (the snapshot stays): scripts, trajectories, policies (fresh
-    /// subprocesses with the captured `state`), cassettes with their consumed flags and the recording, stored
+    /// runtimes with the captured `state`), cassettes with their consumed flags and the recording, stored
     /// responses and the clock. `ControlError::NotFound` for an unknown name. If a policy cannot be started again
     /// the error is returned and nothing else is changed (policies are restored first; the imports after it cannot
     /// fail on state that was exported from a running server, so a restore is all or nothing in practice). The id

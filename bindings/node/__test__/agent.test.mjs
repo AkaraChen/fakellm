@@ -100,23 +100,26 @@ const policySource = `export default (request, context) => {
   return { tool_calls: [{ name: 'Bash', arguments: { command: 'echo hi' }, id: 'c1' }] }
 }`
 
-test('policy over the Responses API and the Anthropic Messages API', () =>
-  withServer({ scripts: [{ reply: { policy: 'loop' } }], policyRuntime: 'node' }, async (s) => {
-    assert.deepEqual(await s.policies.put([{ name: 'loop', source: policySource }]), { added: 1, count: 1 })
-    const ask = await json(responses(s), rspAsk('go'))
-    assert.equal(ask.output.find((o) => o.type === 'function_call').name, 'Bash')
-    const done = await json(responses(s), rspAnswer('go', 'hi'))
-    assert.match(JSON.stringify(done.output), /policy saw: hi/)
+// The default runtime is the one linked into the addon; 'node' is the subprocess path.
+for (const policyRuntime of [undefined, 'node']) {
+  test(`policy over the Responses API and the Anthropic Messages API (${policyRuntime ?? 'default runtime'})`, () =>
+    withServer({ scripts: [{ reply: { policy: 'loop' } }], policyRuntime }, async (s) => {
+      assert.deepEqual(await s.policies.put([{ name: 'loop', source: policySource }]), { added: 1, count: 1 })
+      const ask = await json(responses(s), rspAsk('go'))
+      assert.equal(ask.output.find((o) => o.type === 'function_call').name, 'Bash')
+      const done = await json(responses(s), rspAnswer('go', 'hi'))
+      assert.match(JSON.stringify(done.output), /policy saw: hi/)
 
-    const ask2 = await json(messages(s), antAsk('go'), claude)
-    assert.equal(ask2.content.find((b) => b.type === 'tool_use').name, 'Bash')
-    const done2 = await json(messages(s), antAnswer('go', 'hi'), claude)
-    assert.equal(done2.content[0].text, 'policy saw: hi')
-    assert.equal(s.policies.list()[0].hits, 4)
-  }))
+      const ask2 = await json(messages(s), antAsk('go'), claude)
+      assert.equal(ask2.content.find((b) => b.type === 'tool_use').name, 'Bash')
+      const done2 = await json(messages(s), antAnswer('go', 'hi'), claude)
+      assert.equal(done2.content[0].text, 'policy saw: hi')
+      assert.equal(s.policies.list()[0].hits, 4)
+    }))
+}
 
 test('a policy can decline and let the next rule answer', () =>
-  withServer({ scripts: [{ reply: { policy: 'picky' } }, { reply: { text: 'fallback rule' } }], policyRuntime: 'node' }, async (s) => {
+  withServer({ scripts: [{ reply: { policy: 'picky' } }, { reply: { text: 'fallback rule' } }] }, async (s) => {
     await s.policies.put([{ name: 'picky', source: 'export default (r) => (r.tools?.length ? { text: "policy" } : null)' }])
     const withTools = await json(messages(s), { ...antAsk('x') }, claude)
     assert.equal(withTools.content[0].text, 'policy')
@@ -198,7 +201,7 @@ test('file options load files and are watched by default; watch: false turns it 
     // Policy files: named after the file stem.
     const pfile = path.join(dir, 'echoer.mjs')
     writeFileSync(pfile, "export default () => ({ text: 'from policy file' })")
-    await withServer({ policyFiles: [pfile], policyRuntime: 'node', scripts: [{ reply: { policy: 'echoer' } }] }, async (s) => {
+    await withServer({ policyFiles: [pfile], scripts: [{ reply: { policy: 'echoer' } }] }, async (s) => {
       assert.equal(await say(s), 'from policy file')
     })
     await assert.rejects(start({ scriptsFile: path.join(dir, 'missing.json') }), /missing\.json/)
@@ -208,7 +211,7 @@ test('file options load files and are watched by default; watch: false turns it 
 })
 
 test('maxSnapshots and policyTimeoutMs reach the config', () =>
-  withServer({ maxSnapshots: 1, policyTimeoutMs: 300, policyRuntime: 'node', scripts: [{ reply: { policy: 'slow' } }] }, async (s) => {
+  withServer({ maxSnapshots: 1, policyTimeoutMs: 300, scripts: [{ reply: { policy: 'slow' } }] }, async (s) => {
     s.snapshots.create('one')
     assert.throws(() => s.snapshots.create('two'))
     await s.policies.put([{ name: 'slow', source: 'export default () => new Promise(() => {})' }])
@@ -241,10 +244,11 @@ test('recordRedact scrubs the recording but not the reply; match.after sequences
   }
 })
 
-test('a slow policies.put does not make the JS thread wait behind a pending stop()', async () => {
-  const s = await start({ policyTimeoutMs: 1500, policyRuntime: 'node' })
-  // The module never finishes loading, so the load takes the whole timeout.
-  const put = s.policies.put([{ name: 'hang', source: 'await new Promise(() => {}); export default () => null' }]).catch(() => 'rejected')
+for (const policyRuntime of [undefined, 'node']) {
+test(`a slow policies.put does not make the JS thread wait behind a pending stop() (${policyRuntime ?? 'default runtime'})`, async () => {
+  const s = await start({ policyTimeoutMs: 1500, policyRuntime })
+  // The module is still loading when the timeout hits, so the load takes the whole timeout.
+  const put = s.policies.put([{ name: 'hang', source: 'await new Promise((r) => setTimeout(r, 60000)); export default () => null' }]).catch(() => 'rejected')
   await new Promise((r) => setTimeout(r, 200))
   const stop = s.stop()
   await new Promise((r) => setTimeout(r, 50))
@@ -258,3 +262,4 @@ test('a slow policies.put does not make the JS thread wait behind a pending stop
   await stop
   await put
 })
+}

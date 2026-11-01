@@ -102,23 +102,26 @@ const policySource = `export default (request, context) => {
   return { tool_calls: [{ name: 'Bash', arguments: { command: 'echo hi' }, id: 'c1' }] }
 }`
 
-test('policy over the Responses API and the Anthropic Messages API', () =>
-  withServer({ scripts: [{ reply: { policy: 'loop' } }], policyRuntime: 'node' }, async (s) => {
-    assert.deepEqual(await s.policies.put([{ name: 'loop', source: policySource }]), { added: 1, count: 1 })
-    const ask = await json(responses(s), rspAsk('go'))
-    assert.equal(ask.output.find((o) => o.type === 'function_call').name, 'Bash')
-    const done = await json(responses(s), rspAnswer('go', 'hi'))
-    assert.match(JSON.stringify(done.output), /policy saw: hi/)
+// The default runtime is the one embedded in the binary; 'node' is the subprocess path.
+for (const policyRuntime of [undefined, 'node']) {
+  test(`policy over the Responses API and the Anthropic Messages API (${policyRuntime ?? 'default runtime'})`, () =>
+    withServer({ scripts: [{ reply: { policy: 'loop' } }], policyRuntime }, async (s) => {
+      assert.deepEqual(await s.policies.put([{ name: 'loop', source: policySource }]), { added: 1, count: 1 })
+      const ask = await json(responses(s), rspAsk('go'))
+      assert.equal(ask.output.find((o) => o.type === 'function_call').name, 'Bash')
+      const done = await json(responses(s), rspAnswer('go', 'hi'))
+      assert.match(JSON.stringify(done.output), /policy saw: hi/)
 
-    const ask2 = await json(messages(s), antAsk('go'), claude)
-    assert.equal(ask2.content.find((b) => b.type === 'tool_use').name, 'Bash')
-    const done2 = await json(messages(s), antAnswer('go', 'hi'), claude)
-    assert.equal(done2.content[0].text, 'policy saw: hi')
-    assert.equal((await s.policies.list())[0].hits, 4)
-  }))
+      const ask2 = await json(messages(s), antAsk('go'), claude)
+      assert.equal(ask2.content.find((b) => b.type === 'tool_use').name, 'Bash')
+      const done2 = await json(messages(s), antAnswer('go', 'hi'), claude)
+      assert.equal(done2.content[0].text, 'policy saw: hi')
+      assert.equal((await s.policies.list())[0].hits, 4)
+    }))
+}
 
 test('a policy can decline and let the next rule answer', () =>
-  withServer({ scripts: [{ reply: { policy: 'picky' } }, { reply: { text: 'fallback rule' } }], policyRuntime: 'node' }, async (s) => {
+  withServer({ scripts: [{ reply: { policy: 'picky' } }, { reply: { text: 'fallback rule' } }] }, async (s) => {
     await s.policies.put([{ name: 'picky', source: 'export default (r) => (r.tools?.length ? { text: "policy" } : null)' }])
     const withTools = await json(messages(s), { ...antAsk('x') }, claude)
     assert.equal(withTools.content[0].text, 'policy')
@@ -218,7 +221,7 @@ test('recordRedact, trajectoryFiles and policyFiles reach the binary', async () 
       const pol = path.join(dir, 'filer.mjs');
       writeFileSync(pol, "export default () => ({ text: 'policy file' })");
       await withServer(
-        { upstream: upstream.url, record, recordRedact: ['secret-\\d+'], trajectoryFiles: [traj], policyFiles: [pol], policyRuntime: 'node' },
+        { upstream: upstream.url, record, recordRedact: ['secret-\\d+'], trajectoryFiles: [traj], policyFiles: [pol] },
         async (s) => {
           const r = await json(`${s.baseURL}/chat/completions`, { model: 'm', messages: [{ role: 'user', content: 'ask' }] });
           assert.match(r.choices[0].message.content, /secret-123/); // the client still gets the real reply

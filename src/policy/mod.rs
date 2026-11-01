@@ -1,8 +1,9 @@
 //! Policy scripts: a JS module decides the reply from the request, for agent behavior that does not
 //! fit a fixed trajectory ("read the file first, then edit it; on a tool error retry once, then give
-//! up"). The module runs in a long-lived subprocess per policy (txiki.js, Node or Bun) that speaks
-//! one JSON line per decision over stdio, see [`protocol`]; fakellm keeps the policy's `state`, so a
-//! crashed process is replaced without losing it.
+//! up"). By default the module runs in-process on txiki.js, embedded in the binary (`tjs`, see [`tjs`]):
+//! one dedicated thread per policy. `node`, `bun` or an executable path run it in a long-lived
+//! subprocess per policy that speaks one JSON line per decision over stdio, see [`protocol`]. Either
+//! way fakellm keeps the policy's `state`, so a crashed or timed-out runtime is replaced without losing it.
 //!
 //! A script rule hands a request to a policy with `reply: {policy: "name"}`; the policy's reply is
 //! a `ReplySpec` that the engine renders like the rule's own. See docs/m3-spec.md ("Policy scripts")
@@ -11,6 +12,7 @@
 
 pub mod protocol;
 pub mod runtime;
+pub mod tjs;
 
 pub use runtime::Runtime;
 
@@ -29,7 +31,7 @@ use crate::script::{self, ReplySpec, ScriptFormat};
 /// Default `Config::policy_timeout_ms`.
 pub const DEFAULT_TIMEOUT_MS: u64 = 5000;
 
-/// Lines of subprocess stderr (`context.log`, `console.error`) kept per policy.
+/// Log lines (`context.log`, `console.*`; a subprocess's stderr) kept per policy.
 pub const LOG_LINES: usize = 200;
 
 /// A policy as registered: `{name, source, runtime?}`.
@@ -119,14 +121,16 @@ pub struct PolicyInfo {
     pub name: String,
     /// The runtime in use after defaults were applied: `tjs`, `node`, `bun` or the path.
     pub runtime: String,
-    /// A subprocess is alive right now (they start lazily and after crashes).
+    /// The policy runs inside the fakellm process (`tjs`) instead of as a subprocess.
+    pub in_process: bool,
+    /// A runtime is alive right now: a subprocess, or the in-process runtime's JS heap (both start again after a crash or timeout).
     pub running: bool,
     /// Decisions made so far; what `context.hits` showed the latest call, plus one.
     pub hits: u64,
-    /// Subprocess starts after the first.
+    /// Runtime starts after the first.
     pub restarts: u64,
     pub state: Value,
-    /// The last `LOG_LINES` stderr lines.
+    /// The last `LOG_LINES` log lines.
     pub log: Vec<String>,
 }
 
@@ -151,24 +155,29 @@ struct Entry {
     runtime: Runtime,
     /// What `list` and `get` show; written only by whoever holds `live`, so reads never wait on a decision.
     snap: Mutex<Snapshot>,
-    /// One decision at a time per policy: state is read-modify-write, and the subprocess is sequential.
+    /// One decision at a time per policy: state is read-modify-write, and the runtime is sequential.
     live: tokio::sync::Mutex<Live>,
-    /// Shared with the task that forwards the subprocess's stderr; outlives restarts.
+    /// Shared with whatever forwards the runtime's log lines (the policy thread, or the task reading a subprocess's stderr); outlives restarts.
     log: Arc<Mutex<VecDeque<String>>>,
-    /// Set when the entry leaves the registry, so an in-flight decision kills its subprocess at once.
+    /// Set when the entry leaves the registry, so an in-flight decision is killed (cancelled, for the in-process runtime) at once.
     closed: tokio::sync::watch::Sender<bool>,
 }
 
-/// Marks the policy as not running unless the decision finished; covers a dropped (cancelled) request future.
+/// Marks the policy as not running unless the decision finished; covers a dropped (cancelled) request future. An in-process
+/// decision is cancelled too, which is the equivalent of killing a subprocess: its runtime is rebuilt for the next one.
 struct RunGuard<'a> {
     entry: &'a Entry,
     armed: bool,
+    cancel: Option<tjs::CancelHandle>,
 }
 
 impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.entry.snap.lock().running = false;
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
         }
     }
 }
@@ -181,8 +190,31 @@ struct Snapshot {
 }
 
 struct Live {
-    process: Option<runtime::Process>,
+    instance: Option<Instance>,
     next_id: u64,
+}
+
+/// What runs a policy right now.
+enum Instance {
+    Process(Box<runtime::Process>),
+    InProcess(tjs::Host),
+}
+
+impl Instance {
+    /// A subprocess that exited, or a policy thread that died.
+    fn exited(&mut self) -> bool {
+        match self {
+            Self::Process(p) => p.exited(),
+            Self::InProcess(h) => h.exited(),
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        match self {
+            Self::Process(p) => !p.exited(),
+            Self::InProcess(h) => h.running(),
+        }
+    }
 }
 
 /// Started but not yet registered policies, see [`Policies::prepare`].
@@ -218,16 +250,29 @@ impl Entry {
         }
     }
 
+    /// Starts the policy's runtime and loads the module (a dry run: nothing is decided), within `timeout`.
+    async fn start_instance(&self, timeout: Duration) -> Result<Instance, PolicyError> {
+        let spec = &self.spec;
+        if self.runtime.in_process() {
+            let dir = runtime::write_dir(None, &spec.source, &spec.files)?;
+            let host = tjs::Host::start(dir, runtime::MODULE, timeout, self.logger()).await?;
+            return Ok(Instance::InProcess(host));
+        }
+        let process = runtime::spawn(&self.runtime, &spec.source, &spec.files, timeout, self.logger()).await?;
+        Ok(Instance::Process(Box::new(process)))
+    }
+
     fn info(&self) -> PolicyInfo {
         if let Ok(mut live) = self.live.try_lock()
-            && let Some(p) = live.process.as_mut()
+            && let Some(instance) = live.instance.as_mut()
         {
-            self.snap.lock().running = !p.exited();
+            self.snap.lock().running = instance.running();
         }
         let snap = self.snap.lock();
         PolicyInfo {
             name: self.spec.name.clone(),
             runtime: self.runtime.to_string(),
+            in_process: self.runtime.in_process(),
             running: snap.running,
             hits: snap.hits,
             restarts: snap.restarts,
@@ -238,7 +283,8 @@ impl Entry {
 }
 
 impl Policies {
-    /// `default_runtime` of `None` means "tjs if on PATH, else node, else bun", looked up at registration.
+    /// `default_runtime` of `None` means [`runtime::default_runtime`]: the embedded `tjs` if this build has it, else `node` or `bun`
+    /// from `PATH`, looked up at registration.
     pub fn new(default_runtime: Option<Runtime>, timeout: Duration) -> Self {
         Self {
             default_runtime,
@@ -288,8 +334,12 @@ impl Policies {
                 .runtime
                 .clone()
                 .or_else(|| self.default_runtime.clone())
-                .or_else(runtime::detect_runtime)
-                .ok_or_else(|| PolicyError("no JavaScript runtime found: install node, bun or txiki.js (tjs), or pass runtime".into()))?;
+                .or_else(runtime::default_runtime)
+                .ok_or_else(|| {
+                    PolicyError(
+                        "no JavaScript runtime found: install node or bun, build fakellm with the `tjs` feature, or pass runtime".into(),
+                    )
+                })?;
             let mut entry = Entry {
                 spec,
                 runtime,
@@ -299,14 +349,18 @@ impl Policies {
                     restarts: 0,
                     running: true,
                 }),
-                live: tokio::sync::Mutex::new(Live { process: None, next_id: 1 }),
+                live: tokio::sync::Mutex::new(Live {
+                    instance: None,
+                    next_id: 1,
+                }),
                 log: Arc::default(),
                 closed: tokio::sync::watch::channel(false).0,
             };
-            let process = runtime::spawn(&entry.runtime, &entry.spec.source, &entry.spec.files, self.timeout, entry.logger())
+            let instance = entry
+                .start_instance(self.timeout)
                 .await
                 .map_err(|e| PolicyError(format!("policy \"{}\": {e}", entry.spec.name)))?;
-            entry.live.get_mut().process = Some(process);
+            entry.live.get_mut().instance = Some(instance);
             entries.push(Arc::new(entry));
         }
         Ok(entries)
@@ -411,25 +465,28 @@ impl Policies {
     /// Asks policy `name` to decide the reply for `req`:
     ///
     /// 1. Unknown name: `ApiError::policy_not_found`.
-    /// 2. Takes the policy's lock (decisions are serialized), starts the subprocess if none is
-    ///    alive (counting a restart), writes `{id, request, state, hits}`.
-    /// 3. Waits for the matching `{id, ...}` line for at most the timeout on the host clock; on timeout
-    ///    kills the subprocess and returns `ApiError::policy_timeout`. EOF or a broken pipe is
-    ///    `ApiError::policy_crashed`; an `error` line, a reply that is not a `ReplySpec` or one that fails
+    /// 2. Takes the policy's lock (decisions are serialized), starts the runtime if none is
+    ///    alive (a subprocess that exited, a policy thread that died; counting a restart), and hands it
+    ///    `{request, state, hits}`: a JSON line to a subprocess, a message to the in-process runtime's thread.
+    /// 3. Waits for the answer for at most the timeout on the host clock; on timeout kills the subprocess
+    ///    (the in-process runtime interrupts the script and builds a fresh one for the next decision, counting a
+    ///    restart) and returns `ApiError::policy_timeout`. EOF, a broken pipe or a dead policy thread is
+    ///    `ApiError::policy_crashed`; a script error, a reply that is not a `ReplySpec` or one that fails
     ///    validation (`trajectory` is allowed, `policy` is not) is `ApiError::policy_error`.
     /// 4. On success stores the reply's `state` (when present) and counts the hit; failures do not count.
     ///    A decline (`null`/`undefined`/`{decline: true}`) is `Ok(None)`: `state` is stored, no hit counts.
     pub async fn decide(&self, name: &str, req: &Request) -> Result<Option<ReplySpec>, ApiError> {
         let entry = self.find(name).ok_or_else(|| ApiError::policy_not_found(name))?;
         let mut live = entry.live.lock().await;
-        if live.process.as_mut().is_some_and(|p| p.exited()) {
-            live.process = None;
+        if live.instance.as_mut().is_some_and(|i| i.exited()) {
+            live.instance = None;
         }
-        if live.process.is_none() {
-            let process = runtime::spawn(&entry.runtime, &entry.spec.source, &entry.spec.files, self.timeout, entry.logger())
+        if live.instance.is_none() {
+            let instance = entry
+                .start_instance(self.timeout)
                 .await
                 .map_err(|e| ApiError::policy_error(name, &e.0))?;
-            live.process = Some(process);
+            live.instance = Some(instance);
             let mut snap = entry.snap.lock();
             snap.restarts += 1;
             snap.running = true;
@@ -440,35 +497,70 @@ impl Policies {
             let snap = entry.snap.lock();
             (snap.state.clone(), snap.hits)
         };
-        let line = protocol::encode(&protocol::DecideLine {
-            id,
-            request: req,
-            state: &state,
-            hits,
-        });
-        // The process leaves `live` for the exchange: if this future is dropped half-way (client disconnect)
-        // it is killed with it, so a half-written request line never reaches the next decision.
-        let mut process = live.process.take().expect("started above");
         let mut guard = RunGuard {
             entry: &entry,
             armed: true,
+            cancel: None,
         };
         let mut closed = entry.closed.subscribe();
-        let answer = tokio::select! {
-            a = tokio::time::timeout(self.timeout, exchange(&mut process, id, &line)) => a,
-            _ = closed.wait_for(|c| *c) => Ok(None),
-        };
-        let (outcome, next_state) = match answer {
-            Ok(Some(answer)) => answer,
-            failed => {
-                return Err(match failed {
-                    Ok(_) => ApiError::policy_crashed(name),
-                    Err(_) => ApiError::policy_timeout(name, self.timeout.as_millis() as u64),
-                });
+        let (outcome, next_state) = if matches!(live.instance, Some(Instance::Process(_))) {
+            let line = protocol::encode(&protocol::DecideLine {
+                id,
+                request: req,
+                state: &state,
+                hits,
+            });
+            // The process leaves `live` for the exchange: if this future is dropped half-way (client disconnect)
+            // it is killed with it, so a half-written request line never reaches the next decision.
+            let Some(Instance::Process(mut process)) = live.instance.take() else {
+                unreachable!("matched above")
+            };
+            let answer = tokio::select! {
+                a = tokio::time::timeout(self.timeout, exchange(&mut process, id, &line)) => a,
+                _ = closed.wait_for(|c| *c) => Ok(None),
+            };
+            match answer {
+                Ok(Some(answer)) => {
+                    live.instance = Some(Instance::Process(process));
+                    answer
+                }
+                Ok(None) => return Err(ApiError::policy_crashed(name)),
+                Err(_) => return Err(ApiError::policy_timeout(name, self.timeout.as_millis() as u64)),
+            }
+        } else {
+            let Some(Instance::InProcess(host)) = live.instance.as_mut() else {
+                unreachable!("started above")
+            };
+            guard.cancel = Some(host.cancel_handle());
+            let request = serde_json::to_string(req).expect("a request serializes");
+            let state = serde_json::to_string(&state).expect("state is JSON");
+            let reply = tokio::select! {
+                r = host.decide(request, state, hits, self.timeout) => Some(r),
+                _ = closed.wait_for(|c| *c) => None,
+            };
+            let Some(reply) = reply else {
+                return Err(ApiError::policy_crashed(name));
+            };
+            if reply.restarted {
+                let mut snap = entry.snap.lock();
+                snap.restarts += 1;
+                snap.running = true;
+            }
+            match reply.result {
+                Ok(decision) => {
+                    guard.armed = false;
+                    in_process_answer(decision)
+                }
+                Err(tjs::Failure::Script(message)) => {
+                    guard.armed = false;
+                    return Err(ApiError::policy_error(name, &message));
+                }
+                Err(tjs::Failure::Timeout) => return Err(ApiError::policy_timeout(name, self.timeout.as_millis() as u64)),
+                Err(tjs::Failure::Crashed) => return Err(ApiError::policy_crashed(name)),
+                Err(tjs::Failure::Load(message)) => return Err(ApiError::policy_error(name, &message)),
             }
         };
         guard.armed = false;
-        live.process = Some(process);
         let reply = match outcome.map_err(|m| ApiError::policy_error(name, &m))? {
             Some(reply) => reply,
             None => {
@@ -489,6 +581,29 @@ impl Policies {
         }
         snap.hits += 1;
         Ok(Some(reply))
+    }
+}
+
+/// The in-process runtime's JSON strings as the same `(outcome, state)` a subprocess's answer line parses to.
+fn in_process_answer(decision: tjs::Decision) -> Answer {
+    let state = |s: Option<String>| -> Result<Option<Value>, String> {
+        s.map(|s| serde_json::from_str(&s).map_err(|e| format!("unreadable state: {e}")))
+            .transpose()
+    };
+    match decision {
+        tjs::Decision::Declined { state: s } => match state(s) {
+            Ok(state) => (Ok(None), state),
+            Err(e) => (Err(e), None),
+        },
+        tjs::Decision::Reply { reply, state: s } => {
+            let reply = serde_json::from_str::<ReplySpec>(&reply)
+                .map(Some)
+                .map_err(|e| format!("invalid reply: {e}"));
+            match (reply, state(s)) {
+                (Ok(reply), Ok(state)) => (Ok(reply), state),
+                (Err(e), _) | (_, Err(e)) => (Err(e), None),
+            }
+        }
     }
 }
 
@@ -545,11 +660,20 @@ mod tests {
     #[test]
     fn runtimes_pick_their_shims() {
         assert_eq!("tjs".parse::<Runtime>().unwrap(), Runtime::Tjs);
-        assert_eq!(Runtime::Path("/usr/local/bin/bun".into()).shim().1, "shim.mjs");
-        assert_eq!(Runtime::Path("/opt/tjs".into()).shim().1, "shim.js");
+        assert!(Runtime::Tjs.in_process() && !Runtime::Node.in_process() && !Runtime::Path("/opt/tjs".into()).in_process());
+        assert_eq!(
+            Runtime::Path("/usr/local/bin/bun".into()).args(),
+            vec![std::ffi::OsString::from("run")]
+        );
+        assert!(Runtime::Path("/opt/node".into()).args().is_empty());
         assert!(Runtime::Node.args().is_empty());
         assert_eq!(Runtime::Bun.args(), vec![std::ffi::OsString::from("run")]);
-        assert!(runtime::SHIM_BUN.contains("FAKELLM_POLICY_MODULE") && runtime::SHIM_TJS.contains("FAKELLM_POLICY_MODULE"));
+        assert!(runtime::SHIM_BUN.contains("FAKELLM_POLICY_MODULE") && runtime::SHIM_NODE.contains("FAKELLM_POLICY_MODULE"));
+    }
+
+    #[test]
+    fn the_default_runtime_is_the_embedded_one_when_built_in() {
+        assert_eq!(runtime::default_runtime().is_some_and(|r| r.in_process()), cfg!(feature = "tjs"));
     }
 
     fn node() -> bool {
@@ -577,10 +701,16 @@ mod tests {
         }
     }
 
+    /// Every runtime that can run here: the embedded one if built in, `node` and `bun` if installed.
     fn runtimes() -> Vec<Runtime> {
-        let mut found = vec![Runtime::Node];
-        if std::process::Command::new("bun").arg("--version").output().is_ok() {
-            found.push(Runtime::Bun);
+        let mut found = Vec::new();
+        if cfg!(feature = "tjs") {
+            found.push(Runtime::Tjs);
+        }
+        for (rt, program) in [(Runtime::Node, "node"), (Runtime::Bun, "bun")] {
+            if std::process::Command::new(program).arg("--version").output().is_ok() {
+                found.push(rt);
+            }
         }
         found
     }
@@ -597,9 +727,6 @@ mod tests {
 
     #[tokio::test]
     async fn policy_returns_text_then_tool_call_with_state() {
-        if !node() {
-            return;
-        }
         for rt in runtimes() {
             let policies = Policies::default();
             policies.replace(vec![spec("p", STATEFUL, rt.clone())]).await.unwrap();
@@ -624,9 +751,6 @@ mod tests {
 
     #[tokio::test]
     async fn policy_errors_map_to_codes() {
-        if !node() {
-            return;
-        }
         let src = r#"export default (r) => {
             const t = r.tools[0]?.name;
             if (t === "throw") throw new Error("nope");
@@ -635,49 +759,50 @@ mod tests {
             if (t === "bad") return { bogus: 1 };
             return { text: "ok" };
         }"#;
-        let policies = Policies::default();
-        policies.replace(vec![spec("p", src, Runtime::Node)]).await.unwrap();
-        for tool in ["throw", "empty", "nested", "bad"] {
-            let err = policies.decide("p", &request(&[tool])).await.unwrap_err();
-            assert_eq!((err.status, err.code.as_deref()), (400, Some("fakellm_policy_error")), "{tool}");
+        for rt in runtimes() {
+            let policies = Policies::default();
+            policies.replace(vec![spec("p", src, rt)]).await.unwrap();
+            for tool in ["throw", "empty", "nested", "bad"] {
+                let err = policies.decide("p", &request(&[tool])).await.unwrap_err();
+                assert_eq!((err.status, err.code.as_deref()), (400, Some("fakellm_policy_error")), "{tool}");
+            }
+            assert!(
+                policies
+                    .decide("p", &request(&["throw"]))
+                    .await
+                    .unwrap_err()
+                    .message
+                    .contains("nope")
+            );
+            assert_eq!(
+                policies.decide("p", &request(&[])).await.unwrap().unwrap().text.as_deref(),
+                Some("ok")
+            );
+            assert_eq!(policies.get("p").unwrap().hits, 1);
+            let err = policies.decide("zzz", &request(&[])).await.unwrap_err();
+            assert_eq!(err.code.as_deref(), Some("fakellm_policy_not_found"));
         }
-        assert!(
-            policies
-                .decide("p", &request(&["throw"]))
-                .await
-                .unwrap_err()
-                .message
-                .contains("nope")
-        );
-        assert_eq!(
-            policies.decide("p", &request(&[])).await.unwrap().unwrap().text.as_deref(),
-            Some("ok")
-        );
-        assert_eq!(policies.get("p").unwrap().hits, 1);
-        let err = policies.decide("zzz", &request(&[])).await.unwrap_err();
-        assert_eq!(err.code.as_deref(), Some("fakellm_policy_not_found"));
     }
 
     #[tokio::test]
     async fn timeout_kills_and_the_next_decision_restarts() {
-        if !node() {
-            return;
-        }
         let src = r#"export default async (r) => {
             if (r.tools.length) await new Promise((res) => setTimeout(res, 60000));
             return { text: "fast" };
         }"#;
-        let policies = Policies::new(Some(Runtime::Node), Duration::from_millis(400));
-        policies.replace(vec![spec("p", src, Runtime::Node)]).await.unwrap();
-        let err = policies.decide("p", &request(&["slow"])).await.unwrap_err();
-        assert_eq!((err.status, err.code.as_deref()), (500, Some("fakellm_policy_timeout")));
-        let info = policies.get("p").unwrap();
-        assert_eq!((info.running, info.hits), (false, 0));
-        assert_eq!(
-            policies.decide("p", &request(&[])).await.unwrap().unwrap().text.as_deref(),
-            Some("fast")
-        );
-        assert_eq!(policies.get("p").unwrap().restarts, 1);
+        for rt in runtimes() {
+            let policies = Policies::new(Some(rt.clone()), Duration::from_millis(400));
+            policies.replace(vec![spec("p", src, rt)]).await.unwrap();
+            let err = policies.decide("p", &request(&["slow"])).await.unwrap_err();
+            assert_eq!((err.status, err.code.as_deref()), (500, Some("fakellm_policy_timeout")));
+            let info = policies.get("p").unwrap();
+            assert_eq!((info.running, info.hits), (false, 0));
+            assert_eq!(
+                policies.decide("p", &request(&[])).await.unwrap().unwrap().text.as_deref(),
+                Some("fast")
+            );
+            assert_eq!(policies.get("p").unwrap().restarts, 1);
+        }
     }
 
     #[tokio::test]
@@ -689,7 +814,7 @@ mod tests {
             if (r.tools.length) process.exit(1);
             return { text: "hit " + hits, state: { kept: true } };
         }"#;
-        for rt in runtimes() {
+        for rt in runtimes().into_iter().filter(|rt| !rt.in_process()) {
             let policies = Policies::default();
             policies.replace(vec![spec("p", src, rt)]).await.unwrap();
             policies.decide("p", &request(&[])).await.unwrap();
@@ -704,15 +829,18 @@ mod tests {
 
     #[tokio::test]
     async fn registration_checks_names_and_modules() {
-        if !node() {
-            return;
+        for rt in runtimes() {
+            registration_checks_names_and_modules_on(rt).await;
         }
+    }
+
+    async fn registration_checks_names_and_modules_on(rt: Runtime) {
         let policies = Policies::default();
         policies
-            .replace(vec![spec("keep", "export default () => ({ text: 'k' })", Runtime::Node)])
+            .replace(vec![spec("keep", "export default () => ({ text: 'k' })", rt.clone())])
             .await
             .unwrap();
-        let bad = |name: &str, src: &str| vec![spec(name, src, Runtime::Node)];
+        let bad = |name: &str, src: &str| vec![spec(name, src, rt.clone())];
         let e = policies.replace(bad("p", "export default (")).await.unwrap_err();
         assert!(e.0.starts_with("policy \"p\": "), "{e}");
         let e = policies.replace(bad("p", "export const x = 1;")).await.unwrap_err();
@@ -723,7 +851,7 @@ mod tests {
         let ok = "export default () => ({ text: 'x' })";
         assert!(
             policies
-                .replace(vec![spec("a", ok, Runtime::Node), spec("a", ok, Runtime::Node)])
+                .replace(vec![spec("a", ok, rt.clone()), spec("a", ok, rt.clone())])
                 .await
                 .is_err()
         );

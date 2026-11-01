@@ -429,13 +429,13 @@ impl PoliciesControl {
         })
     }
 
-    /// `{ name, runtime, running, hits, restarts, state, log }` per policy.
+    /// `{ name, runtime, in_process, running, hits, restarts, state, log }` per policy.
     #[napi]
     pub fn list(&self) -> Result<Value> {
         with_server(&self.server, |s| serde_json::to_value(s.policies().list()).map_err(control_error))?
     }
 
-    /// Removes all policies and stops their subprocesses.
+    /// Removes all policies and stops their runtimes (threads or subprocesses).
     #[napi]
     pub fn clear(&self) -> Result<()> {
         with_server(&self.server, |s| s.policies().clear())

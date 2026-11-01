@@ -96,21 +96,14 @@ func TestTrajectories(t *testing.T) {
 }
 
 func TestPolicies(t *testing.T) {
-	rt := "node"
-	if _, err := exec.LookPath(rt); err != nil {
-		if _, err := exec.LookPath("bun"); err != nil {
-			t.Skip("no node or bun")
-		}
-		rt = "bun"
-	}
+	// No runtime named anywhere: the policy runs on the runtime embedded in the binary, in-process.
 	src := `export default function decide(request, context) {
   context.log("hit", context.hits);
   return { text: "n=" + context.hits, state: { n: context.hits } };
 }`
 	s, ctx := start(t, fakellm.Options{
-		PolicyRuntime: rt,
-		Policies:      []fakellm.Policy{{Name: "counter", Source: src}},
-		Scripts:       []fakellm.Rule{{Match: fakellm.Match{Any: fakellm.Ptr(true)}, Reply: fakellm.ReplySpec{Policy: "counter"}}},
+		Policies: []fakellm.Policy{{Name: "counter", Source: src}},
+		Scripts:  []fakellm.Rule{{Match: fakellm.Match{Any: fakellm.Ptr(true)}, Reply: fakellm.ReplySpec{Policy: "counter"}}},
 	})
 	user := []map[string]any{{"role": "user", "content": "hi"}}
 	if out := chatBody(t, s, s.BaseURL(), user); !strings.Contains(out, "n=0") {
@@ -120,7 +113,7 @@ func TestPolicies(t *testing.T) {
 		t.Fatal(out)
 	}
 	p, err := s.Policies().Get(ctx, "counter")
-	if err != nil || p.Hits != 2 || p.Runtime != rt || !strings.Contains(string(p.State), `"n":1`) || len(p.Log) == 0 {
+	if err != nil || p.Hits != 2 || p.Runtime != "tjs" || !p.InProcess || !strings.Contains(string(p.State), `"n":1`) || len(p.Log) == 0 {
 		t.Fatalf("get: %+v %v", p, err)
 	}
 	var e *fakellm.Error
@@ -137,6 +130,28 @@ func TestPolicies(t *testing.T) {
 	}
 	if err := s.Policies().Clear(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPoliciesSubprocessRuntime(t *testing.T) {
+	rt := "node"
+	if _, err := exec.LookPath(rt); err != nil {
+		if _, err := exec.LookPath("bun"); err != nil {
+			t.Skip("no node or bun")
+		}
+		rt = "bun"
+	}
+	s, ctx := start(t, fakellm.Options{
+		PolicyRuntime: rt,
+		Policies:      []fakellm.Policy{{Name: "sub", Source: "export default () => ({ text: 'from sub' });"}},
+		Scripts:       []fakellm.Rule{{Match: fakellm.Match{Any: fakellm.Ptr(true)}, Reply: fakellm.ReplySpec{Policy: "sub"}}},
+	})
+	if out := chatBody(t, s, s.BaseURL(), []map[string]any{{"role": "user", "content": "hi"}}); !strings.Contains(out, "from sub") {
+		t.Fatal(out)
+	}
+	p, err := s.Policies().Get(ctx, "sub")
+	if err != nil || p.Runtime != rt || p.InProcess {
+		t.Fatalf("get: %+v %v", p, err)
 	}
 }
 

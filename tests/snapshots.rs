@@ -17,6 +17,11 @@ fn have_node() -> bool {
     ok
 }
 
+/// The default policy runtime works here: the embedded one, or `node` in a build without it.
+fn have_policy_runtime() -> bool {
+    cfg!(feature = "tjs") || have_node()
+}
+
 async fn snap(s: &Server, name: &str) -> Reply {
     ctl_json(s, "POST", "/_fakellm/snapshots", &json!({"name": name})).await
 }
@@ -54,7 +59,7 @@ const COUNTER: &str =
 
 #[tokio::test]
 async fn restore_brings_everything_back() {
-    let node = have_node();
+    let node = have_policy_runtime();
     let s = start().await;
     s.clock().freeze(None).unwrap();
     let frozen_at = get(&s, "/_fakellm/clock").await.json()["now"].clone();
@@ -76,13 +81,7 @@ async fn restore_brings_everything_back() {
     c["once"] = json!(true);
     put_cassettes(&s, &c).await;
     if node {
-        let r = ctl_json(
-            &s,
-            "PUT",
-            "/_fakellm/policies",
-            &json!({"name": "counter", "source": COUNTER, "runtime": "node"}),
-        )
-        .await;
+        let r = ctl_json(&s, "PUT", "/_fakellm/policies", &json!({"name": "counter", "source": COUNTER})).await;
         assert_eq!(r.status, 200, "{}", r.body);
     }
 

@@ -175,7 +175,7 @@ async fn a_control_plane_put_racing_a_reload_ends_in_one_state() {
 
 #[tokio::test]
 async fn a_policy_reload_fails_only_the_in_flight_decisions() {
-    if Command::new("node").arg("--version").output().is_err() {
+    if !cfg!(feature = "tjs") && Command::new("node").arg("--version").output().is_err() {
         eprintln!("skip: node not on PATH");
         return;
     }

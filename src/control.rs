@@ -58,7 +58,7 @@ pub struct ResetOptions {
     pub clock: bool,
     /// Empty the request log.
     pub requests: bool,
-    /// Remove all script rules, trajectories and policies (policy subprocesses are stopped).
+    /// Remove all script rules, trajectories and policies (policy runtimes are stopped).
     pub scripts: bool,
     /// Forget stored Responses API objects.
     pub responses: bool,

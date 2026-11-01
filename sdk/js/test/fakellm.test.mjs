@@ -208,26 +208,30 @@ test('trajectories: an invalid one throws FakeLLMError', async () => {
 const policySource = "export default () => ({ text: 'from policy' });";
 
 test('policies: put/add/list/clear and a load error', async () => {
-  assert.deepEqual(await srv.policies.put([{ name: 'p1', source: policySource, runtime: 'node' }]), { added: 1, count: 1 });
+  // No runtime named: the one embedded in the binary runs it in-process.
+  assert.deepEqual(await srv.policies.put([{ name: 'p1', source: policySource }]), { added: 1, count: 1 });
   await srv.scripts.put([{ reply: { policy: 'p1' } }]);
   assert.equal((await ask()).choices[0].message.content, 'from policy');
   const [info] = await srv.policies.list();
   assert.equal(info.name, 'p1');
-  assert.equal(info.runtime, 'node');
+  assert.equal(info.runtime, 'tjs');
+  assert.equal(info.in_process, true);
   assert.equal(info.hits, 1);
+  // 'node' is the explicit subprocess runtime.
   assert.equal((await srv.policies.add([{ name: 'p2', source: policySource, runtime: 'node' }])).count, 2);
-  await assert.rejects(srv.policies.put([{ name: 'bad', source: 'export default 1 +', runtime: 'node' }]), (e) => e instanceof FakeLLMError && e.status === 400);
+  const node = (await srv.policies.list()).find((p) => p.name === 'p2');
+  assert.deepEqual([node.runtime, node.in_process], ['node', false]);
+  await assert.rejects(srv.policies.put([{ name: 'bad', source: 'export default 1 +' }]), (e) => e instanceof FakeLLMError && e.status === 400);
   assert.equal((await srv.policies.list()).length, 2);
   await srv.policies.clear();
   assert.equal((await srv.policies.list()).length, 0);
 });
 
-test('start: trajectories, policies, policyRuntime and pathPrefix', async () => {
+test('start: trajectories, policies in both runtimes and pathPrefix', async () => {
   const s = await start({
     bin,
     trajectories: [{ name: 'boot', steps: [{ reply: { text: 'from trajectory' } }] }],
-    policies: [{ name: 'pol', source: policySource }],
-    policyRuntime: 'node',
+    policies: [{ name: 'pol', source: policySource }, { name: 'pol-node', source: policySource, runtime: 'node' }],
     pathPrefix: '/anthropic',
     scripts: [{ match: { last_user: 'traj' }, reply: { trajectory: 'boot' } }, { match: { last_user: 'pol' }, reply: { policy: 'pol' } }],
   });
@@ -236,13 +240,15 @@ test('start: trajectories, policies, policyRuntime and pathPrefix', async () => 
     const say = async (content) => (await c.chat.completions.create({ model: 'm', messages: [{ role: 'user', content }] })).choices[0].message.content;
     assert.equal(await say('traj'), 'from trajectory');
     assert.equal(await say('pol'), 'from policy');
-    assert.equal((await s.policies.list())[0].runtime, 'node');
+    assert.deepEqual((await s.policies.list()).map((p) => p.runtime), ['tjs', 'node']);
     const res = await fetch(`${s.url}/anthropic/v1/models`);
     assert.equal(res.status, 200);
   } finally {
     await s.stop();
   }
-  await assert.rejects(start({ bin, policyRuntime: 'node', policies: [{ name: 'bad', source: 'export default 1 +' }] }), (e) => e instanceof FakeLLMError);
+  for (const policyRuntime of [undefined, 'node']) {
+    await assert.rejects(start({ bin, policyRuntime, policies: [{ name: 'bad', source: 'export default 1 +' }] }), (e) => e instanceof FakeLLMError);
+  }
 });
 
 const tape = (name, user, answer, extra = {}) => ({

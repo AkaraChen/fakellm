@@ -58,8 +58,8 @@ pub struct StartOptions {
     /// Policies registered at start: an array of `{ name, source, runtime? }`, or a JSON / YAML string.
     /// A module that does not load rejects `start()`.
     pub policies: Option<serde_json::Value>,
-    /// Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: whichever of
-    /// tjs, node, bun is on PATH first.
+    /// Runtime for policies that name none: `tjs` (txiki.js embedded in the addon, in-process), `node`, `bun` or a
+    /// path to an executable. Default: `tjs`.
     pub policy_runtime: Option<String>,
     /// How long a policy may take to decide, in milliseconds on the host clock. Default 5000.
     pub policy_timeout_ms: Option<u32>,

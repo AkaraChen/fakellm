@@ -132,7 +132,7 @@ agent 框架 ──messages + tools──▶ fakellm（扮演模型）
    - `lenient`：忽略 tool result 的内容，照原样继续往下走。
    - `stop`：直接给出最终回复，结束这次运行。
 2. **工具名映射**：数据集里的工具（比如 SWE-agent 的 `bash`、`str_replace_editor`）和你的 agent 注册的工具多半对不上。用一份映射表把参数转换一下，例如 `bash {command}` 转成 `run_shell {cmd}`。轨迹里有、但客户端没注册的工具，按 `stop` 处理，或者报错。
-3. **策略脚本（policy）**：用 JS 写一个小状态机，根据当前的 messages 和 tools 决定下一步，脚本由 [txiki.js](https://github.com/saghul/txiki.js)（QuickJS-ng + libuv）执行。例如："还没读过文件就调用 `read_file`；读过了就调用 `edit_file`；收到工具报错就重试一次，然后放弃"。适合测各种分支，不依赖录像。
+3. **策略脚本（policy）**：用 JS 写一个小状态机，根据当前的 messages 和 tools 决定下一步，脚本由 [txiki.js](https://github.com/saghul/txiki.js)（QuickJS-ng + libuv）执行，它作为静态库编进二进制，在进程内运行。例如："还没读过文件就调用 `read_file`；读过了就调用 `edit_file`；收到工具报错就重试一次，然后放弃"。适合测各种分支，不依赖录像。
 
 可以顺带支持的 agent 场景：
 
@@ -197,7 +197,7 @@ agent 框架 ──messages + tools──▶ fakellm（扮演模型）
 
 ## 还没想清楚的问题
 
-1. 策略脚本的集成方式：已解决，作为子进程，通过 JSONL 标准输入输出协议调用，不链接 C 库。txiki.js（`tjs`）、Node、Bun 三个运行时共用协议，各有一个内置 shim；`tjs` 在自编译的 v26.6.0 上验证通过，见 [agent.md](agent.md#策略脚本)。
+1. 策略脚本的集成方式：已解决，默认把 txiki.js 作为库嵌入（`tjs-sys`，cmake 编出静态库，每个策略一个专用线程），策略在进程内运行，二进制不依赖任何 JS 运行时。最初的方案是子进程加 JSONL 协议，不链接 C 库；这条路径保留给显式选择的 Node、Bun 和任意可执行文件（各有一个内置 shim）。代价是 release 二进制多约 5 MB、构建要 cmake 和 git 子模块、隔离变弱；见 [agent.md](agent.md#策略脚本)。
 2. cassette 的语义匹配规则怎么设计：哪些字段默认忽略，怎么归一化 system prompt 里会变的部分（时间、随机 ID）？已解决，见 [cassette.md](cassette.md)。
 3. Responses API 的服务端状态：已解决。默认保存，`store: false` 不保存，`DELETE` 和控制面可清空，快照可存取；不做过期，也就不涉及虚拟时钟。见 [control-plane.md](control-plane.md) 和 [cassette.md](cassette.md)。
 4. 和 fakes3 共用的部分（控制面框架、时钟、请求日志、ctl、napi 发布流程）是拆成一个公共 crate，还是两个仓库各自维护一份？已决定：各自维护（是否改动留给作者，见 [TODO.md](../TODO.md)）。两边的控制面路由、请求记录字段和 ctl 子命令各不相同（fakellm 有协议、规则、轨迹、cassette，fakes3 有桶和对象），真正相同的只有几十行时钟和日志骨架；抽成公共 crate 要让两个仓库同步发版，成本高于复制，所以不拆，改动时人工对照。

@@ -74,9 +74,10 @@ type Options struct {
 	// Watch reloads script, trajectory, policy and cassette files given in Args when they change.
 	// nil keeps the server default (on); false passes --no-watch.
 	Watch *bool
-	// Policies registered right after start. Needs a policy runtime (tjs, node or bun) on the machine.
+	// Policies registered right after start. They run on the binary's embedded runtime unless Policy.Runtime or PolicyRuntime picks node or bun, which must then be on PATH.
 	Policies []Policy
-	// PolicyRuntime is --policy-runtime: tjs, node, bun or a path; empty means the server default.
+	// PolicyRuntime is --policy-runtime: tjs (embedded in the binary), node, bun or a path; empty means the server
+	// default, which is tjs.
 	PolicyRuntime string
 	// PolicyTimeoutMs is --policy-timeout-ms: how long a policy may take to decide, on the host clock; 0 means the server default (5000).
 	PolicyTimeoutMs int

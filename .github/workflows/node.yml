@@ -13,6 +13,9 @@ on:
     paths: &paths
       - "bindings/node/**"
       - "src/**"
+      - "tjs-sys/**"
+      - "third_party/**"
+      - ".gitmodules"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/node.yml"
@@ -54,6 +57,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The addon links txiki.js statically; it builds from git submodules (needs cmake: preinstalled on the runners, apk below).
+      - run: ../../tjs-sys/fetch-sources.sh
+
       - uses: actions/setup-node@v7
         if: ${{ !matrix.alpine }}
         with:
@@ -82,7 +88,7 @@ jobs:
           # napi defaults to a cross linker name on aarch64 musl; Alpine's native cc is the right one.
           docker run --rm -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
             -v "$PWD/../..:/work" -w /work/bindings/node node:24-alpine sh -euxc '
-            apk add --no-cache build-base perl linux-headers rustup
+            apk add --no-cache build-base perl linux-headers rustup cmake
             rustup-init -y --profile minimal --default-toolchain stable
             . "$HOME/.cargo/env"
             export RUSTFLAGS="-C target-feature=-crt-static"

@@ -141,7 +141,7 @@ enum Trajectories {
 
 #[derive(Subcommand)]
 enum Policies {
-    /// List policies with their runtime, hits and whether the subprocess is running.
+    /// List policies with their runtime, hits and whether the runtime is running.
     List,
     /// Replace all policies. FILE is an ES module (`.js`, `.mjs`, `.cjs`; named after the file stem or `--name`)
     /// or a JSON/YAML body `{name, source, runtime?}`; `-` reads stdin (a module when `--name` is given).

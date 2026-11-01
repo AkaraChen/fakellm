@@ -185,6 +185,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -255,6 +264,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "time",
+ "tjs-sys",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1177,6 +1187,14 @@ checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tjs-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "cmake",
 ]
 
 [[package]]

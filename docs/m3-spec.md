@@ -18,7 +18,7 @@ policy shims (Node and Bun tested here, txiki.js not), and stubs with `todo!()` 
 | Id | Owns (may edit) | Does not touch |
 |---|---|---|
 | (a) trajectories | `src/agent/trajectory.rs`, `src/agent/tool_map.rs` (stubs, delete `#![allow(dead_code, unused_variables)]` when no `todo!()` is left) | everything below |
-| (b) policies | `src/policy/mod.rs`, `protocol.rs`, `runtime.rs`, `shim_node.js`, `shim_bun.js`, `shim_tjs.js` (tested for Node and Bun; keep the three in step) | |
+| (b) policies | `src/policy/mod.rs`, `protocol.rs`, `runtime.rs`, `tjs.rs`, `shim_node.js`, `shim_bun.js` (the in-process txiki.js runtime, `tjs.rs`, replaced the third, subprocess shim; keep the two shims in step) | |
 | (c) chores | D1, D2, D5, D7 (`src/ir.rs` `last_user_text` only, `src/script.rs` matcher bits, `api_path` in `src/openai/mod.rs`, `src/anthropic/*`, `src/ctl.rs`); D3 is done (section 6) | |
 | (d) embeddings + SO_LINGER | `src/openai/embeddings.rs`; D6 (`src/lib.rs` accept loop, `src/sse.rs`, `src/openai/mod.rs` only where D6 needs to pass the connection handle) | |
 | (e) tests | `tests/agent.rs`, `tests/policy.rs`, `tests/embeddings.rs`, `tests/chores.rs` (new), additions to `tests/control.rs`, `tests/bin.rs`, `sdk/node/*.mjs` (openai embeddings), `sdk/js` types for the new rule fields | `src/` |
@@ -214,9 +214,9 @@ export default async function decide(request, context) {
 
 `PUT|POST /_fakellm/policies` (JSON or YAML; one `{name, source, runtime?}` object, an array, or `{"policies": [...]}`), `Config::policies`, `--policy FILE` (name = file stem).
 
-- `name`: letters, digits, `.`, `_`, `-`; unique. `runtime`: `"tjs" | "node" | "bun" | "<path>"` (a path's shim follows its file stem: `tjs`, `bun`, else Node's).
-- Default runtime: `Config::policy_runtime` (`--policy-runtime`), else the first of `tjs`, `node`, `bun` found on `PATH` (`runtime::detect_runtime()`), looked up at
-  registration. No runtime available -> `PolicyError("no JavaScript runtime found: install node, bun or txiki.js (tjs), or pass runtime")`.
+- `name`: letters, digits, `.`, `_`, `-`; unique. `runtime`: `"tjs" | "node" | "bun" | "<path>"` (`tjs` is the txiki.js embedded in the binary and runs in-process; the others are subprocesses, and a path's shim follows its file stem: `bun`, else Node's).
+- Default runtime: `Config::policy_runtime` (`--policy-runtime`), else `tjs` when the crate has the `tjs` feature (on by default), else the first of `node`, `bun` found on `PATH` (`runtime::default_runtime()`), looked up at
+  registration. No runtime available -> `PolicyError("no JavaScript runtime found: install node or bun, build fakellm with the `tjs` feature, or pass runtime")`.
 - Dry run at registration: write the temp dir, start the subprocess, wait for `{"ready":true}` (at most the policy timeout, host clock). `{"load_error": msg}` or an exit
   before ready -> `PolicyError("policy \"p\": <msg>")` -> 400. `replace` is all-or-nothing. The dry-run process becomes the live one.
 - `Server::start` returns `InvalidInput` when a `Config::policies` module does not load.
@@ -225,7 +225,7 @@ export default async function decide(request, context) {
 ### 4.3 Lifecycle and protocol
 
 One subprocess per policy, started at registration (the dry run) and restarted lazily on the next decision after it died (counted in `restarts`). The temp dir
-`fakellm-policy-<pid>-<n>` under `std::env::temp_dir()` holds the shim (`shim.mjs`, or `shim.js` for tjs) and `policy.mjs`; it is deleted when the policy is
+`fakellm-policy-<pid>-<n>` under `std::env::temp_dir()` holds the shim (`shim.mjs`; none for the in-process `tjs`, which loads `policy.mjs` straight from the dir) and `policy.mjs`; it is deleted when the policy is
 removed, replaced, the registry cleared, or the server dropped. The child is spawned with `kill_on_drop`, `FAKELLM_POLICY_MODULE=<abs path of policy.mjs>`, stdin and stdout piped, stderr piped.
 
 The wire protocol is in `src/policy/protocol.rs` (and exercised by the shims): newline-delimited JSON on stdout/stdin.
@@ -255,9 +255,9 @@ Failures do not count as hits. 500s are retried by SDKs and so call the policy a
 
 ### 4.4 Runtimes and shims
 
-`src/policy/shim_node.js` (= `shim_bun.js`, byte-identical, keep them so) and `shim_tjs.js` implement the protocol. Node and Bun were run against `pol.mjs`-style modules
-by hand (ready line, state, errors, stderr log, load errors). `shim_tjs.js` is **untested, no tjs binary here**; written from the txiki.js API
-(`tjs.stdin.read`, `tjs.stdout.write`, `tjs.env`, `tjs.exit`, dynamic `import()`). If a tjs binary appears, run it first. `Runtime::args()`: `run` for tjs and bun, none for Node.
+`src/policy/shim_node.js` (= `shim_bun.js`, byte-identical, keep them so) implement the protocol for the subprocess runtimes. Node and Bun were run against `pol.mjs`-style modules
+by hand (ready line, state, errors, stderr log, load errors). The txiki.js runtime (`tjs-sys`, `src/policy/tjs.rs`) does not use it: one thread per policy owns the JS runtime and
+the wrapper in `tjs-sys/csrc/fakellm_tjs.c` mirrors the shims' decide/decline/state handling. `Runtime::args()`: `run` for bun, none for Node.
 Tests may only assume Node (`which node`); skip with a printed notice when absent, like `tests/node_sdk.rs`.
 
 ### 4.5 Engine integration (done)

@@ -1,7 +1,8 @@
-//! Which JavaScript runtime runs a policy and how its subprocess is started. All three runtimes run the
-//! same protocol through a small embedded shim (`shim_node.js`, `shim_bun.js`, `shim_tjs.js`) that is
-//! written, with the user's module, to a temp dir (`fakellm-policy-<pid>-<n>/`) and removed when the policy
-//! is. The module path travels in the `FAKELLM_POLICY_MODULE` environment variable.
+//! Which JavaScript runtime runs a policy and how a subprocess runtime is started. `tjs` is the in-process
+//! runtime ([`super::tjs`]); `node`, `bun` and explicit paths run the same stdio protocol through a small
+//! embedded shim (`shim_node.js`, `shim_bun.js`). The shim and the user's module are written to a temp dir
+//! (`fakellm-policy-<pid>-<n>/`) that is removed with the policy; the module path travels in the
+//! `FAKELLM_POLICY_MODULE` environment variable. The in-process runtime gets the same dir, minus the shim.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -16,17 +17,15 @@ use crate::policy::protocol::{self, Incoming};
 
 pub const SHIM_NODE: &str = include_str!("shim_node.js");
 pub const SHIM_BUN: &str = include_str!("shim_bun.js");
-/// Tested against txiki.js v26.6.0 (`tests/policy_tjs.rs`, gated by `FAKELLM_TJS`).
-pub const SHIM_TJS: &str = include_str!("shim_tjs.js");
 
 /// A policy runtime, written `"tjs"`, `"node"`, `"bun"` or a path to an executable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Runtime {
+    /// txiki.js embedded in the fakellm binary; policies run in-process on their own threads.
     Tjs,
     Node,
     Bun,
-    /// Which shim it gets follows the file stem: `tjs` uses the txiki.js shim, `bun` the Bun one,
-    /// anything else the Node one.
+    /// A subprocess; which shim it gets follows the file stem: `bun` uses the Bun one, anything else the Node one.
     Path(PathBuf),
 }
 
@@ -69,7 +68,12 @@ impl<'de> Deserialize<'de> for Runtime {
 }
 
 impl Runtime {
-    /// The executable to start: the bare name (resolved through `PATH`) or the given path.
+    /// Runs inside the fakellm process rather than as a subprocess.
+    pub fn in_process(&self) -> bool {
+        matches!(self, Self::Tjs)
+    }
+
+    /// The executable to start: the bare name (resolved through `PATH`) or the given path. The in-process runtime has none.
     pub fn program(&self) -> OsString {
         match self {
             Self::Tjs => "tjs".into(),
@@ -79,50 +83,45 @@ impl Runtime {
         }
     }
 
-    fn kind(&self) -> Kind {
-        let stem = match self {
-            Self::Tjs => "tjs",
-            Self::Bun => "bun",
-            Self::Node => "node",
-            Self::Path(p) => p.file_stem().and_then(|s| s.to_str()).unwrap_or("node"),
-        };
-        match stem {
-            "tjs" => Kind::Tjs,
-            "bun" => Kind::Bun,
-            _ => Kind::Node,
+    fn is_bun(&self) -> bool {
+        match self {
+            Self::Bun => true,
+            Self::Path(p) => p.file_stem().and_then(|s| s.to_str()) == Some("bun"),
+            Self::Tjs | Self::Node => false,
         }
     }
 
     /// The embedded shim source and the file name it is written under.
     pub fn shim(&self) -> (&'static str, &'static str) {
-        match self.kind() {
-            Kind::Tjs => (SHIM_TJS, "shim.js"),
-            Kind::Bun => (SHIM_BUN, "shim.mjs"),
-            Kind::Node => (SHIM_NODE, "shim.mjs"),
+        if self.is_bun() {
+            (SHIM_BUN, "shim.mjs")
+        } else {
+            (SHIM_NODE, "shim.mjs")
         }
     }
 
-    /// Arguments before the shim path: `run` for tjs and bun, none for node.
+    /// Arguments before the shim path: `run` for bun, none for node.
     pub fn args(&self) -> Vec<OsString> {
-        match self.kind() {
-            Kind::Tjs | Kind::Bun => vec!["run".into()],
-            Kind::Node => Vec::new(),
-        }
+        if self.is_bun() { vec!["run".into()] } else { Vec::new() }
     }
 }
 
-enum Kind {
-    Tjs,
-    Bun,
-    Node,
+/// The runtime for policies that name none: the embedded `tjs` when this build has it (cargo feature `tjs`, on by default), else
+/// `node` or `bun`, whichever is on `PATH` first.
+pub fn default_runtime() -> Option<Runtime> {
+    if cfg!(feature = "tjs") {
+        Some(Runtime::Tjs)
+    } else {
+        detect_runtime()
+    }
 }
 
-/// The default runtime: `tjs` if an executable of that name is on `PATH`, else `node`, else `bun`.
+/// The subprocess fallback: `node` if an executable of that name is on `PATH`, else `bun`.
 pub fn detect_runtime() -> Option<Runtime> {
     let path = std::env::var_os("PATH")?;
     let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
     let has = |name: &str| dirs.iter().any(|d| d.join(name).is_file());
-    [("tjs", Runtime::Tjs), ("node", Runtime::Node), ("bun", Runtime::Bun)]
+    [("node", Runtime::Node), ("bun", Runtime::Bun)]
         .into_iter()
         .find(|(name, _)| has(name))
         .map(|(_, r)| r)
@@ -166,30 +165,25 @@ pub struct Process {
     pub _dir: PolicyDir,
 }
 
-/// Writes the shim and `source` into a fresh temp dir and starts `runtime` on the shim, then waits
-/// (at most `timeout`, host clock) for `{"ready":true}`. Errors carry the module's own load error,
-/// a missing-executable message, or "timed out waiting for the policy to load".
-/// A `tokio` task forwards the child's stderr lines to `on_log`.
-pub async fn spawn(
-    runtime: &Runtime,
+/// Writes `source` as `policy.mjs`, `files` and, if `shim` is given, the shim into a fresh temp dir. The in-process runtime passes no shim.
+pub fn write_dir(
+    shim: Option<(&str, &str)>,
     source: &str,
     files: &std::collections::BTreeMap<String, String>,
-    timeout: std::time::Duration,
-    on_log: impl Fn(String) + Send + 'static,
-) -> Result<Process, PolicyError> {
+) -> Result<PolicyDir, PolicyError> {
     static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "fakellm-policy-{}-{}",
         std::process::id(),
         NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let (shim, shim_name) = runtime.shim();
-    let module = dir.join("policy.mjs");
     let io = |what: &str, e: std::io::Error| PolicyError(format!("{what}: {e}"));
     std::fs::create_dir_all(&dir).map_err(|e| io("cannot create the policy directory", e))?;
     let dir = PolicyDir(dir);
-    std::fs::write(dir.0.join(shim_name), shim).map_err(|e| io("cannot write the policy shim", e))?;
-    std::fs::write(&module, source).map_err(|e| io("cannot write the policy module", e))?;
+    if let Some((shim, name)) = shim {
+        std::fs::write(dir.0.join(name), shim).map_err(|e| io("cannot write the policy shim", e))?;
+    }
+    std::fs::write(dir.0.join(MODULE), source).map_err(|e| io("cannot write the policy module", e))?;
     // `.js` helpers are ES modules too, unless the caller ships its own package.json.
     if !files.contains_key("package.json") {
         std::fs::write(dir.0.join("package.json"), r#"{"type":"module"}"#).map_err(|e| io("cannot write package.json", e))?;
@@ -201,6 +195,26 @@ pub async fn spawn(
         }
         std::fs::write(&target, content).map_err(|e| io(&format!("cannot write policy file {path:?}"), e))?;
     }
+    Ok(dir)
+}
+
+/// The entry module's file name in a policy dir.
+pub const MODULE: &str = "policy.mjs";
+
+/// Writes the shim and `source` into a fresh temp dir and starts `runtime` on the shim, then waits
+/// (at most `timeout`, host clock) for `{"ready":true}`. Errors carry the module's own load error,
+/// a missing-executable message, or "timed out waiting for the policy to load".
+/// A `tokio` task forwards the child's stderr lines to `on_log`.
+pub async fn spawn(
+    runtime: &Runtime,
+    source: &str,
+    files: &std::collections::BTreeMap<String, String>,
+    timeout: std::time::Duration,
+    on_log: impl Fn(String) + Send + 'static,
+) -> Result<Process, PolicyError> {
+    let (shim, shim_name) = runtime.shim();
+    let dir = write_dir(Some((shim, shim_name)), source, files)?;
+    let module = dir.0.join(MODULE);
 
     let mut child = tokio::process::Command::new(runtime.program())
         .args(runtime.args())

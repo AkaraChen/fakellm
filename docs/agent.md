@@ -187,7 +187,7 @@ export default function decide(request, context) {
 }
 ```
 
-- **默认导出**一个函数（同步或 async），只支持 ES 模块语法；源码被写成临时目录里的 `policy.mjs`，可以用运行时自带的内置模块（`node:fs` 之类）。需要多个文件时用注册对象的 `files`：相对路径到源码的映射（`{"helper.js": "export const f = ...", "lib/x.mjs": "..."}`），连同 `policy.mjs` 一起写进临时目录，入口里就能 `import { f } from "./helper.js"`。路径必须是相对路径、不含 `..`、不能叫 `policy.mjs`，否则 400；临时目录里默认有 `{"type":"module"}` 的 `package.json`（`files` 里自己给一个则以它为准）。`--policy FILE` 仍然只读单个文件。
+- **默认导出**一个函数（同步或 async），只支持 ES 模块语法；源码被写成临时目录里的 `policy.mjs`，可以用运行时自带的内置模块（`tjs` 的 `tjs:path` 之类，`node` / `bun` 的 `node:fs` 之类）。需要多个文件时用注册对象的 `files`：相对路径到源码的映射（`{"helper.js": "export const f = ...", "lib/x.mjs": "..."}`），连同 `policy.mjs` 一起写进临时目录，入口里就能 `import { f } from "./helper.js"`。路径必须是相对路径、不含 `..`、不能叫 `policy.mjs`，否则 400；临时目录里默认有 `{"type":"module"}` 的 `package.json`（`files` 里自己给一个则以它为准）。`--policy FILE` 仍然只读单个文件。
 - `request` 是解析后的请求，和 `GET /_fakellm/requests?full=true` 里的 `request` 完全一样：`messages`（`role`、`content` 是 `{type, text}` 的数组、`tool_calls`、`tool_call_id`）、`tools`、`model`、`stream` 等，文本都是原文，没有去掉 `<system-reminder>`。
 - `context` 有三样：`state`（上一次返回的状态，初始 `{}`）、`hits`（这个策略之前已经做过几次决定，第一次是 0）、`log(...)`（写一行日志）。
 - 返回值是一个回复对象，字段同剧本的 `reply`（`text`、`tool_calls`、`error`、`usage`、`stream` 等），**可以**写 `trajectory` 让某条轨迹来回答这个请求，**不能**写 `policy`；加一个可选的 `state`。规则上的 `stream`、`delay_ms`、`hang*`、`reset`、`usage` 是策略回复的默认值。回复既没有内容、也没有 `error`、`hang` 或 `trajectory` 是 400 `fakellm_policy_error`。
@@ -195,7 +195,7 @@ export default function decide(request, context) {
 
 ### JSONL 协议
 
-fakellm 和运行时之间是按行分隔的 JSON，走子进程的 stdin / stdout。你写策略时不需要关心，它在你想自己实现一个 shim 或排查问题时有用：
+fakellm 和运行时之间是按行分隔的 JSON，走子进程的 stdin / stdout。只有子进程运行时（`node`、`bun`、路径）走它；内置的 `tjs` 在进程内运行，不经过 stdin / stdout。你写策略时不需要关心，它在你想自己实现一个 shim 或排查问题时有用：
 
 ```
 shim -> fakellm   {"ready":true} | {"load_error":"msg"}                  启动时一次
@@ -204,39 +204,43 @@ shim -> fakellm   {"id":7,"reply":{...},"state":{...}}                   返回�
                   {"id":7,"error":"msg"}
 ```
 
-三个内置 shim（`src/policy/shim_node.js`、`shim_bun.js`、`shim_tjs.js`）都编进二进制，运行时写到临时目录。`console.log` / `info` / `debug` 被重定向到 stderr（stdout 留给协议），stderr 的每一行就是策略的日志。
+两个内置 shim（`src/policy/shim_node.js`、`shim_bun.js`）编进二进制，运行时写到临时目录。`console.log` / `info` / `debug` 被重定向到 stderr（stdout 留给协议），stderr 的每一行就是策略的日志。内置 `tjs` 里 `context.log` 和 `console.*` 都直接进日志。
 
 ### 状态
 
-`state` 是 JSON，**替换而不是合并**：回复里带了 `state` 就整个换掉，不带就保持不变。状态存在 fakellm 里，不在脚本进程里，所以进程崩溃、被超时杀掉再重启之后状态还在（`restarts` 计数加一）。`POST` 同名策略（替换）、删除、`reset` 都会让状态归零。
+`state` 是 JSON，**替换而不是合并**：回复里带了 `state` 就整个换掉，不带就保持不变。状态存在 fakellm 里，不在脚本运行时里，所以子进程崩溃、被超时杀掉再重启（内置 `tjs` 是超时后重建运行时）之后状态还在（`restarts` 计数加一）。`POST` 同名策略（替换）、删除、`reset` 都会让状态归零。
 
 同一个策略的决定是**串行**的（所以状态一致）；不同策略并行。失败的决定（超时、崩溃、抛错）不计入 `hits`，也不改状态。
 
 ### 运行时
 
-每个策略一个常驻子进程，注册时启动并加载一次模块（试运行），之后每个请求复用，死了就在下一个请求时重启。
+默认是**内置的 txiki.js**（`tjs`）：QuickJS-ng + libuv 作为静态库链接进 fakellm 二进制，策略在进程内运行，机器上不需要装 node 或 bun，镜像里也不需要。每个策略一个专用的 OS 线程，线程里是它自己的 JS 运行时：注册时创建并加载一次模块（试运行），之后每个请求复用；超时或被打断之后，在下一个请求时重建（`restarts` 加一）。异步代码只把请求发给线程、等回复，所以慢策略不会堵住 Tokio 的工作线程。`node`、`bun` 和可执行文件路径仍然可用，每个策略一个常驻子进程，走上面的 JSONL 协议，死了就在下一个请求时重启。
 
 | 运行时 | 说明 |
 |---|---|
-| `tjs`（[txiki.js](https://github.com/saghul/txiki.js)） | 默认，体积小、启动快；`PATH` 里有它才会选。在 v26.6.0 上测过（见下）。官方没有 Linux 预编译包（release 只有 macOS / Windows），Linux 要自己编译 |
-| `node` | 测试过 |
-| `bun` | 测试过（`bun run`） |
-| 其他路径 | 任意可执行文件；shim 按文件名选（`tjs`、`bun`，其余当 Node） |
+| `tjs`（[txiki.js](https://github.com/saghul/txiki.js)） | 默认，内置，进程内运行（`GET /_fakellm/policies` 里 `in_process: true`）。编进去的是 txiki.js 提交 `e32a7386`（2026-10-31） |
+| `node` | 子进程，测试过。要显式指定，`PATH` 里要有 `node` |
+| `bun` | 子进程，测试过（`bun run`） |
+| 其他路径 | 任意可执行文件，子进程；shim 按文件名选（`bun` 用 Bun 的，其余当 Node） |
 
-选择顺序：注册时的 `runtime` 字段 > `--policy-runtime`（`FAKELLM_POLICY_RUNTIME`）> 在 `PATH` 里依次找 `tjs`、`node`、`bun`。一个都没有时注册返回 400（"no JavaScript runtime found: install node, bun or txiki.js (tjs), or pass runtime"）。
+选择顺序：注册时的 `runtime` 字段 > `--policy-runtime`（`FAKELLM_POLICY_RUNTIME`）> 默认。注册对象里想用子进程时写 `"runtime": "node"`。默认在编译时带了 `tjs` feature（默认开）时是 `tjs`；用 `--no-default-features` 编出来的二进制没有内置运行时，改为在 `PATH` 里依次找 `node`、`bun`，一个都没有时注册返回 400（"no JavaScript runtime found: install node or bun, build fakellm with the `tjs` feature, or pass runtime"），显式写 `tjs` 则 400 并提示缺少 `tjs` feature。
 
-#### txiki.js 说明
+#### 内置 txiki.js 说明
 
-- 编译：`git clone --recursive https://github.com/saghul/txiki.js && cd txiki.js && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8`，产物 `build/tjs`（只需要 cmake、gcc、make，不需要 ninja；约 5 分钟）。
-- shim 用到的 API：`tjs.stdin.getReader()` / `tjs.stdout.getWriter()`（stdio 是 Web Streams，没有 `tjs.stdin.read(buffer)` 这种方法，早先按文档推测写的版本在第一次 `send` 就抛 `not a function`）、`tjs.env`、`tjs.exit`、顶层 `await import()`、`TextEncoder` / `TextDecoder`。策略里要立刻退出用 `tjs.exit(n)`，不是 `process.exit`。
-- 测试：`FAKELLM_TJS=/path/to/tjs cargo test --test policy_tjs`（状态、命中数、日志、崩溃恢复、抛错、decline、坏模块、超时、30 万字节的请求体）。另外把 `tests/policy.rs` 的 23 个场景整体换成 tjs 运行时跑过一遍，22 个通过，剩下一个只是断言运行时名字是 `node`。
+- 可用的 API：完整的 txiki.js 标准库（`tjs.readFile` / `writeFile` / `makeTempDir`、`tjs.env`、`fetch`、`WebSocket`、`crypto.subtle`、`URL`、Web Streams、`TextEncoder` / `TextDecoder`、`structuredClone`、`setTimeout`，以及 `import path from "tjs:path"` 这类 `tjs:` 内置模块）和顶层 `await`。没有 `process`，也没有 `node:*` 模块；用 Node API 写的策略要换成 `tjs.*`，或者显式指定 `node`。
+- 超时：`--policy-timeout-ms` 是真实时间。死循环（`for (;;) {}`）和一直挂着的 `await` 都会被打断，不用等到它自己结束；超时后这个运行时被丢弃，下一个请求建一个新的，模块里的变量（比如 `let calls = 0`）从头来，fakellm 保存的 `state` 和 `hits` 不变。一个永远不会完成的 Promise（事件循环里已经没有任何东西在等）直接报 400 `fakellm_policy_error`，不会挂到超时。
+- 隔离是弱的：策略和 fakellm 在同一个进程里，**`tjs.exit()` 和 `tjs.kill(tjs.pid, …)` 会结束整个 fakellm**，原生层面的崩溃也会带走服务器。JS 堆上限 512 MiB，超过是策略自己的错误。需要把策略关在进程外时，显式用 `node` 或 `bun`。
+- 线程：每个策略一个线程（栈 16 MiB，虚拟内存，用多少占多少）；替换、删除、`reset`、还原快照、热加载和 `Server::shutdown` 都会取消正在进行的决定（那个请求得到 500 `fakellm_policy_crashed`）并让线程退出；等线程退出是在后台的单独线程里做的，不会占住异步工作线程，策略的临时目录也要等线程真正退出后才删除（超过 3 秒没退出会记一条警告，仍继续等）。策略用了异步文件系统 API 之后，libuv 会在进程里留下最多 4 个工作线程，直到进程退出。
+- 日志：每次决定最多保留 1000 行、每行最多 8 KB，超出的行丢弃并记一条“丢了多少行”；死循环里不停 `console.log` 不会撑爆内存。
+- 构建：`cargo build` 默认带它，不要用 `git clone --recursive`（会拉下用不到的嵌套子模块），用 `tjs-sys/fetch-sources.sh`；需要 cmake、make、C 和 C++ 编译器，以及 `third_party/txiki.js` 的 git 子模块（缺了 `tjs-sys/build.rs` 会报错并打印要跑的命令：`git submodule update --init --depth 1 third_party/txiki.js && git -C third_party/txiki.js submodule update --init --depth 1 deps/libuv deps/quickjs deps/mbedtls deps/libwebsockets && git -C third_party/txiki.js/deps/mbedtls submodule update --init --depth 1 framework`）。冷编译多约 45 秒，release 二进制大约多 5 MB（9.1 MB 到 14.3 MB，strip 后 12.7 MB）。不要它：`cargo build --no-default-features`，这时策略只能用 node / bun。目前只支持 Linux 和 macOS。
+- 测试：`tests/policy.rs` 的每个场景在默认运行时和显式 `node` 上各跑一遍，另有 tjs 专属的用例（`tjs.*` API、死循环超时、取消、客户端断开）；`tests/policy_threads.rs` 数线程；`tests/bin.rs` 用空的 `PATH` 启动二进制跑策略。
 
 ### 注册
 
 ```bash
 fakellm --policy reader.mjs                    # 策略名是文件名去掉扩展名：reader
 curl -X PUT $E/_fakellm/policies -H 'content-type: application/json' \
-  -d '{"name": "reader", "runtime": "node", "source": "export default () => ({ text: \"hi\" })"}'
+  -d '{"name": "reader", "source": "export default () => ({ text: \"hi\" })"}'
 ```
 
 `PUT|POST /_fakellm/policies` 收一个 `{name, source, runtime?, files?}`、一个数组或 `{"policies": [...]}`（JSON 或 YAML）。名字只能用字母、数字、`.`、`_`、`-`。注册时会先加载一次模块：语法错误、没有默认导出函数、运行时起不来都是 400，信息里带模块自己的错误，已有的策略不会被改动。`PUT` 是全量替换（被换掉的策略的进程和状态都清掉），`POST` 同名替换。`--policy` 加载失败时 fakellm 启动失败。
@@ -245,25 +249,25 @@ curl -X PUT $E/_fakellm/policies -H 'content-type: application/json' \
 
 | 情况 | 结果 |
 |---|---|
-| 超过 `--policy-timeout-ms`（默认 5000，**真实时间**，不跟虚拟时钟走）没有答复 | 杀掉进程，500 `fakellm_policy_timeout`；下个请求重启 |
-| 进程退出或管道断了 | 500 `fakellm_policy_crashed`；下个请求重启 |
+| 超过 `--policy-timeout-ms`（默认 5000，**真实时间**，不跟虚拟时钟走）没有答复 | 杀掉子进程（`tjs`：打断脚本并丢弃运行时），500 `fakellm_policy_timeout`；下个请求重启 / 重建 |
+| 子进程退出或管道断了（`tjs`：运行时被取消，或线程死了） | 500 `fakellm_policy_crashed`；下个请求重启 / 重建 |
 | 脚本抛错、返回不合法的回复、回复里有 `policy` | 400 `fakellm_policy_error`，带脚本自己的消息 |
 | 名字没注册 | 400 `fakellm_policy_not_found` |
 
-只有超时和崩溃是 500，因为 SDK 会重试 500，而重试一个有 bug 的策略没有意义。删除、`reset`、替换策略以及服务退出（包括 SIGINT / SIGTERM）都会杀掉子进程，包括正在决定中的那个，并删掉临时目录。
+只有超时和崩溃是 500，因为 SDK 会重试 500，而重试一个有 bug 的策略没有意义。删除、`reset`、替换策略、还原快照、热加载以及服务退出（包括 SIGINT / SIGTERM）都会停掉运行时（杀掉子进程，或取消并等 `tjs` 线程退出），包括正在决定中的那个，并删掉临时目录。客户端在决定中途断开连接也一样：那个运行时被丢弃，下一个请求重建，所以不会有请求排在一个已经没人等的决定后面。
 
 ### 控制面
 
 | 路径 | 作用 |
 |---|---|
-| `GET /_fakellm/policies` | 列表：`name`、`runtime`、`running`、`hits`、`restarts`、`state`、`log`（最近 200 行 stderr） |
+| `GET /_fakellm/policies` | 列表：`name`、`runtime`、`in_process`（`tjs` 为 `true`）、`running`、`hits`、`restarts`、`state`、`log`（最近 200 行：子进程的 stderr，或 `tjs` 里的 `context.log` / `console.*`） |
 | `PUT` / `POST /_fakellm/policies` | 替换全部 / 追加（同名替换，状态重置） |
 | `DELETE /_fakellm/policies` | 清空 |
 | `GET` / `DELETE /_fakellm/policies/{name}` | 读 / 删一个 |
 
 ### 安全
 
-**注册策略就是在运行 fakellm 的机器上以它的用户身份执行代码**，`runtime` 还可以是任意可执行文件的路径。控制面没有认证（见[控制面的安全一节](control-plane.md#安全)），所以不要绑定 `0.0.0.0`，也不要让不可信的调用方访问控制面，不需要策略时不要用 `--policy`。官方 Docker 镜像（alpine）里没有 JS 运行时，策略在里面跑不起来；需要的话基于它做一个派生镜像（`apk add nodejs`），或者只用轨迹。
+**注册策略就是在运行 fakellm 的机器上以它的用户身份执行代码**，内置的 `tjs` 就在 fakellm 进程里（能读写文件、联网，也能 `tjs.exit()` 结束服务器），`runtime` 还可以是任意可执行文件的路径。控制面没有认证（见[控制面的安全一节](control-plane.md#安全)），所以不要绑定 `0.0.0.0`，也不要让不可信的调用方访问控制面，不需要策略时不要用 `--policy`。官方 Docker 镜像（alpine）带着内置的 `tjs`，策略直接能跑；`node` / `bun` 子进程运行时需要 `fakellm:node` 变体。
 
 ## 示例一：回放一次修复，并改写工具名
 
@@ -313,7 +317,7 @@ fakellm --policy reader.mjs --scripts rules.yaml &
 agent 的每个请求会得到：`read_file` → `edit_file` →（结果带 error 就）再来一次 `edit_file` → 再带 error 就回复“修改失败，放弃。”，成功就回复“完成。”。`GET /_fakellm/policies/reader` 看得到最终的状态和 `log`：
 
 ```json
-{"name":"reader","runtime":"node","running":true,"hits":4,"restarts":0,"state":{"stage":"gave_up","failures":2},
+{"name":"reader","runtime":"tjs","in_process":true,"running":true,"hits":4,"restarts":0,"state":{"stage":"gave_up","failures":2},
  "log":["hit 0 stage ","hit 1 stage read","hit 2 stage edit","hit 3 stage edit"]}
 ```
 
@@ -345,8 +349,8 @@ agent 的每个请求会得到：`read_file` → `edit_file` →（结果带 err
 
 ## 已知限制
 
-- `tjs`、`node`、`bun` 的 shim 都在真实运行时上测过；`tjs` 的测试需要 `FAKELLM_TJS` 指向二进制，否则跳过。
+- 内置 `tjs`、`node`、`bun` 都在真实运行时上测过（`tests/policy.rs`、`tests/policy_protocols.rs`）。早先的外部 `tjs` 子进程 shim 已经移除：显式写 `tjs` 现在总是指内置的那个，指向一个叫 `tjs` 的可执行文件路径会被当作 Node 兼容的运行时。
 - `fakellm ctl` 没有 trajectories / policies 子命令，用 curl、`sdk/js`、`bindings/node` 或 Go helper。
 - 策略不能 import 相对路径的其他文件。
-- `bindings/node` 的 `policies.put` / `add` 返回 Promise，子进程在工作线程里加载，不阻塞 JS 线程；`snapshots.restore` 还原策略时仍是同步的（要重启子进程，会阻塞）。
+- `bindings/node` 的 `policies.put` / `add` 返回 Promise，策略在工作线程里加载，不阻塞 JS 线程；`snapshots.restore` 还原策略时仍是同步的（要重新创建运行时，会阻塞）。
 - `bindings/node` 的 `npm test` 只覆盖到 OpenAI 路径上的轨迹和策略；Responses 与 Anthropic 路径由 `tests/agent.rs`、`tests/policy.rs` 和 `sdk/node` 覆盖。

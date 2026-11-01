@@ -1,0 +1,5 @@
+[submodule "third_party/txiki.js"]
+	path = third_party/txiki.js
+	url = https://github.com/saghul/txiki.js
+	ignore = dirty
+	shallow = true

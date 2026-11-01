@@ -248,6 +248,7 @@ export interface SnapshotInfo {
   responses: number;
 }
 
+/** `tjs` is txiki.js embedded in the fakellm binary (in-process, the default); `node`, `bun` and paths run a subprocess. */
 export type PolicyRuntime = 'tjs' | 'node' | 'bun' | (string & {});
 
 /** A policy script: an ES module whose default export is `decide(request, context)`. */
@@ -265,6 +266,8 @@ export interface Policy {
 export interface PolicyInfo {
   name: string;
   runtime: string;
+  /** Runs inside the fakellm process (`tjs`) rather than as a subprocess. */
+  in_process: boolean;
   running: boolean;
   hits: number;
   restarts: number;
@@ -409,7 +412,7 @@ export interface StartOptions {
   watch?: boolean;
   /** Policies registered at start; a module that does not load makes `start()` reject. */
   policies?: Policy[];
-  /** Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: tjs, node, bun, whichever is on PATH first. */
+  /** Runtime for policies that name none: `tjs`, `node`, `bun` or a path. Default: tjs, the runtime embedded in the binary. */
   policyRuntime?: PolicyRuntime;
   /** How long a policy may take to decide, in milliseconds on the host clock. Default 5000. */
   policyTimeoutMs?: number;

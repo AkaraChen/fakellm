@@ -1,0 +1,22 @@
+[package]
+name = "tjs-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Embeds the txiki.js JavaScript runtime (QuickJS + libuv) as a static library, for fakellm policy scripts"
+license = "MIT"
+repository = "https://github.com/AkaraChen/fakellm"
+rust-version = "1.88"
+links = "tjs"
+build = "build.rs"
+# The txiki.js sources (a git submodule at ../third_party/txiki.js, about 145 MB with the four nested submodules it needs)
+# are not part of the package, so this crate cannot go to crates.io as is (the limit is 10 MB).
+publish = false
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
+
+[dev-dependencies]
+serde_json = "1"

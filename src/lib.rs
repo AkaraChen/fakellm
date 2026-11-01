@@ -143,7 +143,8 @@ pub struct Config {
     /// Policy scripts registered at start (`--policy FILE`; the name is the file stem). Starting fails
     /// when a module does not load.
     pub policies: Vec<PolicySpec>,
-    /// Runtime for policies that name none; `None` picks `tjs`, `node` or `bun`, in that order, from `PATH`.
+    /// Runtime for policies that name none. `None` picks the embedded `tjs` (in-process) when this build has the `tjs`
+    /// feature (the default), else `node` or `bun`, in that order, from `PATH`.
     pub policy_runtime: Option<Runtime>,
     /// How long a policy may take to decide, in host-clock milliseconds.
     pub policy_timeout_ms: u64,

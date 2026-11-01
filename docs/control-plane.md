@@ -22,7 +22,7 @@ fakellm ctl requests list --rule step-1 --status 4xx
 **控制面没有认证**，包括配了 `--api-key` 的时候（`--api-key` 只管 API 路径）。任何连得上端口的人都能清空剧本、改时钟。
 这是一个测试服务，默认只监听 `127.0.0.1`；改成 `--host 0.0.0.0` 之前请想清楚。
 
-**注册策略脚本等于远程代码执行。** `PUT|POST /_fakellm/policies` 的 `source` 会作为 JS 在子进程里运行，`runtime` 还可以是任意可执行文件的路径；
+**注册策略脚本等于远程代码执行。** `PUT|POST /_fakellm/policies` 的 `source` 会作为 JS 运行：默认在 fakellm 进程里（内置的 txiki.js），`runtime` 选 `node` / `bun` 时在子进程里，还可以是任意可执行文件的路径；
 控制面没有认证，所以任何连得上端口的人都能以 fakellm 进程的用户身份执行代码。这是不要绑定 `0.0.0.0` 的又一个理由；需要远程访问时请放在受信任的网络里，或不要注册策略（不要用 `--policy`，也不要让不可信的调用方访问控制面）。
 
 唯一的防护：带 `Origin` 头的非 GET 请求会被拒绝（403），防止用户浏览器里打开的网页向 `localhost` 发跨站 POST 把服务清空。
@@ -63,7 +63,7 @@ $ curl -X POST -H 'Origin: http://evil.example' $E/_fakellm/reset
 | `trajectories list` / `get NAME [--jsonl]` | `GET /_fakellm/trajectories[/NAME]`，文本输出每条轨迹一行（步数、命中数、cursor、on_divergence） |
 | `trajectories put FILE` / `add FILE` | `PUT` / `POST /_fakellm/trajectories`，JSON、JSONL 或 YAML 文件 |
 | `trajectories delete NAME` / `clear` | `DELETE /_fakellm/trajectories[/NAME]` |
-| `policies list` / `get NAME` | `GET /_fakellm/policies[/NAME]`，文本输出名字、运行时、命中数和子进程是否在运行 |
+| `policies list` / `get NAME` | `GET /_fakellm/policies[/NAME]`，文本输出名字、运行时、命中数和运行时是否在运行（JSON 里还有 `in_process`） |
 | `policies put FILE [--name N] [--runtime R]` / `add FILE ...` | `PUT` / `POST /_fakellm/policies`。`FILE` 是 ES 模块（`.js` / `.mjs` / `.cjs`，以文件名或 `--name` 作为策略名）或 JSON / YAML 注册体 `{name, source, runtime?}`；模块加载失败时服务器返回 400，命令退出码非 0 |
 | `policies delete NAME` / `clear` | `DELETE /_fakellm/policies[/NAME]` |
 | `cassettes list` / `get NAME` | `GET /_fakellm/cassettes[/NAME]`；`get recording` 是上游录到的内容 |
@@ -137,7 +137,7 @@ $ curl -X POST "$E/_fakellm/reset?clock=false&requests=false"
 {"reset":true}
 ```
 
-默认清空四样东西（另外 cassette 和录制随 `scripts` 一起清空；快照默认保留，`?snapshots=true` 才删）：剧本（包括命中计数，同时清掉全部轨迹和策略脚本并杀掉它们的子进程）、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项；`snapshots=true` 额外删除全部快照（默认保留）。
+默认清空四样东西（另外 cassette 和录制随 `scripts` 一起清空；快照默认保留，`?snapshots=true` 才删）：剧本（包括命中计数，同时清掉全部轨迹和策略脚本并停掉它们的运行时（子进程被杀掉，内置运行时的线程被取消并 join））、请求日志、时钟（回到宿主机时间）、保存的 Responses 对象。查询参数 `clock` / `requests` / `scripts` / `responses` 设为 `false` 可以保留对应的那一项；`snapshots=true` 额外删除全部快照（默认保留）。
 
 - 挂起（`hang`）的请求一被挂住就以 `status: 0`、`hung: true` 记入日志，放行或客户端放弃时原地更新；错误延迟或同步回复延迟期间客户端断开的请求，以 `status: 0` 记入日志。如果期间发生过清空请求日志的 `reset`，这些记录会被丢弃，不会污染新的日志。
 - `reset` 会唤醒所有挂起的请求：有 `hang_ms` 的按规则的其余部分回答，只写 `hang: true` 的回 503。
@@ -226,7 +226,7 @@ $ curl $E/_fakellm/snapshots
 $ curl -X DELETE $E/_fakellm/snapshots/after-login      # DELETE /_fakellm/snapshots 删全部
 ```
 
-`reset` 默认**保留**快照，`?snapshots=true`（`ctl reset --drop-snapshots`）才删。快照里的 cassette 是共享的，不复制；还原策略总会重启它的子进程。命令行：`fakellm ctl cassettes list|put|add|get|delete|clear`，`fakellm ctl snapshot create|list|restore|delete`。
+`reset` 默认**保留**快照，`?snapshots=true`（`ctl reset --drop-snapshots`）才删。快照里的 cassette 是共享的，不复制；还原策略总会重新创建它的运行时（新的子进程，或新的内置运行时线程）。命令行：`fakellm ctl cassettes list|put|add|get|delete|clear`，`fakellm ctl snapshot create|list|restore|delete`。
 
 ### 时钟
 

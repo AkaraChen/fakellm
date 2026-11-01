@@ -1,5 +1,6 @@
-//! Policy scripts on every wire format (Chat, Responses, Anthropic Messages) and on every JavaScript runtime found
-//! on PATH (node, bun, tjs). Runtimes that are not installed are skipped with a notice.
+//! Policy scripts on every wire format (Chat, Responses, Anthropic Messages) and on every JavaScript runtime available:
+//! the embedded `tjs` (cargo feature, on by default) and `node` and `bun` when found on PATH. Runtimes that are not
+//! available are skipped with a notice. `"default"` below means no `runtime` field: whatever the server defaults to.
 
 use std::process::Command;
 
@@ -12,22 +13,30 @@ mod protocols;
 use protocols::*;
 
 fn have(runtime: &str) -> bool {
-    let ok = Command::new(runtime).arg("--version").output().is_ok();
+    let ok = match runtime {
+        "tjs" => cfg!(feature = "tjs"),
+        "default" => cfg!(feature = "tjs") || Command::new("node").arg("--version").output().is_ok(),
+        other => Command::new(other).arg("--version").output().is_ok(),
+    };
     if !ok {
         eprintln!("skip: {runtime} not on PATH");
     }
     ok
 }
 
-const RUNTIMES: [&str; 3] = ["node", "bun", "tjs"];
+const RUNTIMES: [&str; 3] = ["tjs", "node", "bun"];
 
 async fn add_policy(s: &fakellm::Server, name: &str, source: &str, runtime: &str) {
+    let mut spec = json!({"name": name, "source": source});
+    if runtime != "default" {
+        spec["runtime"] = json!(runtime);
+    }
     let r = send(
         s,
         "PUT",
         "/_fakellm/policies",
         &[("content-type", "application/json")],
-        &json!({"name": name, "source": source, "runtime": runtime}).to_string(),
+        &spec.to_string(),
     )
     .await;
     assert_eq!(r.status, 200, "{runtime}: {}", r.body);
@@ -102,13 +111,13 @@ async fn agent_loop_on_every_protocol_and_runtime() {
 /// What the policy is shown is the same on every protocol: roles, tool results as `tool` messages, offered tools.
 #[tokio::test]
 async fn the_policy_sees_one_normalized_request() {
-    if !have("node") {
+    if !have("default") {
         return;
     }
     let src = "export default (req) => ({ text: JSON.stringify({ protocol: req.protocol, roles: req.messages.map((m) => m.role), tools: (req.tools ?? []).map((t) => t.name ?? t.function?.name), stream: !!req.stream }) });";
     for p in ALL {
         let s = start().await;
-        add_policy(&s, "peek", src, "node").await;
+        add_policy(&s, "peek", src, "default").await;
         attach(&s, "peek").await;
         let r = p.send(&s, "go", &[call_turn("c1", "read_file", json!({}), "data")], &TOOLS).await;
         let seen: Value = serde_json::from_str(&p.text(&r)).unwrap();
@@ -120,7 +129,7 @@ async fn the_policy_sees_one_normalized_request() {
 
 #[tokio::test]
 async fn declines_fall_through_on_every_protocol() {
-    if !have("node") {
+    if !have("default") {
         return;
     }
     for p in ALL {
@@ -129,7 +138,7 @@ async fn declines_fall_through_on_every_protocol() {
             &s,
             "picky",
             "export default (r) => r.tools?.length ? { text: 'policy' } : { decline: true };",
-            "node",
+            "default",
         )
         .await;
         put_rules(&s, json!([{"reply": {"policy": "picky"}}, {"reply": {"text": "other"}}])).await;
@@ -142,18 +151,18 @@ async fn declines_fall_through_on_every_protocol() {
 
 #[tokio::test]
 async fn policy_errors_keep_the_protocol_envelope() {
-    if !have("node") {
+    if !have("default") {
         return;
     }
     for p in ALL {
         let s = start().await;
-        add_policy(&s, "p", "export default () => { throw new Error('boom from policy'); };", "node").await;
+        add_policy(&s, "p", "export default () => { throw new Error('boom from policy'); };", "default").await;
         attach(&s, "p").await;
         let r = p.send(&s, "x", &[], &[]).await;
         assert_eq!(r.status, 400, "{p:?}: {}", r.body);
         assert!(p.error_message(&r).contains("boom from policy"), "{p:?}: {}", r.body);
 
-        add_policy(&s, "p", "export default () => ({});", "node").await;
+        add_policy(&s, "p", "export default () => ({});", "default").await;
         assert_eq!(p.send(&s, "x", &[], &[]).await.status, 400, "{p:?}");
 
         put_rules(&s, json!([{"reply": {"policy": "ghost"}}])).await;
@@ -165,7 +174,7 @@ async fn policy_errors_keep_the_protocol_envelope() {
 
 #[tokio::test]
 async fn policy_error_replies_and_delivery_defaults_on_every_protocol() {
-    if !have("node") {
+    if !have("default") {
         return;
     }
     for p in ALL {
@@ -174,7 +183,7 @@ async fn policy_error_replies_and_delivery_defaults_on_every_protocol() {
             &s,
             "p",
             "export default (r) => r.messages.at(-1).role === 'tool' ? { error: { status: 529, message: 'busy' } } : { text: 'alpha beta gamma delta' };",
-            "node",
+            "default",
         )
         .await;
         put_rules(
@@ -199,7 +208,7 @@ async fn policy_error_replies_and_delivery_defaults_on_every_protocol() {
 
 #[tokio::test]
 async fn streamed_policy_answers_on_every_protocol() {
-    if !have("node") {
+    if !have("default") {
         return;
     }
     for p in ALL {
@@ -208,7 +217,7 @@ async fn streamed_policy_answers_on_every_protocol() {
             &s,
             "p",
             "export default () => ({ text: 'streamed from policy', tool_calls: [{ name: 'read_file', arguments: { path: 'z.rs' } }] });",
-            "node",
+            "default",
         )
         .await;
         attach(&s, "p").await;
@@ -225,7 +234,7 @@ async fn streamed_policy_answers_on_every_protocol() {
 
 #[tokio::test]
 async fn policy_may_pick_a_trajectory_on_every_protocol() {
-    if !have("node") {
+    if !have("default") {
         return;
     }
     for p in ALL {
@@ -239,7 +248,7 @@ async fn policy_may_pick_a_trajectory_on_every_protocol() {
         )
         .await;
         assert_eq!(r.status, 200, "{}", r.body);
-        add_policy(&s, "router", "export default () => ({ trajectory: 'script' });", "node").await;
+        add_policy(&s, "router", "export default () => ({ trajectory: 'script' });", "default").await;
         attach(&s, "router").await;
         assert_eq!(p.text(&p.send(&s, "go", &[], &[]).await), "first", "{p:?}");
         assert_eq!(
@@ -252,12 +261,12 @@ async fn policy_may_pick_a_trajectory_on_every_protocol() {
 
 #[tokio::test]
 async fn request_log_marks_policy_answers_on_every_protocol() {
-    if !have("node") {
+    if !have("default") {
         return;
     }
     for p in ALL {
         let s = start().await;
-        add_policy(&s, "p", "export default () => ({ text: 'logged' });", "node").await;
+        add_policy(&s, "p", "export default () => ({ text: 'logged' });", "default").await;
         put_rules(&s, json!([{"name": "r", "reply": {"policy": "p"}}])).await;
         p.send(&s, "x", &[], &[]).await;
         let reqs = log(&s, "source=script").await;

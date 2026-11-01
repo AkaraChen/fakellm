@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # txiki.js is embedded in the binary: its git submodules are part of the build
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,21 +27,43 @@ jobs:
       - run: npm ci
         working-directory: sdk/node
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
-  # The crate has cfg(unix) fallbacks (RST, signals); this only proves it compiles on the other hosts.
+  # The crate has cfg(unix) fallbacks (RST, signals); this only proves it compiles on the other hosts. The embedded
+  # txiki.js (feature `tjs`) builds on Linux and macOS only, so Windows checks the crate without it.
   compile:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            flags: ""
+          - os: windows-latest
+            flags: --no-default-features
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # the embedded txiki.js builds from git submodules (not on Windows, which checks without it)
+        if: runner.os != 'Windows'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
+      - run: cargo check ${{ matrix.flags }}
+
+  # A build without the embedded txiki.js: policies then need node (or bun) on PATH, and no cmake or submodules are involved.
+  no-tjs:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - run: cargo test --no-default-features --lib --test policy --test policy_protocols --test snapshots --test watch --test bin
 
   node:
     runs-on: ubuntu-24.04
@@ -48,6 +71,7 @@ jobs:
       FAKELLM_BIN: ${{ github.workspace }}/target/debug/fakellm
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # txiki.js is embedded in the binary: its git submodules are part of the build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v7
@@ -73,6 +97,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # txiki.js is embedded in the binary: its git submodules are part of the build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v7
@@ -90,6 +115,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # txiki.js is embedded in the binary: its git submodules are part of the build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -107,6 +133,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # txiki.js is embedded in the binary: its git submodules are part of the build
       - run: ./e2e/docker.sh
 
   python:
@@ -115,6 +142,7 @@ jobs:
       FAKELLM_BIN: ${{ github.workspace }}/target/debug/fakellm
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # txiki.js is embedded in the binary: its git submodules are part of the build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v6

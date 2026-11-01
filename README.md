@@ -35,7 +35,8 @@ Anthropic 请求里 Claude Code 常常先发一条只有 `<system-reminder>` 块
 ## 快速开始
 
 ```bash
-cargo build --release
+tjs-sys/fetch-sources.sh      # 取 txiki.js 的 git 子模块（内置的策略运行时从源码编，约 150 MB）；不要用 git clone --recursive，它会连带拉下用不到的嵌套子模块
+cargo build --release         # 需要 cmake、make 和 C / C++ 编译器；不要内置运行时就加 --no-default-features
 ./target/release/fakellm --port 0      # 0 表示随机选一个空闲端口，实际地址会打印到 stdout
 # http://127.0.0.1:41873
 export PATH=$PWD/target/release:$PATH            # 后面的 fakellm ctl / wire 命令直接用
@@ -439,7 +440,7 @@ agent 框架 ──messages + tools──▶ fakellm（扮演模型）
 ```
 
 - **轨迹（trajectory）**：一次运行写成回合列表（JSON、YAML 或 JSONL），按请求里的历史选步骤，所以重试和并行对话互不干扰；每步可以用 `expect` 检查客户端送回来的工具结果，偏离时 `strict` 报 400 并给出差异、`lenient` 照常继续、`stop` 直接收尾；`tool_map` 把数据集里的工具名和参数（`bash {command}`）改写成你的 agent 的写法（`run_shell {cmd}`）。
-- **策略脚本（policy）**：一个 JS 模块 `decide(request, context)` 看请求返回回复，状态由 fakellm 保存；返回 `null` 或 `{decline: true}` 表示“不归我”，请求落到后面的规则；运行时是 txiki.js（`tjs`）、Node 或 Bun。**注册策略就是在本机执行代码**，不要把控制面暴露出去。
+- **策略脚本（policy）**：一个 JS 模块 `decide(request, context)` 看请求返回回复，状态由 fakellm 保存；返回 `null` 或 `{decline: true}` 表示“不归我”，请求落到后面的规则；默认在进程内运行：txiki.js（`tjs`，QuickJS + libuv）作为静态库编进了二进制，机器上不需要 node；也可以显式选 Node 或 Bun 子进程。**注册策略就是在本机执行代码**，不要把控制面暴露出去。
 
 ```bash
 fakellm --trajectory fix-bug.yaml --policy reader.mjs --scripts rules.yaml
@@ -499,7 +500,11 @@ const b = await openai.responses.create({ model: 'gpt-5.5', input: 'and again', 
 ```toml
 [dev-dependencies]
 fakellm = { git = "https://github.com/AkaraChen/fakellm" }
+# 不需要策略脚本的话，不要内置的 txiki.js（省掉 cmake、git 子模块和约 5 MB）：
+# fakellm = { git = "https://github.com/AkaraChen/fakellm", default-features = false }
 ```
+
+默认特性 `tjs` 会把 txiki.js 编进去，作为 git 依赖时 cargo 会连子模块一起取，编译需要 cmake 和 C / C++ 编译器；关掉它之后策略脚本只能用 `node` / `bun` 子进程。
 
 异步测试：
 
@@ -552,9 +557,9 @@ docker run --rm -p 4010:4010 fakellm
 
 - 镜像基于 Alpine，里面只有一个静态链接的 musl 二进制，以非 root 用户（uid 10001）运行；默认监听 `0.0.0.0:4010`（`FAKELLM_HOST` / `FAKELLM_PORT`），配置项见[配置](#配置)，环境变量和命令行参数都可以，如 `docker run fakellm --strict`。启动完成后 stdout 第一行是 `http://0.0.0.0:4010`，可以作为就绪信号。
 - 带 `HEALTHCHECK`（`GET /_fakellm`），只跟随 `FAKELLM_PORT`；用 `--port` 参数改端口，或只跑 `wire` / `ctl` 这类一次性命令时加 `docker run --no-healthcheck`。
-- 默认镜像里没有 JS 运行时，[策略脚本](docs/agent.md#策略脚本)跑不起来（轨迹不受影响）：注册策略时得到 400 `no JavaScript runtime found: ...`。要用策略就用 node 变体 `fakellm:node`（`Dockerfile.node`，`node:22-alpine` 加同一个静态二进制，环境变量 `FAKELLM_POLICY_RUNTIME=node`；发布后的 tag 是 `node` 和 `<版本>-node`），本地构建：`docker build -f Dockerfile.node -t fakellm:node .`。
+- 二进制里内置了 txiki.js，所以默认镜像里[策略脚本](docs/agent.md#策略脚本)直接能跑，不需要 JS 运行时。要让策略跑在 `node` 子进程里（`"runtime": "node"`）就用 node 变体 `fakellm:node`（`Dockerfile.node`，`node:22-alpine` 加同一个静态二进制；发布后的 tag 是 `node` 和 `<版本>-node`），本地构建：`docker build -f Dockerfile.node -t fakellm:node .`。两个镜像都从 `third_party/txiki.js` 的 git 子模块构建，`docker build` 之前先跑一次 `tjs-sys/fetch-sources.sh`。
 - 控制面没有认证，容器里监听 `0.0.0.0`：只发布到本机（`-p 127.0.0.1:4010:4010`），不要暴露到公网。
-- 发布后的 tag 是 `latest`、完整版本（`0.1.0`）、`主版本.次版本`（`0.1`）和提交短 sha；手动触发 release 工作流时 `publish` 默认是 `false`，只构建和冒烟测试。`e2e/docker.sh` 是本地的镜像冒烟脚本：构建两个镜像，随机端口启动，请求一次 chat completion；默认镜像必须拒绝策略，node 变体必须跑通一个策略。
+- 发布后的 tag 是 `latest`、完整版本（`0.1.0`）、`主版本.次版本`（`0.1`）和提交短 sha；手动触发 release 工作流时 `publish` 默认是 `false`，只构建和冒烟测试。`e2e/docker.sh` 是本地的镜像冒烟脚本：构建两个镜像，随机端口启动，请求一次 chat completion；两个镜像都必须在内置运行时上跑通一个策略，默认镜像必须拒绝 `runtime: node` 的策略（没装 node），node 变体必须在 node 上也跑通。
 
 ### 在 Testcontainers 里使用
 
@@ -667,7 +672,7 @@ test('agent 调用工具', async () => {
 
 ## Node.js 原生绑定（bindings/node）
 
-[`bindings/node`](bindings/node/) 是一个 [napi-rs](https://napi.rs) 插件，服务器直接跑在 Node / Bun 进程里：不起子进程、不需要二进制，也不用协商端口。包名 `@fakellm/native`，**尚未发布到 npm**（`node.yml` 在推送 `v*` tag 时发布，其余情况只做 `npm publish --dry-run`）。控制面的操作是同步方法，不走 HTTP；例外是 `policies.put` / `add`，它们要启动并加载策略子进程（约 100 ms），所以返回 Promise，在工作线程里做，不阻塞 JS 线程：`await server.policies.put([...])`：
+[`bindings/node`](bindings/node/) 是一个 [napi-rs](https://napi.rs) 插件，服务器直接跑在 Node / Bun 进程里：不起子进程、不需要二进制，也不用协商端口。包名 `@fakellm/native`，**尚未发布到 npm**（`node.yml` 在推送 `v*` tag 时发布，其余情况只做 `npm publish --dry-run`）。控制面的操作是同步方法，不走 HTTP；例外是 `policies.put` / `add`，它们要创建并加载策略的运行时（内置 `tjs` 几毫秒，子进程约 100 ms），所以返回 Promise，在工作线程里做，不阻塞 JS 线程：`await server.policies.put([...])`：
 
 ```js
 import { createRequire } from 'node:module';
@@ -738,7 +743,7 @@ func TestAgent(t *testing.T) {
 | `--args-chunk-bytes` | `FAKELLM_ARGS_CHUNK_BYTES` | `16` | 流式工具调用参数每个分片的字节数（至少 1），三种协议通用 |
 | `--trajectory` | `FAKELLM_TRAJECTORIES` | 无 | 启动时加载的轨迹文件，可重复；格式按扩展名（`.json`、`.jsonl` / `.ndjson`、`.yaml` / `.yml`），其他按内容判断。不合法则启动失败 |
 | `--policy` | `FAKELLM_POLICIES` | 无 | 启动时加载的策略脚本（ES 模块，导出默认函数 `decide`），可重复；策略名是文件名去掉扩展名；加载失败则启动失败 |
-| `--policy-runtime` | `FAKELLM_POLICY_RUNTIME` | 自动 | 策略脚本的运行时：`tjs`、`node`、`bun` 或可执行文件路径；默认按 `tjs`、`node`、`bun` 的顺序在 `PATH` 里找 |
+| `--policy-runtime` | `FAKELLM_POLICY_RUNTIME` | `tjs` | 策略脚本的运行时：`tjs`（编进二进制的 txiki.js，进程内运行）、`node`、`bun`（子进程）或可执行文件路径。`--no-default-features` 编出来的二进制没有内置运行时，默认改为按 `node`、`bun` 的顺序在 `PATH` 里找 |
 | `--policy-timeout-ms` | `FAKELLM_POLICY_TIMEOUT_MS` | `5000` | 一个策略做一次决定的时限（真实时间，不跟虚拟时钟）；超时杀掉进程并返回 500 |
 | `--cassette` | `FAKELLM_CASSETTES` | 无 | 启动时加载的 cassette 文件，可重复；JSON、YAML 或 JSONL。没有剧本规则命中的请求按含义在里面查找，见 [docs/cassette.md](docs/cassette.md)。不合法则启动失败 |
 | `--upstream` | `FAKELLM_UPSTREAM` | 无 | 没有剧本和 cassette 命中的请求转发到这个 OpenAI 兼容或 Anthropic 服务（`http://` 或 `https://`，不能带用户名密码），并记录回答 |
@@ -817,13 +822,13 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 | 套件 | 命令 | 当前结果 |
 |---|---|---|
 | 格式与 lint | `cargo fmt --check`；`cargo clippy --all-targets -- -D warnings` | 干净 |
-| Rust 单元和集成测试 | `cargo test` | 551 个通过：库 251、二进制 12、`tests/*.rs` 28 个文件共 286（含 `faults.rs`、`agent_protocols.rs`、`custom_protocols.rs`、`python_sdk.rs`）、文档测试 2 |
+| Rust 单元和集成测试 | `cargo test` | 605 个通过（`cargo test --workspace`）：库 252、二进制 12、`tests/*.rs` 28 个文件共 317（含 `faults.rs`、`agent_protocols.rs`、`custom_protocols.rs`、`python_sdk.rs`）、文档测试 2、`tjs-sys` 22；`--no-default-features` 下 573 个通过 |
 | 官方 SDK 套件（`sdk/node`） | 先 `cd sdk/node && npm ci`；`cargo test` 里的 `tests/node_sdk.rs` 会自动跑它，也可以 `npm test` 或 `bun test` | 106 个通过（node 和 bun 都是），11 个测试文件，覆盖 `openai`、`@anthropic-ai/sdk`、`@ai-sdk/openai`、`@ai-sdk/anthropic` 以及 agent、cassette、结构化输出、故障注入 |
 | Python 官方客户端（`sdk/python`） | `cd sdk/python && uv run --frozen pytest`；`tests/python_sdk.rs` 会在 `cargo test` 里自动跑它（没有 `uv` 时 skip） | 17 个通过：`openai` / `anthropic` 官方包加 `fakellm_sdk` helper |
-| JS / TS 客户端（`sdk/js`） | `cd sdk/js && npm ci && npm test`；`bun test` | 31 个通过（node 和 bun 都是） |
-| Node 原生绑定（`bindings/node`） | `cd bindings/node && npm ci && npm run build:debug && npm test`；Bun：`bun test __test__/openai.test.mjs` | node 37 个通过；Bun 36 个通过、1 个跳过（那一条需要 `node --expose-gc`）；Bun 跑 `__test__/` 下全部文件 |
-| Go helper（`go/`） | `cd go && go vet ./... && go test -count=1 ./...` | 16 个通过 |
-| 发布前检查 | `cargo publish --dry-run`（工作区有未提交改动时加 `--allow-dirty`）；`npm pack --dry-run`（`sdk/js`、`bindings/node`） | 通过 |
+| JS / TS 客户端（`sdk/js`） | `cd sdk/js && npm ci && npm test`；`bun test` | 32 个通过（node 和 bun 都是） |
+| Node 原生绑定（`bindings/node`） | `cd bindings/node && npm ci && npm run build:debug && npm test`；Bun：`bun test __test__/openai.test.mjs` | node 40 个通过；Bun 39 个通过、1 个跳过（那一条需要 `node --expose-gc`）；Bun 跑 `__test__/` 下全部文件 |
+| Go helper（`go/`） | `cd go && go vet ./... && go test -count=1 ./...` | 17 个通过 |
+| 发布前检查 | `npm pack --dry-run`（`sdk/js`、`bindings/node`）；`cargo publish --dry-run` 目前**不通过**：默认依赖的 `tjs-sys` 没有版本号、`publish = false`（见 [docs/release.md](docs/release.md)） | `npm pack` 通过；`cargo publish` 待作者决定 |
 
 真实 harness 和镜像的 e2e 脚本（`e2e/*.sh`），每个都会先 `cargo build`，用 `FAKELLM_BIN` 可以换二进制，成功时最后一行如下：
 
@@ -838,10 +843,10 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 | `e2e/pi.sh` | pi-mono 克隆、node | `wire pi` 的 `models.json`，文本和 `bash` 工具循环 | `pi e2e ok` |
 | `e2e/connect-rst.sh` | node | CONNECT 代理后面的 `reset_after_chunks`：直连是 RST，`pipe()` 式代理变成 EOF | `connect rst e2e ok` |
 | `e2e/opencode.sh` | `opencode` | 标题旁路请求加主请求，配置文件和环境变量两种形式，5 次全新目录运行 | `PASS` |
-| `e2e/opencode-policy.sh` | `opencode`、node | 策略脚本驱动 opencode | `opencode policy e2e ok` |
+| `e2e/opencode-policy.sh` | `opencode` | 策略脚本（默认的内置运行时，不需要 node）驱动 opencode | `opencode policy e2e ok` |
 | `e2e/docker.sh` | `docker` | 构建镜像、随机端口启动、请求一次 chat completion | `PASS docker ...` |
 
-这十一个脚本在 2026-11-01 的最后一轮集成中全部以退出码 0 通过（含 `pi`，没有 skip；`docker.sh` 的默认镜像拒绝策略、`node` 变体跑通策略）。pi 的版本是 pi-mono 1.4.0。版本：codex 0.162.1、Claude Code 2.1.314、opencode 1.18.29。`tjs` 在自编译的 txiki.js v26.6.0 上验证过；没有覆盖的只有真实付费上游，见 [TODO.md](TODO.md)。
+这十一个脚本在 2026-11-01 的最后一轮集成中全部以退出码 0 通过（含 `pi`，没有 skip；`docker.sh` 那一轮策略还跑在 node 上；内置 `tjs` 之后重新跑过 `opencode-policy.sh` 和 `docker.sh`）。pi 的版本是 pi-mono 1.4.0。版本：codex 0.162.1、Claude Code 2.1.314、opencode 1.18.29。内置的 txiki.js 由 `tests/policy*.rs` 覆盖；没有覆盖的只有真实付费上游，见 [TODO.md](TODO.md)。
 
 消费方实验（八个真实仓库的测试对着 fakellm 跑）的结果和复现方法见 [docs/consumers.md](docs/consumers.md)。
 
@@ -855,13 +860,13 @@ CI（`.github/workflows/ci.yml`）跑 `cargo fmt --check`、`cargo clippy --all-
 | M1 | `fakellm wire` helper 和 codex / claude / opencode 的冒烟 e2e（`e2e/*.sh`，手工运行） | 已完成 |
 | M2 | napi 绑定（Node 和 Bun，`bindings/node`）、JS / TS 客户端（`sdk/js`）、Go helper（`go/`） | 已完成 |
 | M2 | Docker 镜像和 GHCR 发布（`Dockerfile`、`release.yml`） | 已完成（还没推过 tag，没有真正发布） |
-| M3 | fake agent：轨迹回放、工具映射、txiki.js / Node / Bun 策略脚本，见 [docs/agent.md](docs/agent.md) | 已完成 |
+| M3 | fake agent：轨迹回放、工具映射、策略脚本（内置 txiki.js 进程内运行，也可选 Node / Bun 子进程），见 [docs/agent.md](docs/agent.md) | 已完成 |
 | M3 | `POST /v1/embeddings`，见 [Embeddings](#embeddings) | 已完成 |
 | M3 | 可配置的路径前缀、`last_user` 忽略 `<system-reminder>`、`last_user_raw`、`stream.args_chunk_bytes` | 已完成 |
 | M4 | cassette 录制回放（`--upstream`、`--record`）、`fakellm import hf`、快照、热加载，见 [docs/cassette.md](docs/cassette.md) | 已完成 |
 | M4 | 按 `json_schema` 生成结构化输出 | 已完成 |
 | M4 之后 | 自定义端点规则（`match.path` / `reply.body`）、策略脚本的 `decline`、启动错误信息、LICENSE | 已完成（未提交） |
-| 再之后 | 响应保真字段、`sdk/python`、故障注入与 pi / CONNECT 的 e2e、`e2e.yml`、真实 `tjs` 和真实数据集验证、`xlam` 导入 | 已完成（未提交） |
+| 再之后 | 响应保真字段、`sdk/python`、故障注入与 pi / CONNECT 的 e2e、`e2e.yml`、真实数据集验证、`xlam` 导入 | 已完成（未提交） |
 
 每个里程碑的细节见 [CHANGELOG.md](CHANGELOG.md)。M0 到 M4 的路线图都已完成。
 

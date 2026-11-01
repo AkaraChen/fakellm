@@ -172,15 +172,17 @@ type Policy struct {
 	Files map[string]string `json:"files,omitempty"`
 }
 
-// PolicyInfo is a registered policy with its process state.
+// PolicyInfo is a registered policy with its runtime state. InProcess is true for the embedded txiki.js
+// runtime ("tjs"), false for node, bun and paths, which run as subprocesses.
 type PolicyInfo struct {
-	Name     string          `json:"name"`
-	Runtime  string          `json:"runtime"`
-	Running  bool            `json:"running"`
-	Hits     uint64          `json:"hits"`
-	Restarts uint64          `json:"restarts"`
-	State    json.RawMessage `json:"state"`
-	Log      []string        `json:"log"`
+	Name      string          `json:"name"`
+	Runtime   string          `json:"runtime"`
+	InProcess bool            `json:"in_process"`
+	Running   bool            `json:"running"`
+	Hits      uint64          `json:"hits"`
+	Restarts  uint64          `json:"restarts"`
+	State     json.RawMessage `json:"state"`
+	Log       []string        `json:"log"`
 }
 
 // Policies returns the policy client.

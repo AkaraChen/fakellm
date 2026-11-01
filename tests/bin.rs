@@ -95,6 +95,17 @@ fn env_vars_and_flag_errors() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent/y.json"));
 }
 
+#[cfg(feature = "tjs")]
+fn http_get(endpoint: &str, path: &str) -> String {
+    use std::io::{Read, Write};
+    let addr = endpoint.trim_start_matches("http://");
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    write!(conn, "GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n").unwrap();
+    let mut out = String::new();
+    conn.read_to_string(&mut out).unwrap();
+    out
+}
+
 fn http_post(endpoint: &str, path: &str, body: &str) -> String {
     use std::io::{Read, Write};
     let addr = endpoint.trim_start_matches("http://");
@@ -111,10 +122,15 @@ fn http_post(endpoint: &str, path: &str, body: &str) -> String {
 }
 
 fn spawn_with(args: &[&str]) -> (Kill, String) {
+    spawn_with_env(args, &[])
+}
+
+fn spawn_with_env(args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> (Kill, String) {
     let mut child = Kill(
         Command::new(env!("CARGO_BIN_EXE_fakellm"))
             .args(["--port", "0"])
             .args(args)
+            .envs(env.iter().copied())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -124,13 +140,31 @@ fn spawn_with(args: &[&str]) -> (Kill, String) {
     (child, line.trim().to_owned())
 }
 
+fn have_node() -> bool {
+    let ok = Command::new("node").arg("--version").output().is_ok();
+    if !ok {
+        eprintln!("skip: node not on PATH");
+    }
+    ok
+}
+
+/// With no `--policy-runtime`: the embedded runtime, or `node` in a build without the `tjs` feature.
 #[test]
 fn policy_and_trajectory_files_load_at_start() {
-    if Command::new("node").arg("--version").output().is_err() {
-        eprintln!("skip: node not on PATH");
-        return;
+    if cfg!(feature = "tjs") || have_node() {
+        policy_and_trajectory_files(None);
     }
-    let dir = std::env::temp_dir().join(format!("fakellm-bin-test-{}", std::process::id()));
+}
+
+#[test]
+fn policy_and_trajectory_files_load_at_start_on_node() {
+    if have_node() {
+        policy_and_trajectory_files(Some("node"));
+    }
+}
+
+fn policy_and_trajectory_files(runtime: Option<&str>) {
+    let dir = std::env::temp_dir().join(format!("fakellm-bin-test-{}-{}", std::process::id(), runtime.unwrap_or("default")));
     std::fs::create_dir_all(&dir).unwrap();
     let policy = dir.join("greeter.mjs");
     std::fs::write(&policy, "export default () => ({ text: 'hello from policy file' });").unwrap();
@@ -147,16 +181,15 @@ fn policy_and_trajectory_files_load_at_start() {
     )
     .unwrap();
 
-    let (_child, endpoint) = spawn_with(&[
-        "--policy",
-        policy.to_str().unwrap(),
-        "--policy-runtime",
-        "node",
-        "--trajectory",
-        traj.to_str().unwrap(),
-        "--scripts",
-        rules.to_str().unwrap(),
-    ]);
+    let runtime_args: Vec<&str> = runtime.map(|r| vec!["--policy-runtime", r]).unwrap_or_default();
+    let (_child, endpoint) = spawn_with(
+        &[
+            &["--policy", policy.to_str().unwrap()][..],
+            &runtime_args,
+            &["--trajectory", traj.to_str().unwrap(), "--scripts", rules.to_str().unwrap()],
+        ]
+        .concat(),
+    );
     let body = |u: &str| format!(r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{u}"}}]}}"#);
     let r = http_post(&endpoint, "/v1/chat/completions", &body("anything"));
     assert!(r.contains("hello from policy file"), "{r}");
@@ -175,7 +208,7 @@ fn policy_and_trajectory_files_load_at_start() {
 
     let broken = dir.join("broken.mjs");
     std::fs::write(&broken, "export default (").unwrap();
-    let out = run(&["--port", "0", "--policy", broken.to_str().unwrap(), "--policy-runtime", "node"]);
+    let out = run(&[&["--port", "0", "--policy", broken.to_str().unwrap()][..], &runtime_args].concat());
     assert!(!out.status.success());
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("broken"),
@@ -201,7 +234,7 @@ fn ctl_stdin(endpoint: &str, args: &[&str], stdin: &str) -> std::process::Output
 
 #[test]
 fn ctl_trajectories_policies_and_stdin() {
-    let (_child, endpoint) = spawn_with(&["--policy-runtime", "node"]);
+    let (_child, endpoint) = spawn_with(&[]);
     let ok = |out: std::process::Output| {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap()
@@ -239,8 +272,8 @@ fn ctl_trajectories_policies_and_stdin() {
     ok(ctl_stdin(&endpoint, &["trajectories", "clear"], ""));
     assert!(ok(ctl_stdin(&endpoint, &["trajectories", "list"], "")).contains("no trajectories"));
 
-    // Policies need a JS runtime; the rest of the test needs node.
-    if Command::new("node").arg("--version").output().is_err() {
+    // Policies need a JS runtime: the embedded one, or node in a build without it.
+    if !cfg!(feature = "tjs") && Command::new("node").arg("--version").output().is_err() {
         eprintln!("skip policies: node not on PATH");
         return;
     }
@@ -282,20 +315,126 @@ fn ctl_trajectories_policies_and_stdin() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn policy_without_runtime_fails_clearly() {
-    let dir = std::env::temp_dir().join(format!("fakellm-bin-nort-{}", std::process::id()));
+/// A directory that exists and holds nothing, as the whole of PATH.
+fn empty_path() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("fakellm-bin-empty-path-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let js = dir.join("p.mjs");
+    dir
+}
+
+/// A fresh directory for a test's files (`greeter.mjs` names the policy `greeter`).
+fn files_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("fakellm-bin-files-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[cfg(feature = "tjs")]
+#[test]
+fn policies_run_with_no_javascript_runtime_on_path() {
+    let path = empty_path();
+    let files = files_dir("nopath");
+    let js = files.join("greeter.mjs");
+    std::fs::write(
+        &js,
+        "export default (req, ctx) => ({ text: `no node here, hits=${ctx.hits}`, state: { seen: true } });",
+    )
+    .unwrap();
+    let rules = files.join("rules.json");
+    std::fs::write(&rules, r#"[{"reply": {"policy": "greeter"}}]"#).unwrap();
+    // The binary is started by absolute path, and nothing it could exec is on PATH.
+    for runtime_args in [&[][..], &["--policy-runtime", "tjs"]] {
+        let args = [
+            &["--policy", js.to_str().unwrap(), "--scripts", rules.to_str().unwrap()][..],
+            runtime_args,
+        ]
+        .concat();
+        let (_child, endpoint) = spawn_with_env(&args, &[("PATH", path.as_os_str())]);
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+        let r = http_post(&endpoint, "/v1/chat/completions", body);
+        assert!(r.contains("no node here, hits=0"), "{runtime_args:?}: {r}");
+        let r = http_post(&endpoint, "/v1/chat/completions", body);
+        assert!(r.contains("no node here, hits=1"), "{runtime_args:?}: {r}");
+        let policies = http_get(&endpoint, "/_fakellm/policies");
+        assert!(
+            policies.contains(r#""runtime":"tjs""#) && policies.contains(r#""in_process":true"#),
+            "{policies}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&files);
+}
+
+#[cfg(feature = "tjs")]
+#[test]
+fn the_server_exits_promptly_on_sigterm_with_policies_running() {
+    let files = files_dir("sigterm");
+    let js = files.join("sleeper.mjs");
+    std::fs::write(
+        &js,
+        "export default async () => { await new Promise((r) => setTimeout(r, 60000)); return { text: 'late' }; };",
+    )
+    .unwrap();
+    let rules = files.join("rules.json");
+    std::fs::write(&rules, r#"[{"reply": {"policy": "sleeper"}}]"#).unwrap();
+    let (mut child, endpoint) = spawn_with(&["--policy", js.to_str().unwrap(), "--scripts", rules.to_str().unwrap()]);
+    // A decision is in flight when the signal arrives.
+    let addr = endpoint.clone();
+    std::thread::spawn(move || {
+        http_post(
+            &addr,
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = child.0.wait().unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(status.success() || status.code().is_none(), "{status:?}");
+    let _ = std::fs::remove_dir_all(&files);
+}
+
+/// Naming a subprocess runtime that is not installed is an error that says so.
+#[test]
+fn a_subprocess_runtime_missing_from_path_fails_clearly() {
+    let path = empty_path();
+    let files = files_dir("missing");
+    let js = files.join("p.mjs");
     std::fs::write(&js, "export default () => null;").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_fakellm"))
-        .args(["--port", "0", "--policy", js.to_str().unwrap()])
-        .env("PATH", "/nonexistent")
+        .args(["--port", "0", "--policy", js.to_str().unwrap(), "--policy-runtime", "node"])
+        .env("PATH", &path)
         .output()
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    println!("{err}");
+    assert!(err.contains("cannot start node"), "{err}");
+    let _ = std::fs::remove_dir_all(&files);
+}
+
+/// A build without the embedded runtime has nothing to default to when no node or bun is on PATH.
+#[cfg(not(feature = "tjs"))]
+#[test]
+fn policy_without_runtime_fails_clearly() {
+    let path = empty_path();
+    let files = files_dir("noruntime");
+    let js = files.join("q.mjs");
+    std::fs::write(&js, "export default () => null;").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fakellm"))
+        .args(["--port", "0", "--policy", js.to_str().unwrap()])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("JavaScript runtime"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&files);
 }

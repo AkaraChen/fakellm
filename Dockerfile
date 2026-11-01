@@ -7,12 +7,21 @@
 #
 # The endpoint is printed on stdout once the server is listening; the image also has a HEALTHCHECK
 # on GET /_fakellm for docker-compose and Kubernetes. The server runs as an unprivileged user.
+#
+# The binary embeds txiki.js (policy scripts run in-process, no JavaScript runtime in the image), which is built from the
+# git submodules of third_party/txiki.js: run `tjs-sys/fetch-sources.sh` before `docker build`, they are part of the build
+# context. cmake and g++ are only needed in the build stage; libstdc++ is linked statically.
 
 FROM rust:1-alpine AS build
-RUN apk add --no-cache musl-dev make perl
+# git: txiki.js's CMake applies its own patches to the mbedtls and libwebsockets checkouts with `git apply`.
+RUN apk add --no-cache musl-dev make perl cmake g++ git linux-headers
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY tjs-sys ./tjs-sys
+COPY third_party ./third_party
+# The submodules' .git files point outside the build context; without them `git apply` works on the plain directories.
+RUN find third_party -name .git -type f -delete
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked \

@@ -21,7 +21,18 @@ exclude = [
     "/.github",
     "/Dockerfile",
     "/tests/node_sdk.rs",
+    "/tjs-sys",
+    "/third_party",
 ]
+
+[workspace]
+members = [".", "tjs-sys"]
+
+[features]
+default = ["tjs"]
+# Embeds txiki.js (QuickJS + libuv) so policy scripts run in-process and the binary needs no JavaScript runtime. Needs cmake, a C and a
+# C++ compiler, and the git submodules of third_party/txiki.js at build time (see tjs-sys/build.rs). Without it, policies need `node` or `bun`.
+tjs = ["dep:tjs-sys"]
 
 [dependencies]
 bytes = "1.12"
@@ -42,6 +53,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_norway = "0.9"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tjs-sys = { path = "tjs-sys", optional = true }
 tokio = { version = "1.54", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

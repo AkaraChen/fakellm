@@ -68,8 +68,8 @@ s, err := fakellm.Start(ctx, fakellm.Options{Bin: bin})
 | `Scripts` | 启动时加载的剧本：JSON 或 YAML 字符串（`string` / `[]byte`），或 `[]Rule`。不合法则 `Start` 返回错误 |
 | `FallbackTokens` / `ChunkTokens` / `ArgsChunkBytes` | 对应 `--fallback-tokens`、`--chunk-tokens`、`--args-chunk-bytes`，0 为服务器默认值 |
 | `Trajectories` | 启动后注册的轨迹：`Trajectory`、`[]Trajectory`，或 JSON / YAML / JSONL 字符串（`string` / `[]byte`） |
-| `Policies` | 启动后注册的策略，`[]fakellm.Policy{{Name, Source, Runtime}}`；需要机器上有 node、bun 或 tjs |
-| `PolicyRuntime` | `--policy-runtime`：`tjs`、`node`、`bun` 或路径；默认由服务器探测 |
+| `Policies` | 启动后注册的策略，`[]fakellm.Policy{{Name, Source, Runtime}}`；默认在二进制内置的运行时上跑，选 `node` / `bun` 才需要机器上装着 |
+| `PolicyRuntime` | `--policy-runtime`：`tjs`（内置在二进制里，进程内运行）、`node`、`bun` 或路径；默认 `tjs` |
 | `PathPrefix` | `--path-prefix`：API 同时挂在这个前缀下；`BaseURL()` 和 `AnthropicBaseURL()` 会带上它（控制面不变） |
 | `Cassettes` | 启动后注册的 cassette：`Cassette`、`[]Cassette`，或 JSON / YAML / JSONL 字符串（`string` / `[]byte`） |
 | `Upstream`、`UpstreamAPIKey` | `--upstream`、`--upstream-api-key`：没有规则和 cassette 命中的请求转发给这个上游并录下来 |
@@ -142,7 +142,7 @@ s.Trajectories().Delete(ctx, "fix-bug"); s.Trajectories().Clear(ctx)
 
 s.Policies().Put(ctx, fakellm.Policy{Name: "p", Source: src}) // 全部先试加载，失败返回 400 的 *fakellm.Error，原状态不变
 s.Policies().Add(ctx, policies...)     // 同名替换（状态重置）
-s.Policies().List(ctx)                 // []PolicyInfo：Runtime / Running / Hits / Restarts / State / Log
+s.Policies().List(ctx)                 // []PolicyInfo：Runtime / InProcess / Running / Hits / Restarts / State / Log
 s.Policies().Get(ctx, "p"); s.Policies().Delete(ctx, "p"); s.Policies().Clear(ctx)
 ```
 

@@ -51,7 +51,8 @@ struct Opt {
     #[arg(long = "policy", env = "FAKELLM_POLICIES", value_delimiter = ',', value_name = "FILE")]
     policies: Vec<std::path::PathBuf>,
 
-    /// Runtime for policy scripts: tjs, node, bun or a path. Default: tjs if on PATH, else node, else bun.
+    /// Runtime for policy scripts: tjs (embedded in this binary, runs in-process), node, bun or a path to an executable.
+    /// Default: tjs, or node then bun from PATH in a build without the `tjs` feature.
     #[arg(long, env = "FAKELLM_POLICY_RUNTIME")]
     policy_runtime: Option<fakellm::Runtime>,
 

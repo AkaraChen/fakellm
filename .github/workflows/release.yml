@@ -45,6 +45,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
+      - run: tjs-sys/fetch-sources.sh # the binary embeds txiki.js, built from these git submodules
 
       - name: Tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
@@ -196,7 +197,7 @@ jobs:
       - name: Inspect
         run: docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"
 
-  # The node:22-alpine variant (policy scripts need a JavaScript runtime): `:node` and `:<version>-node`, built on top
+  # The node:22-alpine variant (policy scripts can also run on node as a subprocess): `:node` and `:<version>-node`, built on top
   # of the multi-arch image the manifest job just pushed, so there is no second compile.
   node-image:
     needs: manifest
